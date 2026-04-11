@@ -1,12 +1,18 @@
-base: configs/base.yaml
+base: base.yaml
 
-exp_name: text_meta_v1
-
-model:
-  hidden_dim: 256
-  dropout: 0.1
+exp_name: text_meta_cross_v1
 
 train:
   batch_size: 16
   lr: 2.0e-5
   epochs: 8
+
+model:
+  hidden_dim: 256
+  dropout: 0.1
+
+meta:
+  branch_dim: 128
+
+fusion:
+  type: cross_feature

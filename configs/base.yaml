@@ -1,85 +1,51 @@
 seed: 42
-exp_name: text_meta_v1
+exp_name: text_meta_cross_v1
 
-# =========================
-# data
-# =========================
 data:
   train_path: data/processed/train.parquet
   val_path: data/processed/val.parquet
 
-# =========================
-# model switch
-# =========================
 model:
   use_text: true
   use_meta: true
   use_image: false
-
   hidden_dim: 256
   dropout: 0.1
 
-# =========================
-# text encoder
-# =========================
 text:
-  model_name: distilbert-base-uncased
-  max_length: 128
-  pooling: cls
-  trainable: true
+  model_name: openai/clip-vit-base-patch32
+  max_length: 77
+  pooling: clip
+  trainable: false
 
-# =========================
-# metadata encoder
-# =========================
 meta:
-  hidden_dims: [128, 256]
-  activation: relu
-  use_layernorm: true
+  branch_dim: 128
 
-# =========================
-# image encoder (future)
-# =========================
 image:
   model_name: resnet50
   pretrained: true
   trainable: true
 
-# =========================
-# fusion
-# =========================
 fusion:
-  type: concat   # future: gated / attention
-  hidden_dim: 256
-  dropout: 0.1
+  type: cross_feature
 
-# =========================
-# head
-# =========================
-head:
-  type: regression
-  hidden_dim: 256
-  dropout: 0.1
-
-# =========================
-# training
-# =========================
-train:
-  batch_size: 16
-  num_workers: 4
-  epochs: 5
-  lr: 2.0e-5
-  weight_decay: 1.0e-2
-
-# =========================
-# loss
-# =========================
 loss:
   name: smoothl1
 
-# =========================
-# output
-# =========================
+train:
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+  epochs: 8
+  lr: 2.0e-5
+  weight_decay: 1.0e-2
+  grad_clip_norm: 1.0
+
 output:
   root_dir: outputs
-  save_dir: outputs/checkpoints
-  tensorboard_dir: outputs/tensorboard
+
+preprocess:
+  num_cols: null
+  cat_cols: null
+  bin_cols: null
+  log1p_cols: null
