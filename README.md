@@ -11,40 +11,37 @@ We have completed the full training pipeline backbone (without image branch yet)
 ## Completed Modules
 
 ### 0. Data
+```text
 smp-challenge/
-├── configs/              
-│   └── default.yaml       # 預設 config
-│
+├── configs/
+│   └── default.yaml
 ├── data/
 │   ├── raw/
 │   └── processed/
-│
 ├── outputs/
 │   ├── checkpoints/
 │   ├── tensorboard/
-│   └── experiments/       
+│   └── experiments/
 │       └── exp_001/
 │           ├── config.yaml
 │           ├── log.txt
 │           └── result.json
-│
 ├── src/
 │   ├── datasets/
 │   ├── models/
 │   ├── utils/
-│   └── engine/            
+│   └── engine/
 │       ├── trainer.py
 │       └── evaluator.py
-│
-├── scripts/               
+├── scripts/
 │   ├── train.py
 │   ├── infer.py
 │   └── eval.py
-│
 ├── build_dataset.py
 ├── README.md
 ├── requirements.txt
 └── .gitignore
+```
 
 ### 1. Dataset Processing
 - Built build_dataset.py
