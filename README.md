@@ -1,228 +1,311 @@
 # SMP Challenge Project (Multimodal Popularity Prediction)
 
+---
+
+# Overview
+
 This project aims to build a multimodal model for predicting social media popularity (SMP Challenge).
+
+Current focus:
+- Strong **text + metadata baseline**
+- Modular design for future multimodal extension (image branch)
 
 ---
 
-# Current Progress (2026-04)
+# Project Structure
 
-We have completed the full training pipeline backbone (without image branch yet).
-
-## Completed Modules
-
-### 0. Data
 ```text
 smp-challenge/
 ├── configs/
-│   └── default.yaml
+│   ├── base.yaml
+│   └── text_meta_cross_v1.yaml
 ├── data/
 │   ├── raw/
 │   └── processed/
+│       ├── train.parquet
+│       └── val.parquet
 ├── outputs/
 │   ├── checkpoints/
 │   ├── tensorboard/
-│   └── experiments/
-│       └── exp_001/
-│           ├── config.yaml
-│           ├── log.txt
-│           └── result.json
+│   └── <exp_name>/
 ├── src/
 │   ├── datasets/
+│   │   ├── smp_datasets.py
+│   │   └── metadata_preprocessor.py
 │   ├── models/
-│   ├── utils/
-│   └── engine/
-│       ├── trainer.py
-│       └── evaluator.py
+│   │   ├── text_encoder.py
+│   │   ├── meta_encoder.py
+│   │   ├── fusion.py
+│   │   ├── fusion_model.py
+│   │   └── head.py
+│   ├── engine/
+│   │   ├── trainer.py
+│   │   └── evaluator.py
+│   └── utils/
 ├── scripts/
-│   ├── train.py
-│   ├── infer.py
-│   └── eval.py
+│   └── train.py
 ├── build_dataset.py
-├── README.md
-├── requirements.txt
-└── .gitignore
+└── README.md
 ```
 
-### 1. Dataset Processing
-- Built build_dataset.py
-- Merged raw SMP data into unified tables
-- Key design:
-  - Post-level key: Uid + Pid
-  - User-level join: Uid
-- Output formats:
-  - train.parquet (main training data)
-  - test.parquet
-  - jsonl / csv (for debugging)
+---
+
+# Data Pipeline
+
+## Input Data
+
+Processed dataset (from `build_dataset.py`):
+
+- train.parquet
+- val.parquet
+
+Each row represents a post:
+- Key: (Uid, Pid)
 
 ---
 
-### 2. Data Pipeline (SMPDataset)
-- Located at: src/datasets/smp_dataset.py
-- Responsibilities:
-  - Load parquet data
-  - Build text input (full_text + category + tags)
-  - Extract metadata features
-  - Tokenize text (HuggingFace tokenizer)
-  - Return:
-    - input_ids
-    - attention_mask
-    - meta_features
-    - labels
+## Metadata Processing
 
-- Image branch:
-  - Placeholder only (not implemented yet)
+Handled by:
+`MetadataPreprocessor`
 
----
+Feature types:
 
-### 3. Metadata Features
+### Numerical
+- time features (hour, weekday, etc.)
+- user statistics
+- geo features
 
-Currently used:
+### Categorical
+- category
+- subcategory
+- concept
+- user_id related fields
 
-Time:
-- hour, weekday, is_weekend, year, month, day
-
-User:
-- photo_count (log1p)
-- ispro, canbuypro
-- timezone_offset, timezone_id
-
-Geo:
-- latitude, longitude, geoaccuracy, has_geo
-
-System:
+### Binary
 - ispublic
+- ispro
+- has_geo
 
-Note:
-Metadata is very important for this task.
+Output:
 
----
-
-### 4. Config System (YAML-based)
-- Located at: configs/
-- Supports:
-  - Multiple experiments
-  - Base config inheritance
-
-Example:
-
-python src/main.py --config configs/text_meta_v1.yaml
+```
+meta_num  ∈ R^N
+meta_cat  ∈ Z^C
+meta_bin  ∈ R^B
+```
 
 ---
 
-### 5. Training Pipeline (main.py)
-- Full training loop implemented:
-  - Train / Validation
-  - Checkpoint saving
-  - Best model selection (by Spearman)
+## Dataset (SMPDataset)
 
-- Supports:
-  - Text + Metadata
-  - Optional image branch (future)
+Outputs:
+
+```
+{
+  input_ids,
+  attention_mask,
+  meta_num,
+  meta_cat,
+  meta_bin,
+  labels
+}
+```
+
+Text construction:
+- full_text (priority)
+- title / tags fallback
+- topic: category + concept
+
+Tokenizer:
+- CLIP tokenizer
+- max_length = 77
 
 ---
 
-### 6. Metrics (metrics.py)
+# Model Architecture
+
+## Overview
+
+Current model: Text + Metadata
+
+```
+Text Input
+   ↓
+CLIP Text Encoder
+   ↓
+text_repr (H)
+
+Metadata
+   ↓
+MetaEncoder
+   ↓
+meta_repr (H)
+
+Interaction:
+cross = text_repr ⊙ meta_repr
+cross = projection
+
+Fusion:
+concat(text, meta, cross)
+→ MLP
+
+Head:
+→ regression output
+```
+
+---
+
+## Components
+
+### Text Encoder
+- Model: CLIPTextModelWithProjection
+- Output: text_repr ∈ R^H
+- Default: frozen
+
+---
+
+### Metadata Encoder
+
+Structure:
+- numerical branch (MLP)
+- categorical embedding
+- binary branch
+
+Output:
+- meta_repr ∈ R^H
+
+---
+
+### Fusion (Cross Feature)
+
+Explicit interaction:
+
+```
+cross = text ⊙ meta
+```
+
+Then:
+
+```
+fused = concat(text, meta, cross)
+→ fusion MLP
+```
+
+Reason:
+- captures interaction
+- lightweight
+- better than simple concat
+
+---
+
+### Head
+
+Regression head:
+- MLP
+- Output: scalar popularity score
+
+---
+
+# Training Pipeline
+
+Script:
+```
+scripts/train.py
+```
+
+Steps:
+1. Load config (with base inheritance)
+2. Load parquet data
+3. Fit metadata preprocessor
+4. Build datasets & dataloaders
+5. Build model
+6. Train + validate
+7. Save checkpoints and logs
+
+---
+
+# Config System (YAML)
+
+Supports base inheritance:
+
+```yaml
+base: base.yaml
+
+train:
+  lr: 2e-5
+  epochs: 8
+```
+
+Sections:
+
+- data
+- model
+- text
+- meta
+- fusion
+- train
+- output
+
+---
+
+# Current Status
 
 Implemented:
-- Spearman Correlation (main metric)
-- MAE
-- MSE, RMSE
+- text encoder (CLIP)
+- metadata encoder
+- cross-feature fusion
+- training pipeline
+- config system
 
-Important:
-- Model selection is based on Spearman, not loss.
-
----
-
-### 7. TensorBoard Logging
-
-Logs:
-- train loss
-- validation loss
-- MAE
-- Spearman
-- learning rate
-
-Run:
-
-tensorboard --logdir outputs/tensorboard
+Not implemented:
+- image encoder
+- ranking loss
+- advanced fusion (attention)
 
 ---
 
-### 8. Experiment Management
+# TODO
 
-Each run will automatically save:
-
-outputs/
-  checkpoints/<exp_name>/
-    best.pt
-    latest.pt
-  tensorboard/<exp_name>/
-  <exp_name>/
-    config.json
-    history.json
-    summary.json
-
----
-
-# Current Model Scope
-
-Implemented:
-- Text encoder (transformer)
-- Metadata encoder (MLP)
-
-Not yet implemented:
-- Image encoder
-- Fusion module
-- Ranking-based loss
-
----
-
-# Observations from Data
-
-- Same full_text can appear many times for the same user
-- Text is not always unique per post
-- Metadata (especially user + time) is critical
-
----
-
-# Design Philosophy
-
-- Modular design
-- Easy experiment control (YAML)
-- Reproducibility (config saving)
-- Fast iteration (no image dependency initially)
-
----
-
-# Next Steps
-
-Short-term:
-- Implement fusion_model.py
-- Run baseline:
+## Immediate
+- run full training
+- verify pipeline end-to-end
+- baseline comparison:
   - metadata-only
   - text-only
   - text + metadata
 
-Mid-term:
-- Add image encoder
-- Improve feature engineering
-- Add normalization for metadata
+---
 
-Advanced:
-- Ranking-aware loss
-- Better fusion (cross-attention)
-- User-level modeling
+## Feature Engineering
+- tag target encoding
+- category / concept encoding
+- user-level statistics
 
 ---
 
-# How to Run
+## Model Improvements
+- compare fusion methods
+- add text cluster features
+- add lightweight text features
 
-python src/main.py --config configs/text_meta_v1.yaml
+---
+
+## Image Branch
+- implement image encoder
+- extend fusion to multimodal
+
+---
+
+## Advanced
+- ranking-aware loss
+- cross-attention
+- user modeling
 
 ---
 
 # Notes
 
-- Start simple (text + metadata)
-- Gradually evolve into multimodal model
-- Focus on strong baselines first
+- metadata is highly important in this task
+- text alone is not sufficient
+- interaction between text and metadata is critical
