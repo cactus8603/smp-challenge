@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
+import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -60,5 +61,10 @@ def validate(
     avg_loss = total_loss / max(len(loader), 1)
     mae = compute_mae(all_labels, all_preds)
     spearman = compute_spearman(all_labels, all_preds)
+
+    print("pred std:", np.std(all_preds))
+    print("label std:", np.std(all_labels))
+    print("pred sample:", all_preds[:10])
+    print("label sample:", all_labels[:10])
 
     return avg_loss, mae, spearman

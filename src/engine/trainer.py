@@ -72,11 +72,16 @@ def train_one_epoch(
     criterion: torch.nn.Module,
     device: str,
     grad_clip_norm: Optional[float] = None,
+    writer: Optional[SummaryWriter] = None,
+    epoch: int = 0,
 ) -> float:
     model.train()
     total_loss = 0.0
+    total_reg_loss = 0.0
+    total_rank_loss = 0.0
 
     progress = tqdm(loader, desc="Train", leave=False)
+    step = 0
 
     for batch in progress:
         input_ids = batch["input_ids"].to(device)
@@ -87,7 +92,6 @@ def train_one_epoch(
         labels = batch["labels"].to(device)
 
         image_tensor = batch.get("image_tensor", None)
-        # Keep placeholder image disabled unless it has real content
         if image_tensor is not None and image_tensor.numel() > 0:
             image_tensor = image_tensor.to(device)
         else:
@@ -115,9 +119,25 @@ def train_one_epoch(
         optimizer.step()
 
         total_loss += loss.item()
+
+        # 記錄各損失
+        if hasattr(criterion, "last_reg_loss"):
+            total_reg_loss += criterion.last_reg_loss
+            total_rank_loss += criterion.last_rank_loss
+
+            if writer is not None:
+                global_step = epoch * len(loader) + step
+                writer.add_scalar("loss/train_reg", criterion.last_reg_loss, global_step)
+                writer.add_scalar("loss/train_rank", criterion.last_rank_loss, global_step)
+
+        step += 1
         progress.set_postfix(loss=f"{loss.item():.4f}")
 
-    return total_loss / max(len(loader), 1)
+    avg_loss = total_loss / max(len(loader), 1)
+    avg_reg_loss = total_reg_loss / max(len(loader), 1)
+    avg_rank_loss = total_rank_loss / max(len(loader), 1)
+
+    return avg_loss
 
 
 class Trainer:
@@ -168,6 +188,8 @@ class Trainer:
                 criterion=self.criterion,
                 device=self.device,
                 grad_clip_norm=self.grad_clip_norm,
+                writer=self.writer,
+                epoch=epoch,
             )
 
             val_loss, val_mae, val_spearman = validate(
