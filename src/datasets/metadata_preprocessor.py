@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,7 +26,6 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
-
 def _safe_int(x: Any, default: int = 0) -> int:
     if x is None:
         return default
@@ -40,7 +38,6 @@ def _safe_int(x: Any, default: int = 0) -> int:
         return int(x)
     except Exception:
         return default
-
 
 
 def _safe_str(x: Any, default: str = "") -> str:
@@ -71,12 +68,6 @@ class MetadataPreprocessor:
     - binary: fill missing with 0
     - numeric: optional log1p for heavy-tail columns, median imputation, z-score normalization
     - user history style columns: context-appropriate defaults
-
-    Usage:
-        pre = MetadataPreprocessor()
-        pre.fit(train_df)
-        train_df = pre.transform(train_df)
-        valid_df = pre.transform(valid_df)
     """
 
     def __init__(
@@ -85,6 +76,7 @@ class MetadataPreprocessor:
         cat_cols: Optional[List[str]] = None,
         bin_cols: Optional[List[str]] = None,
         text_cols: Optional[List[str]] = None,
+        log1p_cols: Optional[List[str]] = None,
         normalize_numeric: bool = True,
     ) -> None:
         self.num_cols = num_cols or [
@@ -154,16 +146,17 @@ class MetadataPreprocessor:
             "has_tags",
             "has_user_description",
             "has_location_description",
-            # ispro/canbuypro/ispublic 在 build_dataset 中以整數 0/1 儲存，屬於 binary
             "ispro",
             "canbuypro",
             "ispublic",
         ]
         self.text_cols = text_cols or ["title", "alltags", "full_text"]
+        self.log1p_cols = log1p_cols or []
         self.normalize_numeric = normalize_numeric
 
         self.num_stats: Dict[str, NumericStats] = {}
         self.cat_vocab: Dict[str, Dict[str, int]] = {}
+        self.cat_cardinalities: Dict[str, int] = {}
         self.fitted: bool = False
 
     @property
@@ -196,22 +189,12 @@ class MetadataPreprocessor:
     def fit(self, train_df: pd.DataFrame) -> "MetadataPreprocessor":
         df = self._ensure_columns(train_df)
 
-        # binary fit: no learned parameters
-        # 先從原始資料算 stats，再決定 fill_value，避免 fill 值污染統計量
-        global_label = pd.to_numeric(df["label"] if "label" in df.columns else None, errors="coerce").median()
-        if pd.isna(global_label):
-            global_label = 0.0
-        global_hour = pd.to_numeric(df["hour"] if "hour" in df.columns else None, errors="coerce").median()
-        if pd.isna(global_hour):
-            global_hour = 0.0
-
         for col in self.num_cols:
             s_raw = pd.to_numeric(df[col], errors="coerce")
 
-            # 先用原始非空值計算統計量
             median = float(s_raw.median()) if s_raw.notna().any() else 0.0
-            mean   = float(s_raw.mean())   if s_raw.notna().any() else 0.0
-            std    = float(s_raw.std(ddof=0)) if s_raw.notna().any() else 1.0
+            mean = float(s_raw.mean()) if s_raw.notna().any() else 0.0
+            std = float(s_raw.std(ddof=0)) if s_raw.notna().any() else 1.0
             if not np.isfinite(std) or std < EPS:
                 std = 1.0
             self.num_stats[col] = NumericStats(median=median, mean=mean, std=std)
@@ -220,7 +203,9 @@ class MetadataPreprocessor:
             values = df[col].map(lambda x: _safe_str(x, "UNK") or "UNK").fillna("UNK")
             uniq = values.astype(str).unique().tolist()
             ordered = ["UNK"] + sorted([u for u in uniq if u != "UNK"])
-            self.cat_vocab[col] = {v: i for i, v in enumerate(ordered)}
+            vocab = {v: i for i, v in enumerate(ordered)}
+            self.cat_vocab[col] = vocab
+            self.cat_cardinalities[col] = len(vocab)
 
         self.fitted = True
         return self
@@ -235,7 +220,6 @@ class MetadataPreprocessor:
             s = pd.to_numeric(out[col], errors="coerce")
             stats = self.num_stats[col]
 
-            # context-appropriate fill value
             if col in ("user_prev_post_count", "user_category_nunique"):
                 fill_value = 0.0
             elif col == "user_mean_label":
@@ -246,8 +230,13 @@ class MetadataPreprocessor:
                 fill_value = stats.median
 
             s = s.fillna(fill_value).astype(np.float32)
+
+            if col in self.log1p_cols:
+                s = np.log1p(np.clip(s, a_min=0.0, a_max=None))
+
             if self.normalize_numeric:
                 s = (s - stats.mean) / stats.std
+
             out[f"num__{col}"] = s.astype(np.float32)
 
         for col in self.bin_cols:
@@ -259,17 +248,8 @@ class MetadataPreprocessor:
             vocab = self.cat_vocab[col]
             unk_id = vocab.get("UNK", 0)
             values = out[col].map(lambda x: _safe_str(x, "UNK") or "UNK").fillna("UNK")
-            mapped = values.map(lambda x: vocab.get(str(x), None))
-            oov_mask = mapped.isna()
-            oov_count = int(oov_mask.sum())
-            if oov_count > 0:
-                import warnings
-                warnings.warn(
-                    f"[MetadataPreprocessor] cat col '{col}': {oov_count}/{len(out)} OOV values mapped to UNK",
-                    UserWarning,
-                    stacklevel=2,
-                )
-            out[f"cat__{col}"] = mapped.fillna(unk_id).astype(np.int64)
+            mapped = values.map(lambda x: vocab.get(str(x), unk_id))
+            out[f"cat__{col}"] = mapped.astype(np.int64)
 
         for col in self.text_cols + ["post_id", "Uid", "Pid"]:
             out[col] = out[col].map(lambda x: _safe_str(x, ""))
@@ -290,8 +270,9 @@ class MetadataPreprocessor:
             "transformed_num_cols": self.transformed_num_cols,
             "transformed_cat_cols": self.transformed_cat_cols,
             "transformed_bin_cols": self.transformed_bin_cols,
-            "cat_cardinalities": {c: len(v) for c, v in self.cat_vocab.items()},
+            "cat_cardinalities": self.cat_cardinalities,
             "normalize_numeric": self.normalize_numeric,
+            "log1p_cols": self.log1p_cols,
         }
 
     def save(self, path: str | Path) -> None:
@@ -302,9 +283,11 @@ class MetadataPreprocessor:
             "cat_cols": self.cat_cols,
             "bin_cols": self.bin_cols,
             "text_cols": self.text_cols,
+            "log1p_cols": self.log1p_cols,
             "normalize_numeric": self.normalize_numeric,
             "num_stats": {k: asdict(v) for k, v in self.num_stats.items()},
             "cat_vocab": self.cat_vocab,
+            "cat_cardinalities": self.cat_cardinalities,
         }
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -318,9 +301,18 @@ class MetadataPreprocessor:
             cat_cols=payload["cat_cols"],
             bin_cols=payload["bin_cols"],
             text_cols=payload.get("text_cols"),
+            log1p_cols=payload.get("log1p_cols"),
             normalize_numeric=payload.get("normalize_numeric", True),
         )
         obj.num_stats = {k: NumericStats(**v) for k, v in payload["num_stats"].items()}
-        obj.cat_vocab = {k: {str(kk): int(vv) for kk, vv in vocab.items()} for k, vocab in payload["cat_vocab"].items()}
+        obj.cat_vocab = {
+            k: {str(kk): int(vv) for kk, vv in vocab.items()}
+            for k, vocab in payload["cat_vocab"].items()
+        }
+        obj.cat_cardinalities = {
+            str(k): int(v) for k, v in payload.get("cat_cardinalities", {}).items()
+        }
+        if not obj.cat_cardinalities and obj.cat_vocab:
+            obj.cat_cardinalities = {k: len(v) for k, v in obj.cat_vocab.items()}
         obj.fitted = True
         return obj

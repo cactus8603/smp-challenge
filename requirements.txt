@@ -1,0 +1,64 @@
+absl-py==2.4.0
+accelerate==1.13.0
+annotated-doc==0.0.4
+anyio==4.13.0
+brotlicffi @ file:///C:/miniconda3/conda-bld/brotlicffi_1764961370587/work
+certifi @ file:///C:/Users/task_176765900829408/croot/certifi_1767659214946/work/certifi
+cffi @ file:///C:/miniconda3/conda-bld/cffi_1761832792265/work
+charset-normalizer @ file:///C:/miniconda3/conda-bld/charset-normalizer_1761745005832/work
+click==8.3.2
+colorama==0.4.6
+filelock @ file:///C:/Users/task_176943975530691/croot/filelock_1769440571783/work
+fsspec==2026.3.0
+gmpy2 @ file:///C:/miniconda3/conda-bld/gmpy2_1764748103115/work
+grpcio==1.80.0
+h11==0.16.0
+hf-xet==1.4.3
+httpcore==1.0.9
+httpx==0.28.1
+huggingface_hub==1.10.1
+idna @ file:///C:/miniconda3/conda-bld/idna_1761912044050/work
+Jinja2 @ file:///C:/b/abs_920kup4e6u/croot/jinja2_1741711580669/work
+Markdown==3.10.2
+markdown-it-py==4.0.0
+MarkupSafe @ file:///C:/b/abs_a0ma7ge0jc/croot/markupsafe_1738584052792/work
+mdurl==0.1.2
+mkl-service==2.4.0
+mkl_fft @ file:///C:/Users/dev-admin/mkl/mkl_fft_1730823082242/work
+mkl_random @ file:///C:/Users/dev-admin/mkl/mkl_random_1730822522280/work
+mpmath @ file:///C:/b/abs_7833jrbiox/croot/mpmath_1690848321154/work
+networkx @ file:///C:/miniconda3/conda-bld/networkx_1765378660274/work
+numpy @ file:///C:/b/abs_0123vcxhf8/croot/numpy_and_numpy_base_1725470331966/work/dist/numpy-2.0.1-cp311-cp311-win_amd64.whl#sha256=46eb5850478cda64bda6d2f2d3d6ad8ceeb7cc168b83532e4f9dbbcb42e22ab2
+packaging==26.0
+pandas==3.0.2
+pillow @ file:///C:/b/abs_b50vowcrzo/croot/pillow_1738010273782/work
+protobuf==7.34.1
+psutil==7.2.2
+pyarrow==23.0.1
+pycparser @ file:///C:/Users/task_177495971060608/croot/pycparser_1774959807716/work
+Pygments==2.20.0
+PySocks @ file:///C:/miniconda3/conda-bld/pysocks_1761753028158/work
+python-dateutil==2.9.0.post0
+PyYAML @ file:///C:/miniconda3/conda-bld/pyyaml_1763465512847/work
+regex==2026.4.4
+requests @ file:///C:/Users/task_177506609072086/croot/requests_1775066161205/work
+rich==14.3.4
+safetensors==0.7.0
+scipy==1.17.1
+shellingham==1.5.4
+six==1.17.0
+sympy==1.13.1
+tensorboard==2.20.0
+tensorboard-data-server==0.7.2
+tokenizers==0.22.2
+torch==2.5.1
+torchaudio==2.5.1
+torchvision==0.20.1
+tqdm==4.67.3
+transformers==5.5.3
+typer==0.24.1
+typing_extensions @ file:///C:/b/abs_ecq8gc0vbm/croot/typing_extensions_1756281142218/work
+tzdata==2026.1
+urllib3 @ file:///C:/Users/task_176781036847582/croot/urllib3_1767810492638/work
+Werkzeug==3.1.8
+win_inet_pton @ file:///C:/miniconda3/conda-bld/win_inet_pton_1761746278197/work

@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 
-from metadata_preprocessor import MetadataPreprocessor
+from src.datasets.metadata_preprocessor import MetadataPreprocessor
 
 
 def safe_str(x: Any, default: str = "") -> str:

@@ -3,7 +3,7 @@ exp_name: text_meta_cross_v1
 
 data:
   train_path: data/processed/train.parquet
-  val_path: data/processed/val.parquet
+  val_path: data/processed/test.parquet
 
 model:
   use_text: true
@@ -34,7 +34,7 @@ loss:
 
 train:
   batch_size: 16
-  num_workers: 4
+  num_workers: 0 # BUG: Windows DataLoader multiprocessing pickle problem
   pin_memory: true
   epochs: 8
   lr: 2.0e-5

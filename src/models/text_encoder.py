@@ -35,7 +35,10 @@ class TextEncoder(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.model = CLIPTextModelWithProjection.from_pretrained(model_name)
+        self.model = CLIPTextModelWithProjection.from_pretrained(
+            model_name,
+            use_safetensors=True,
+        )
         self.hidden_size = self.model.config.hidden_size
         self.projection_dim = self.model.config.projection_dim
 

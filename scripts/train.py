@@ -191,7 +191,7 @@ def main() -> None:
     # -------------------------
     cat_cardinalities = [
         int(preprocessor.cat_cardinalities[col])
-        for col in preprocessor.transformed_cat_cols
+        for col in preprocessor.cat_cols
     ]
 
     model = SMPFusionModel(
@@ -246,4 +246,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# python scripts/train.py --config configs/text_meta_cross_v1.yaml
+# python scripts/train.py --config configs/text_meta_v1.yaml
