@@ -2,36 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Build unified SMP-Image train/test tables from raw official files.
+Build unified SMP-Image train/val/test tables from raw official files.
 
-Expected raw files (example):
-  train_label.json
-  train_category.json
-  train_img_filepath.txt
-  train_temporalspatial_information.json
-  train_text.json
-  train_user_data.json
-  train_additional_information.json
-
-  test_category.json
-  test_img_filepath.txt
-  test_temporalspatial_information.json
-  test_text.json
-  test_user_data.json
-  test_additional_information.json
-
-Usage:
-  python build_dataset.py --input_dir /path/to/raw_files --output_dir /path/to/output
-
-Output:
-  train.parquet / train.jsonl / train.csv
-  test.parquet / test.jsonl / test.csv
-  summary.json
-
-Notes:
-- Post-level join key: (Uid, Pid) -> post_id = f"{Uid}_{Pid}"
-- User-level join key: Uid
-- Main table is built from *_img_filepath.txt
+Key points:
+- train labels are loaded from train_label.txt by row order
+- the i-th label corresponds to the i-th line in train_img_filepath.txt
+- official train is split into train/val
+- train/val/test feature columns are aligned
+- only test has no true label
 """
 
 from __future__ import annotations
@@ -41,9 +19,9 @@ import json
 import logging
 import math
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -170,13 +148,6 @@ def make_post_id(uid: Any, pid: Any) -> Optional[str]:
 
 
 def parse_img_filepath_line(line: str, split: str) -> Optional[Dict[str, Any]]:
-    """
-    Expected line examples:
-      train/59@N75/775.jpg
-      ./train/59@N75/775.jpg
-      /abs/path/to/train/59@N75/775.jpg
-    We only need Uid and Pid.
-    """
     raw = line.strip()
     if not raw:
         return None
@@ -219,6 +190,28 @@ def load_img_filepath_table(path: Path, split: str) -> pd.DataFrame:
     return df
 
 
+def load_label_txt(path: Path) -> pd.DataFrame:
+    """
+    Load label text file where each row is the popularity score of the
+    corresponding post in train_img_filepath.txt.
+    """
+    labels: List[Optional[float]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line == "":
+                continue
+
+            lower = line.lower()
+            # Skip header-like lines
+            if lower in {"label", "popularityscore", "popularity_score"}:
+                continue
+
+            labels.append(to_float(line))
+
+    return pd.DataFrame({"label": labels})
+
+
 def standardize_post_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -254,36 +247,11 @@ def load_json_table(path: Optional[Path]) -> pd.DataFrame:
     return df
 
 
-def standardize_label_table(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    df = standardize_post_df(df)
-    label_col = None
-    for c in ["Label", "label", "Popularity", "popularity", "Views", "views", "score"]:
-        if c in df.columns:
-            label_col = c
-            break
-    if label_col is None:
-        LOGGER.warning("Label column not found in label table! Columns: %s", list(df.columns))
-        df["label"] = None
-    else:
-        df["label"] = df[label_col].map(to_float)
-    cols = ["Uid", "Pid", "post_id", "label"]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = None
-    return df[cols].drop_duplicates(subset=["post_id"], keep="first").copy()
-
-
 def standardize_category_table(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df = standardize_post_df(df)
-    rename = {
-        "Category": "category",
-        "Subcategory": "subcategory",
-        "Concept": "concept",
-    }
+    rename = {"Category": "category", "Subcategory": "subcategory", "Concept": "concept"}
     df = df.rename(columns=rename)
     for c in ["category", "subcategory", "concept"]:
         if c not in df.columns:
@@ -297,12 +265,7 @@ def standardize_text_table(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df = standardize_post_df(df)
-    rename = {
-        "Title": "title",
-        "Tile": "title",
-        "Mediatype": "mediatype",
-        "Alltags": "alltags",
-    }
+    rename = {"Title": "title", "Tile": "title", "Mediatype": "mediatype", "Alltags": "alltags"}
     df = df.rename(columns=rename)
     for c in ["title", "mediatype", "alltags"]:
         if c not in df.columns:
@@ -316,12 +279,7 @@ def standardize_temporal_table(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df = standardize_post_df(df)
-    rename = {
-        "Postdate": "postdate",
-        "Latitude": "latitude",
-        "Longitude": "longitude",
-        "Geoaccuracy": "geoaccuracy",
-    }
+    rename = {"Postdate": "postdate", "Latitude": "latitude", "Longitude": "longitude", "Geoaccuracy": "geoaccuracy"}
     df = df.rename(columns=rename)
     for c in ["postdate", "latitude", "longitude", "geoaccuracy"]:
         if c not in df.columns:
@@ -338,11 +296,7 @@ def standardize_additional_table(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df = standardize_post_df(df)
-    rename = {
-        "Pathalias": "pathalias",
-        "Ispublic": "ispublic",
-        "Mediastatus": "mediastatus",
-    }
+    rename = {"Pathalias": "pathalias", "Ispublic": "ispublic", "Mediastatus": "mediastatus"}
     df = df.rename(columns=rename)
     for c in ["pathalias", "ispublic", "mediastatus"]:
         if c not in df.columns:
@@ -377,7 +331,6 @@ def standardize_user_table(df: pd.DataFrame) -> pd.DataFrame:
     df = standardize_user_df(df)
 
     lower_to_actual = {str(c).lower(): c for c in df.columns}
-
     alias_candidates = {
         "photo_firstdate": ["photo_firstdate", "firstdate", "user_firstdate", "photofirstdate"],
         "photo_count": ["photo_count", "photocount", "photo_num", "photos", "post_count"],
@@ -407,40 +360,20 @@ def standardize_user_table(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns=mapping)
 
     keep_cols = [
-        "Uid",
-        "photo_firstdate",
-        "photo_count",
-        "ispro",
-        "canbuypro",
-        "timezone_offset",
-        "photo_firstdatetaken",
-        "timezone_id",
-        "user_description",
-        "location_description",
-        "follower_count",
-        "following_count",
-        "total_views",
-        "total_favorites",
-        "mean_views",
-        "mean_favorites",
-        "mean_tags",
+        "Uid", "photo_firstdate", "photo_count", "ispro", "canbuypro",
+        "timezone_offset", "photo_firstdatetaken", "timezone_id",
+        "user_description", "location_description",
+        "follower_count", "following_count", "total_views", "total_favorites",
+        "mean_views", "mean_favorites", "mean_tags",
     ]
     for c in keep_cols:
         if c not in df.columns:
             df[c] = None
 
     int_cols = [
-        "photo_firstdate",
-        "photo_count",
-        "ispro",
-        "canbuypro",
-        "timezone_offset",
-        "photo_firstdatetaken",
-        "timezone_id",
-        "follower_count",
-        "following_count",
-        "total_views",
-        "total_favorites",
+        "photo_firstdate", "photo_count", "ispro", "canbuypro",
+        "timezone_offset", "photo_firstdatetaken", "timezone_id",
+        "follower_count", "following_count", "total_views", "total_favorites",
     ]
     float_cols = ["mean_views", "mean_favorites", "mean_tags"]
 
@@ -468,26 +401,16 @@ def add_user_history_features(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = None
 
     def add_ratio(num_col: str, den_col: str, out_col: str) -> None:
-        df[out_col] = [
-            safe_div(to_float(a), to_float(b))
-            for a, b in zip(df[num_col], df[den_col])
-        ]
+        df[out_col] = [safe_div(to_float(a), to_float(b)) for a, b in zip(df[num_col], df[den_col])]
 
     add_ratio("follower_count", "following_count", "follower_following_ratio")
     add_ratio("total_views", "photo_count", "views_per_photo")
     add_ratio("total_favorites", "photo_count", "favorites_per_photo")
 
     for src in [
-        "photo_count",
-        "follower_count",
-        "following_count",
-        "total_views",
-        "total_favorites",
-        "mean_views",
-        "mean_favorites",
-        "mean_tags",
-        "account_age_days",
-        "camera_age_days",
+        "photo_count", "follower_count", "following_count", "total_views",
+        "total_favorites", "mean_views", "mean_favorites", "mean_tags",
+        "account_age_days", "camera_age_days",
     ]:
         if src in df.columns:
             df[f"{src}_log1p"] = df[src].map(
@@ -499,7 +422,6 @@ def add_user_history_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     if "postdate" not in df.columns:
         return df
@@ -507,20 +429,16 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     ts = pd.to_numeric(df["postdate"], errors="coerce")
     dts = pd.to_datetime(ts, unit="s", utc=True, errors="coerce")
 
-    # 保留 datetime_utc 為 Python datetime object（向後相容）
     df["datetime_utc"] = dts.map(lambda x: x.to_pydatetime() if not pd.isna(x) else None).astype("object")
-
-    df["year"]      = dts.dt.year.where(dts.notna(), other=None).astype("Int64")
-    df["month"]     = dts.dt.month.where(dts.notna(), other=None).astype("Int64")
-    df["day"]       = dts.dt.day.where(dts.notna(), other=None).astype("Int64")
-    df["hour"]      = dts.dt.hour.where(dts.notna(), other=None).astype("Int64")
-    df["weekday"]   = dts.dt.dayofweek.where(dts.notna(), other=None).astype("Int64")
+    df["year"] = dts.dt.year.where(dts.notna(), other=None).astype("Int64")
+    df["month"] = dts.dt.month.where(dts.notna(), other=None).astype("Int64")
+    df["day"] = dts.dt.day.where(dts.notna(), other=None).astype("Int64")
+    df["hour"] = dts.dt.hour.where(dts.notna(), other=None).astype("Int64")
+    df["weekday"] = dts.dt.dayofweek.where(dts.notna(), other=None).astype("Int64")
     df["weekofyear"] = dts.dt.isocalendar().week.where(dts.notna(), other=pd.NA).astype("Int64")
-
-    df["is_weekend"]  = (dts.dt.dayofweek >= 5).astype("Int64").where(dts.notna(), other=pd.NA)
-    df["is_night"]    = ((dts.dt.hour < 6) | (dts.dt.hour >= 22)).astype("Int64").where(dts.notna(), other=pd.NA)
+    df["is_weekend"] = (dts.dt.dayofweek >= 5).astype("Int64").where(dts.notna(), other=pd.NA)
+    df["is_night"] = ((dts.dt.hour < 6) | (dts.dt.hour >= 22)).astype("Int64").where(dts.notna(), other=pd.NA)
     df["is_workhour"] = ((dts.dt.dayofweek < 5) & (dts.dt.hour >= 9) & (dts.dt.hour < 18)).astype("Int64").where(dts.notna(), other=pd.NA)
-
     return df
 
 
@@ -618,16 +536,13 @@ def add_text_stats_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df["has_title"] = df["title"].map(lambda x: int(empty_to_none(x) is not None))
     df["has_tags"] = tag_lists.map(lambda x: int(len(x) > 0))
-
     df["title_len"] = df["title"].map(lambda x: len(str(x)) if empty_to_none(x) is not None else 0)
     df["tags_len"] = df["alltags"].map(lambda x: len(str(x)) if empty_to_none(x) is not None else 0)
     df["full_text_len"] = df["full_text"].map(lambda x: len(str(x)) if empty_to_none(x) is not None else 0)
-
     df["title_word_count"] = df["title"].map(count_words)
     df["full_text_word_count"] = df["full_text"].map(count_words)
     df["tag_count"] = tag_lists.map(len)
     df["avg_tag_len"] = tag_lists.map(lambda tags: (sum(len(t) for t in tags) / len(tags)) if tags else None)
-
     df["title_digit_ratio"] = df["title"].map(lambda x: ratio_by_pattern(x, r"\d"))
     df["title_upper_ratio"] = df["title"].map(lambda x: ratio_by_pattern(x, r"[A-Z]"))
     df["title_punct_ratio"] = df["title"].map(lambda x: ratio_by_pattern(x, r"[^\w\s]"))
@@ -684,10 +599,7 @@ def add_geo_bin_features(df: pd.DataFrame, n_bins: int = 20) -> pd.DataFrame:
             return None
         return f"{int(lat_b)}_{int(lon_b)}"
 
-    df["geo_cluster"] = [
-        make_geo_bucket(h, a, b)
-        for h, a, b in zip(df["has_geo"], df["lat_bin"], df["lon_bin"])
-    ]
+    df["geo_cluster"] = [make_geo_bucket(h, a, b) for h, a, b in zip(df["has_geo"], df["lat_bin"], df["lon_bin"])]
     return df
 
 
@@ -716,13 +628,15 @@ def add_account_age_features(df: pd.DataFrame) -> pd.DataFrame:
     df["account_age_days"] = [diff_days(a, b) for a, b in zip(df["postdate"], df["photo_firstdate"])]
     df["camera_age_days"] = [diff_days(a, b) for a, b in zip(df["postdate"], df["photo_firstdatetaken"])]
 
-    # 負值代表資料異常（firstdate > postdate），clip 到 0 避免 log1p 出錯
     for col in ["account_age_days", "camera_age_days"]:
         df[col] = df[col].map(lambda x: max(x, 0.0) if x is not None else None)
     return df
 
 
 def add_user_aggregate_features(train_df: pd.DataFrame, target_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep aligned output columns across train / val / test.
+    """
     if train_df.empty or "Uid" not in train_df.columns or "Uid" not in target_df.columns:
         return target_df
 
@@ -733,12 +647,12 @@ def add_user_aggregate_features(train_df: pd.DataFrame, target_df: pd.DataFrame)
     agg = (
         work.groupby("Uid", dropna=True)
         .agg(
-            user_post_count_global=("post_id", "count"),
-            user_mean_label_global=("label", "mean"),
-            user_median_label_global=("label", "median"),
-            user_std_label_global=("label", "std"),
-            user_category_nunique_global=("category", _safe_nunique),
-            user_active_hour_mean_global=("hour", "mean"),
+            user_prev_post_count=("post_id", "count"),
+            user_mean_label=("label", "mean"),
+            user_median_label=("label", "median"),
+            user_std_label=("label", "std"),
+            user_category_nunique=("category", _safe_nunique),
+            user_active_hour_mean=("hour", "mean"),
         )
         .reset_index()
     )
@@ -751,16 +665,11 @@ def add_user_aggregate_features(train_df: pd.DataFrame, target_df: pd.DataFrame)
         work["user_prev_post_count"] = g.cumcount()
         work["_label_filled"] = work["label"].fillna(0.0)
         work["_label_seen"] = work["label"].notna().astype(int)
-
         work["_cum_label_sum"] = g["_label_filled"].cumsum() - work["_label_filled"]
         work["_cum_label_cnt"] = g["_label_seen"].cumsum() - work["_label_seen"]
         work["user_mean_label"] = work["_cum_label_sum"] / work["_cum_label_cnt"].replace(0, pd.NA)
+        work["user_active_hour_mean"] = g["hour"].expanding().mean().reset_index(level=0, drop=True).shift(1)
 
-        work["user_active_hour_mean"] = (
-            g["hour"].expanding().mean().reset_index(level=0, drop=True).shift(1)
-        )
-
-        # 向量化計算 expanding category nunique（每個 user 在當前 post 之前看過的 category 種數）
         def _expanding_nunique(series: pd.Series) -> pd.Series:
             result = []
             seen = set()
@@ -771,10 +680,8 @@ def add_user_aggregate_features(train_df: pd.DataFrame, target_df: pd.DataFrame)
                     seen.add(cat)
             return pd.Series(result, index=series.index)
 
-        cat_col = work["category"] if "category" in work.columns else pd.Series([None] * len(work), index=work.index)
         work["user_category_nunique"] = (
-            work.groupby("Uid", dropna=False)["category"]
-            .transform(_expanding_nunique)
+            work.groupby("Uid", dropna=False)["category"].transform(_expanding_nunique)
             if "category" in work.columns
             else 0
         )
@@ -789,21 +696,36 @@ def add_user_aggregate_features(train_df: pd.DataFrame, target_df: pd.DataFrame)
             ]],
             on="post_id",
             how="left",
+        ).merge(
+            agg.rename(columns={
+                "user_prev_post_count": "_user_prev_post_count_global",
+                "user_mean_label": "_user_mean_label_global",
+                "user_median_label": "_user_median_label_global",
+                "user_std_label": "_user_std_label_global",
+                "user_category_nunique": "_user_category_nunique_global",
+                "user_active_hour_mean": "_user_active_hour_mean_global",
+            }),
+            on="Uid",
+            how="left",
         )
-        out = out.merge(agg, on="Uid", how="left")
+
+        for col, fallback in [
+            ("user_prev_post_count", "_user_prev_post_count_global"),
+            ("user_mean_label", "_user_mean_label_global"),
+            ("user_category_nunique", "_user_category_nunique_global"),
+            ("user_active_hour_mean", "_user_active_hour_mean_global"),
+        ]:
+            out[col] = out[col].where(out[col].notna(), out[fallback])
+
+        out["user_median_label"] = out["_user_median_label_global"]
+        out["user_std_label"] = out["_user_std_label_global"]
+
+        drop_cols = [c for c in out.columns if c.startswith("_user_")] + ["_label_filled", "_label_seen", "_cum_label_sum", "_cum_label_cnt"]
+        out = out.drop(columns=[c for c in drop_cols if c in out.columns], errors="ignore")
         return out
 
     out = target_df.merge(agg, on="Uid", how="left")
-    out = out.rename(columns={
-        "user_post_count_global": "user_prev_post_count",
-        "user_mean_label_global": "user_mean_label",
-        "user_median_label_global": "user_median_label",
-        "user_std_label_global": "user_std_label",
-        "user_category_nunique_global": "user_category_nunique",
-        "user_active_hour_mean_global": "user_active_hour_mean",
-    })
     return out
-
 
 
 def load_split(input_dir: Path, split: str) -> pd.DataFrame:
@@ -816,7 +738,7 @@ def load_split(input_dir: Path, split: str) -> pd.DataFrame:
     temporal_file = split_dir / f"{prefix}_temporalspatial_information.json"
     user_file = split_dir / f"{prefix}_user_data.json"
     additional_file = split_dir / f"{prefix}_additional_information.json"
-    label_file = split_dir / f"{prefix}_label.json"
+    label_txt_file = split_dir / f"{prefix}_label.txt"
 
     if not img_path_file.exists():
         raise FileNotFoundError(f"Missing required file: {img_path_file}")
@@ -827,12 +749,29 @@ def load_split(input_dir: Path, split: str) -> pd.DataFrame:
     temporal_df = standardize_temporal_table(load_json_table(temporal_file))
     user_df = standardize_user_table(load_json_table(user_file))
     additional_df = standardize_additional_table(load_json_table(additional_file))
-    label_df = standardize_label_table(load_json_table(label_file)) if label_file.exists() else pd.DataFrame()
 
     out = image_df.copy()
 
+    # Train labels are aligned by row order with train_img_filepath.txt
+    if split == "train" and label_txt_file.exists():
+        label_df = load_label_txt(label_txt_file)
+
+        if len(label_df) != len(out):
+            raise ValueError(
+                f"Label count ({len(label_df)}) != image count ({len(out)}) for split={split}. "
+                "train_label.txt must align row-by-row with train_img_filepath.txt"
+            )
+
+        out = out.reset_index(drop=True)
+        label_df = label_df.reset_index(drop=True)
+        out["label"] = label_df["label"]
+        LOGGER.info("%s split: label loaded from txt with %d entries", split, len(label_df))
+    else:
+        out["label"] = None
+        if split == "train":
+            LOGGER.warning("%s split: %s missing, labels will be None", split, label_txt_file.name)
+
     for name, df in [
-        ("label", label_df),
         ("category", category_df),
         ("text", text_df),
         ("temporal", temporal_df),
@@ -886,11 +825,76 @@ def load_split(input_dir: Path, split: str) -> pd.DataFrame:
         "account_age_days_log1p", "camera_age_days_log1p",
         "has_user_description", "has_location_description",
         "user_description", "location_description",
+        "user_prev_post_count", "user_mean_label", "user_median_label",
+        "user_std_label", "user_category_nunique", "user_active_hour_mean",
     ]
     existing_front = [c for c in front if c in out.columns]
     remaining = [c for c in out.columns if c not in existing_front]
     out = out[existing_front + remaining]
     return out
+
+
+def split_train_valid(
+    train_df: pd.DataFrame,
+    val_ratio: float = 0.1,
+    split_seed: int = 42,
+    split_by: str = "user",
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if train_df.empty:
+        raise ValueError("train_df is empty; cannot split train/valid.")
+    if not (0.0 < val_ratio < 1.0):
+        raise ValueError(f"val_ratio must be in (0, 1), got {val_ratio}")
+
+    split_by = str(split_by).lower()
+
+    if split_by == "user":
+        if "Uid" not in train_df.columns:
+            raise ValueError("split_by='user' requires 'Uid' column.")
+        unique_users = train_df[["Uid"]].drop_duplicates().sample(frac=1.0, random_state=split_seed).reset_index(drop=True)
+        n_val_users = max(1, int(round(len(unique_users) * val_ratio)))
+        val_users = set(unique_users.iloc[:n_val_users]["Uid"].astype(str).tolist())
+
+        val_mask = train_df["Uid"].astype(str).isin(val_users)
+        val_df = train_df[val_mask].copy()
+        train_sub_df = train_df[~val_mask].copy()
+
+    elif split_by == "post":
+        shuffled = train_df.sample(frac=1.0, random_state=split_seed)
+        n_val = max(1, int(round(len(shuffled) * val_ratio)))
+        val_df = shuffled.iloc[:n_val].copy()
+        train_sub_df = shuffled.iloc[n_val:].copy()
+
+    else:
+        raise ValueError(f"Unsupported split_by: {split_by}. Use 'user' or 'post'.")
+
+    train_sub_df = train_sub_df.reset_index(drop=True)
+    val_df = val_df.reset_index(drop=True)
+    train_sub_df["split"] = "train"
+    val_df["split"] = "val"
+
+    LOGGER.info(
+        "Created train/val split with split_by=%s, val_ratio=%.4f -> train=%d, val=%d",
+        split_by, val_ratio, len(train_sub_df), len(val_df)
+    )
+    return train_sub_df, val_df
+
+
+def align_columns(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    all_cols: List[str] = []
+    for df in [train_df, val_df, test_df]:
+        for c in df.columns:
+            if c not in all_cols:
+                all_cols.append(c)
+
+    for df in [train_df, val_df, test_df]:
+        for c in all_cols:
+            if c not in df.columns:
+                df[c] = None
+
+    train_df = train_df[all_cols].copy()
+    val_df = val_df[all_cols].copy()
+    test_df = test_df[all_cols].copy()
+    return train_df, val_df, test_df
 
 
 def save_split(df: pd.DataFrame, output_dir: Path, split: str) -> None:
@@ -922,13 +926,16 @@ def save_split(df: pd.DataFrame, output_dir: Path, split: str) -> None:
     LOGGER.info("Saved %s", csv_path)
 
 
-def save_summary(train_df: pd.DataFrame, test_df: pd.DataFrame, output_dir: Path) -> None:
+def save_summary(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame, output_dir: Path) -> None:
     summary = {
         "train_rows": int(len(train_df)),
+        "val_rows": int(len(val_df)),
         "test_rows": int(len(test_df)),
         "train_cols": list(train_df.columns),
+        "val_cols": list(val_df.columns),
         "test_cols": list(test_df.columns),
         "train_missing_label": int(train_df["label"].isna().sum()) if "label" in train_df.columns else None,
+        "val_missing_label": int(val_df["label"].isna().sum()) if "label" in val_df.columns else None,
         "test_missing_label": int(test_df["label"].isna().sum()) if "label" in test_df.columns else None,
     }
     path = output_dir / "summary.json"
@@ -938,10 +945,13 @@ def save_summary(train_df: pd.DataFrame, test_df: pd.DataFrame, output_dir: Path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build unified SMP dataset tables.")
+    parser = argparse.ArgumentParser(description="Build unified SMP dataset tables with train/val split.")
     parser.add_argument("--input_dir", type=str, required=True, help="Folder containing raw official files.")
     parser.add_argument("--output_dir", type=str, required=True, help="Output folder.")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation ratio split from train. Default: 0.1")
+    parser.add_argument("--split_seed", type=int, default=42, help="Random seed for train/val split.")
+    parser.add_argument("--split_by", type=str, default="user", choices=["user", "post"], help="Split validation by 'user' or 'post'. Default: user")
     return parser.parse_args()
 
 
@@ -955,22 +965,37 @@ def main() -> None:
     LOGGER.info("Input dir: %s", input_dir)
     LOGGER.info("Output dir: %s", output_dir)
 
-    train_df = load_split(input_dir, "train")
+    official_train_df = load_split(input_dir, "train")
     test_df = load_split(input_dir, "test")
 
+    train_df, val_df = split_train_valid(
+        official_train_df,
+        val_ratio=args.val_ratio,
+        split_seed=args.split_seed,
+        split_by=args.split_by,
+    )
+
+    # Fit user aggregate features on train only
     train_df = add_user_aggregate_features(train_df, train_df)
+    val_df = add_user_aggregate_features(train_df, val_df)
     test_df = add_user_aggregate_features(train_df, test_df)
 
+    # Keep schema aligned
+    train_df, val_df, test_df = align_columns(train_df, val_df, test_df)
+
     save_split(train_df, output_dir, "train")
+    save_split(val_df, output_dir, "val")
     save_split(test_df, output_dir, "test")
-    save_summary(train_df, test_df, output_dir)
+    save_summary(train_df, val_df, test_df, output_dir)
 
     LOGGER.info("Done.")
     LOGGER.info("Train shape: %s", train_df.shape)
+    LOGGER.info("Val shape: %s", val_df.shape)
     LOGGER.info("Test shape: %s", test_df.shape)
 
 
 if __name__ == "__main__":
     main()
 
-# python build_dataset_v1.py --input_dir ./data/raw --output_dir ./data/processed
+# Example:
+# python build_dataset.py --input_dir ./data/raw --output_dir ./data/processed --val_ratio 0.1 --split_by user
