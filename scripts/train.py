@@ -23,6 +23,7 @@ from src.datasets.metadata_preprocessor import MetadataPreprocessor
 from src.datasets.smp_datasets import SMPDataset, smp_collate_fn
 from src.engine.trainer import Trainer
 from src.models.fusion_model import SMPFusionModel
+from src.utils.criterion import PairwiseRankingLoss, HybridLoss
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,15 +77,24 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def build_loss(loss_name: str) -> torch.nn.Module:
+
+def build_loss(loss_name: str):
     name = loss_name.lower()
+
     if name == "mse":
-        return torch.nn.MSELoss()
-    if name == "mae" or name == "l1":
-        return torch.nn.L1Loss()
-    if name == "smoothl1":
-        return torch.nn.SmoothL1Loss()
-    raise ValueError(f"Unsupported loss: {loss_name}")
+        base_loss = torch.nn.MSELoss()
+    elif name == "mae" or name == "l1":
+        base_loss = torch.nn.L1Loss()
+    elif name == "smoothl1":
+        base_loss = torch.nn.SmoothL1Loss()
+    elif name == "ranking":
+        return PairwiseRankingLoss()
+    elif name == "hybrid":
+        return HybridLoss()
+    else:
+        raise ValueError(f"Unsupported loss: {loss_name}")
+
+    return base_loss
 
 
 def load_dataframe(path: str) -> pd.DataFrame:
@@ -246,4 +256,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# python scripts/train.py --config configs/text_meta_v1.yaml
+# python3 scripts/train.py --config configs/text_meta_v1.yaml
