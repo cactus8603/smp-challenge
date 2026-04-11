@@ -3,23 +3,21 @@ exp_name: text_meta_cross_v1
 
 data:
   train_path: data/processed/train.parquet
-  val_path: data/processed/test.parquet
+  val_path: data/processed/val.parquet
 
 model:
   use_text: true
   use_meta: true
   use_image: false
-  hidden_dim: 256
+  hidden_dim: 128
   dropout: 0.1
 
 text:
   model_name: openai/clip-vit-base-patch32
   max_length: 77
   pooling: clip
-  trainable: false
+  trainable: true
 
-meta:
-  branch_dim: 128
 
 image:
   model_name: resnet50
@@ -30,11 +28,11 @@ fusion:
   type: cross_feature
 
 loss:
-  name: smoothl1
+  name: hybrid
 
 train:
   batch_size: 16
-  num_workers: 0 # BUG: Windows DataLoader multiprocessing pickle problem
+  num_workers: 6 # BUG: Windows DataLoader multiprocessing pickle problem (use 0)
   pin_memory: true
   epochs: 8
   lr: 2.0e-5

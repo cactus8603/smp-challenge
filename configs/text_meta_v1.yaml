@@ -3,12 +3,12 @@ base: base.yaml
 exp_name: text_meta_cross_v1
 
 train:
-  batch_size: 16
-  lr: 2.0e-5
+  batch_size: 256
+  lr: 2.0e-4
   epochs: 8
 
 model:
-  hidden_dim: 256
+  hidden_dim: 128
   dropout: 0.1
 
 meta:
