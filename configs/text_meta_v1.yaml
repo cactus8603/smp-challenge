@@ -1,0 +1,12 @@
+base: configs/base.yaml
+
+exp_name: text_meta_v1
+
+model:
+  hidden_dim: 256
+  dropout: 0.1
+
+train:
+  batch_size: 16
+  lr: 2.0e-5
+  epochs: 8
