@@ -4,75 +4,62 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from transformers import AutoModel
+from transformers import CLIPTextModelWithProjection
 
 
 class TextEncoder(nn.Module):
     """
-    Generic text encoder wrapper for HuggingFace transformer models.
+    CLIP-based text encoder.
 
     Design goals:
-    - Easy to swap backbone model later
-    - Unified output dimension via optional projection
-    - Support common pooling methods
+    - Keep the interface close to the old text encoder
+    - Output a unified text representation [B, output_dim]
+    - Support optional freezing for lower training cost
+    - Stay easy to plug into fusion with metadata
+
+    Recommended model_name:
+        "openai/clip-vit-base-patch32"
+
+    Important:
+    - If you switch to CLIP here, your dataset/tokenizer side should also use
+      the matching CLIP tokenizer and usually max_length=77.
     """
 
     def __init__(
         self,
-        model_name: str = "distilbert-base-uncased",
-        
+        model_name: str = "openai/clip-vit-base-patch32",
         output_dim: Optional[int] = None,
-        pooling: str = "cls",
+        pooling: str = "clip",
         dropout: float = 0.1,
-        trainable: bool = True,
+        trainable: bool = False,
     ) -> None:
         super().__init__()
 
-        self.model = AutoModel.from_pretrained(model_name)
+        self.model = CLIPTextModelWithProjection.from_pretrained(model_name)
         self.hidden_size = self.model.config.hidden_size
-        self.pooling = pooling.lower()
+        self.projection_dim = self.model.config.projection_dim
 
-        if self.pooling not in {"cls", "mean"}:
-            raise ValueError(f"Unsupported pooling: {pooling}")
+        # Kept for interface compatibility with the old encoder.
+        self.pooling = pooling.lower()
+        if self.pooling not in {"clip"}:
+            raise ValueError(
+                f"Unsupported pooling for CLIP text encoder: {pooling}. "
+                "Use pooling='clip'."
+            )
 
         if not trainable:
             for param in self.model.parameters():
                 param.requires_grad = False
 
-        self.output_dim = output_dim if output_dim is not None else self.hidden_size
+        self.output_dim = output_dim if output_dim is not None else self.projection_dim
 
         self.proj = None
-        if self.output_dim != self.hidden_size:
+        if self.output_dim != self.projection_dim:
             self.proj = nn.Sequential(
                 nn.Dropout(dropout),
-                nn.Linear(self.hidden_size, self.output_dim),
+                nn.Linear(self.projection_dim, self.output_dim),
                 nn.LayerNorm(self.output_dim),
             )
-
-    def _mean_pool(
-        self,
-        last_hidden_state: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Mean pooling over valid tokens only.
-        """
-        mask = attention_mask.unsqueeze(-1).float()  # [B, L, 1]
-        masked_hidden = last_hidden_state * mask
-        summed = masked_hidden.sum(dim=1)            # [B, H]
-        counts = mask.sum(dim=1).clamp(min=1e-6)     # [B, 1]
-        return summed / counts
-
-    def _pool(
-        self,
-        last_hidden_state: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.pooling == "cls":
-            return last_hidden_state[:, 0]
-        if self.pooling == "mean":
-            return self._mean_pool(last_hidden_state, attention_mask)
-        raise RuntimeError(f"Unexpected pooling: {self.pooling}")
 
     def forward(
         self,
@@ -84,9 +71,27 @@ class TextEncoder(nn.Module):
             attention_mask=attention_mask,
         )
 
-        x = self._pool(outputs.last_hidden_state, attention_mask)
+        # [B, projection_dim]
+        x = outputs.text_embeds
 
         if self.proj is not None:
             x = self.proj(x)
 
         return x
+
+
+if __name__ == "__main__":
+    batch_size = 2
+    seq_len = 16
+
+    model = TextEncoder(
+        model_name="openai/clip-vit-base-patch32",
+        output_dim=256,
+        trainable=False,
+    )
+
+    input_ids = torch.randint(0, 100, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+
+    y = model(input_ids=input_ids, attention_mask=attention_mask)
+    print("output shape:", y.shape)
