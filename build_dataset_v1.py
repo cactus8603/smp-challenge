@@ -101,6 +101,12 @@ def to_float(value: Any) -> Optional[float]:
         return None
 
 
+def safe_div(a: float, b: float) -> Optional[float]:
+    if a is None or b is None or b == 0:
+        return None
+    return a / b
+
+
 def parse_json_file(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -128,7 +134,7 @@ def normalize_record_keys(record: Dict[str, Any]) -> Dict[str, Any]:
     }
     out = {}
     for k, v in record.items():
-        nk = alias_map.get(str(k), alias_map.get(str(k).lower(), str(k)))
+        nk = alias_map.get(str(k).lower(), str(k))
         out[nk] = v
     return out
 
@@ -178,13 +184,11 @@ def parse_img_filepath_line(line: str, split: str) -> Optional[Dict[str, Any]]:
     normalized = raw.replace("\\", "/")
     parts = [p for p in normalized.split("/") if p not in ("", ".")]
 
-    # Find ".../<split>/<Uid>/<Pid>.ext"
     try:
         split_idx = parts.index(split)
         uid = parts[split_idx + 1]
         pid = Path(parts[split_idx + 2]).stem
     except Exception:
-        # fallback: just use last 2 segments
         if len(parts) < 2:
             return None
         uid = parts[-2]
@@ -259,7 +263,11 @@ def standardize_label_table(df: pd.DataFrame) -> pd.DataFrame:
         if c in df.columns:
             label_col = c
             break
-    df["label"] = df[label_col].map(to_float) if label_col else None
+    if label_col is None:
+        LOGGER.warning("Label column not found in label table! Columns: %s", list(df.columns))
+        df["label"] = None
+    else:
+        df["label"] = df[label_col].map(to_float)
     cols = ["Uid", "Pid", "post_id", "label"]
     for c in cols:
         if c not in df.columns:
@@ -368,22 +376,33 @@ def standardize_user_table(df: pd.DataFrame) -> pd.DataFrame:
         return df
     df = standardize_user_df(df)
 
-    # normalize lower-case columns if needed
     lower_to_actual = {str(c).lower(): c for c in df.columns}
+
+    alias_candidates = {
+        "photo_firstdate": ["photo_firstdate", "firstdate", "user_firstdate", "photofirstdate"],
+        "photo_count": ["photo_count", "photocount", "photo_num", "photos", "post_count"],
+        "ispro": ["ispro", "is_pro", "pro", "professional", "professional_status"],
+        "canbuypro": ["canbuypro", "can_buy_pro"],
+        "timezone_offset": ["timezone_offset", "timezoneoffset", "tz_offset"],
+        "photo_firstdatetaken": ["photo_firstdatetaken", "firstdatetaken", "photo_first_date_taken"],
+        "timezone_id": ["timezone_id", "timezoneid", "tz_id"],
+        "user_description": ["user_description", "userdescription", "description", "bio"],
+        "location_description": ["location_description", "locationdescription", "location", "hometown"],
+        "follower_count": ["follower_count", "followers", "followers_count", "follower", "num_followers"],
+        "following_count": ["following_count", "following", "following_count_num", "contacts", "contact_count", "num_following"],
+        "total_views": ["total_views", "views", "view_count", "count_views", "totalviews"],
+        "total_favorites": ["total_favorites", "favorites", "faves", "favourites", "favorite_count", "fave_count"],
+        "mean_views": ["mean_views", "avg_views", "average_views", "mean_view"],
+        "mean_favorites": ["mean_favorites", "avg_favorites", "average_favorites", "mean_faves", "mean_favorites_count"],
+        "mean_tags": ["mean_tags", "avg_tags", "average_tags", "mean_tag"],
+    }
+
     mapping = {}
-    for src, dst in [
-        ("photo_firstdate", "photo_firstdate"),
-        ("photo_count", "photo_count"),
-        ("ispro", "ispro"),
-        ("canbuypro", "canbuypro"),
-        ("timezone_offset", "timezone_offset"),
-        ("photo_firstdatetaken", "photo_firstdatetaken"),
-        ("timezone_id", "timezone_id"),
-        ("user_description", "user_description"),
-        ("location_description", "location_description"),
-    ]:
-        if src in lower_to_actual:
-            mapping[lower_to_actual[src]] = dst
+    for dst, aliases in alias_candidates.items():
+        for src in aliases:
+            if src in lower_to_actual:
+                mapping[lower_to_actual[src]] = dst
+                break
 
     df = df.rename(columns=mapping)
 
@@ -398,6 +417,13 @@ def standardize_user_table(df: pd.DataFrame) -> pd.DataFrame:
         "timezone_id",
         "user_description",
         "location_description",
+        "follower_count",
+        "following_count",
+        "total_views",
+        "total_favorites",
+        "mean_views",
+        "mean_favorites",
+        "mean_tags",
     ]
     for c in keep_cols:
         if c not in df.columns:
@@ -411,9 +437,17 @@ def standardize_user_table(df: pd.DataFrame) -> pd.DataFrame:
         "timezone_offset",
         "photo_firstdatetaken",
         "timezone_id",
+        "follower_count",
+        "following_count",
+        "total_views",
+        "total_favorites",
     ]
+    float_cols = ["mean_views", "mean_favorites", "mean_tags"]
+
     for c in int_cols:
         df[c] = df[c].map(to_int)
+    for c in float_cols:
+        df[c] = df[c].map(to_float)
 
     for c in ["user_description", "location_description"]:
         df[c] = df[c].map(parse_vector_like)
@@ -421,27 +455,90 @@ def standardize_user_table(df: pd.DataFrame) -> pd.DataFrame:
     return df[keep_cols].drop_duplicates(subset=["Uid"], keep="first").copy()
 
 
+def _safe_nunique(series: pd.Series) -> int:
+    return int(series.dropna().nunique())
+
+
+def add_user_history_features(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    for c in ["follower_count", "following_count", "photo_count", "total_views", "total_favorites", "mean_views", "mean_favorites", "mean_tags"]:
+        if c not in df.columns:
+            df[c] = None
+
+    def add_ratio(num_col: str, den_col: str, out_col: str) -> None:
+        df[out_col] = [
+            safe_div(to_float(a), to_float(b))
+            for a, b in zip(df[num_col], df[den_col])
+        ]
+
+    add_ratio("follower_count", "following_count", "follower_following_ratio")
+    add_ratio("total_views", "photo_count", "views_per_photo")
+    add_ratio("total_favorites", "photo_count", "favorites_per_photo")
+
+    for src in [
+        "photo_count",
+        "follower_count",
+        "following_count",
+        "total_views",
+        "total_favorites",
+        "mean_views",
+        "mean_favorites",
+        "mean_tags",
+        "account_age_days",
+        "camera_age_days",
+    ]:
+        if src in df.columns:
+            df[f"{src}_log1p"] = df[src].map(
+                lambda x: math.log1p(x) if x is not None and not pd.isna(x) and x >= 0 else None
+            )
+
+    df["has_user_description"] = df["user_description"].map(lambda x: int(empty_to_none(x) is not None))
+    df["has_location_description"] = df["location_description"].map(lambda x: int(empty_to_none(x) is not None))
+    return df
+
+
+
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     if "postdate" not in df.columns:
         return df
 
-    def ts_to_dt(ts: Any) -> Optional[datetime]:
-        ts = to_int(ts)
-        if ts is None:
-            return None
-        try:
-            return datetime.fromtimestamp(ts, tz=timezone.utc)
-        except Exception:
-            return None
+    ts = pd.to_numeric(df["postdate"], errors="coerce")
+    dts = pd.to_datetime(ts, unit="s", utc=True, errors="coerce")
 
-    dts = df["postdate"].map(ts_to_dt)
-    df["datetime_utc"] = dts.astype("object")
-    df["year"] = dts.map(lambda x: x.year if x is not None else None)
-    df["month"] = dts.map(lambda x: x.month if x is not None else None)
-    df["day"] = dts.map(lambda x: x.day if x is not None else None)
-    df["hour"] = dts.map(lambda x: x.hour if x is not None else None)
-    df["weekday"] = dts.map(lambda x: x.weekday() if x is not None else None)
-    df["is_weekend"] = dts.map(lambda x: int(x.weekday() >= 5) if x is not None else None)
+    # 保留 datetime_utc 為 Python datetime object（向後相容）
+    df["datetime_utc"] = dts.map(lambda x: x.to_pydatetime() if not pd.isna(x) else None).astype("object")
+
+    df["year"]      = dts.dt.year.where(dts.notna(), other=None).astype("Int64")
+    df["month"]     = dts.dt.month.where(dts.notna(), other=None).astype("Int64")
+    df["day"]       = dts.dt.day.where(dts.notna(), other=None).astype("Int64")
+    df["hour"]      = dts.dt.hour.where(dts.notna(), other=None).astype("Int64")
+    df["weekday"]   = dts.dt.dayofweek.where(dts.notna(), other=None).astype("Int64")
+    df["weekofyear"] = dts.dt.isocalendar().week.where(dts.notna(), other=pd.NA).astype("Int64")
+
+    df["is_weekend"]  = (dts.dt.dayofweek >= 5).astype("Int64").where(dts.notna(), other=pd.NA)
+    df["is_night"]    = ((dts.dt.hour < 6) | (dts.dt.hour >= 22)).astype("Int64").where(dts.notna(), other=pd.NA)
+    df["is_workhour"] = ((dts.dt.dayofweek < 5) & (dts.dt.hour >= 9) & (dts.dt.hour < 18)).astype("Int64").where(dts.notna(), other=pd.NA)
+
+    return df
+
+
+def add_cyclic_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    import numpy as np
+
+    if "hour" in df.columns:
+        h = pd.to_numeric(df["hour"], errors="coerce")
+        df["hour_sin"] = np.sin(2 * np.pi * h / 24)
+        df["hour_cos"] = np.cos(2 * np.pi * h / 24)
+    if "weekday" in df.columns:
+        w = pd.to_numeric(df["weekday"], errors="coerce")
+        df["weekday_sin"] = np.sin(2 * np.pi * w / 7)
+        df["weekday_cos"] = np.cos(2 * np.pi * w / 7)
+    if "month" in df.columns:
+        m = pd.to_numeric(df["month"], errors="coerce")
+        df["month_sin"] = np.sin(2 * np.pi * m / 12)
+        df["month_cos"] = np.cos(2 * np.pi * m / 12)
     return df
 
 
@@ -479,9 +576,238 @@ def add_extra_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def split_tags(value: Any) -> List[str]:
+    value = empty_to_none(value)
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items = value
+    else:
+        text = str(value).strip()
+        items = re.split(r"[\s,;|]+", text)
+    return [str(x).strip() for x in items if empty_to_none(x) is not None]
+
+
+def count_words(text: Any) -> int:
+    text = empty_to_none(text)
+    if text is None:
+        return 0
+    return len(re.findall(r"\S+", str(text)))
+
+
+def ratio_by_pattern(text: Any, pattern: str) -> Optional[float]:
+    text = empty_to_none(text)
+    if text is None:
+        return None
+    s = str(text)
+    if len(s) == 0:
+        return None
+    matches = re.findall(pattern, s)
+    return len(matches) / len(s)
+
+
+def add_text_stats_features(df: pd.DataFrame) -> pd.DataFrame:
+    if "title" not in df.columns:
+        df["title"] = None
+    if "alltags" not in df.columns:
+        df["alltags"] = None
+    if "full_text" not in df.columns:
+        df["full_text"] = None
+
+    tag_lists = df["alltags"].map(split_tags)
+
+    df["has_title"] = df["title"].map(lambda x: int(empty_to_none(x) is not None))
+    df["has_tags"] = tag_lists.map(lambda x: int(len(x) > 0))
+
+    df["title_len"] = df["title"].map(lambda x: len(str(x)) if empty_to_none(x) is not None else 0)
+    df["tags_len"] = df["alltags"].map(lambda x: len(str(x)) if empty_to_none(x) is not None else 0)
+    df["full_text_len"] = df["full_text"].map(lambda x: len(str(x)) if empty_to_none(x) is not None else 0)
+
+    df["title_word_count"] = df["title"].map(count_words)
+    df["full_text_word_count"] = df["full_text"].map(count_words)
+    df["tag_count"] = tag_lists.map(len)
+    df["avg_tag_len"] = tag_lists.map(lambda tags: (sum(len(t) for t in tags) / len(tags)) if tags else None)
+
+    df["title_digit_ratio"] = df["title"].map(lambda x: ratio_by_pattern(x, r"\d"))
+    df["title_upper_ratio"] = df["title"].map(lambda x: ratio_by_pattern(x, r"[A-Z]"))
+    df["title_punct_ratio"] = df["title"].map(lambda x: ratio_by_pattern(x, r"[^\w\s]"))
+    df["full_text_digit_ratio"] = df["full_text"].map(lambda x: ratio_by_pattern(x, r"\d"))
+    df["full_text_punct_ratio"] = df["full_text"].map(lambda x: ratio_by_pattern(x, r"[^\w\s]"))
+    return df
+
+
+def add_category_combo_features(df: pd.DataFrame) -> pd.DataFrame:
+    if "category" not in df.columns:
+        df["category"] = None
+    if "subcategory" not in df.columns:
+        df["subcategory"] = None
+    if "concept" not in df.columns:
+        df["concept"] = None
+
+    def make_combo(a: Any, b: Any) -> Optional[str]:
+        a = empty_to_none(a)
+        b = empty_to_none(b)
+        if a is None and b is None:
+            return None
+        return f"{a if a is not None else 'NA'}__{b if b is not None else 'NA'}"
+
+    df["category_subcategory_combo"] = [make_combo(a, b) for a, b in zip(df["category"], df["subcategory"])]
+    df["category_concept_combo"] = [make_combo(a, b) for a, b in zip(df["category"], df["concept"])]
+    return df
+
+
+def add_geo_bin_features(df: pd.DataFrame, n_bins: int = 20) -> pd.DataFrame:
+    if "latitude" not in df.columns:
+        df["latitude"] = None
+    if "longitude" not in df.columns:
+        df["longitude"] = None
+
+    lat_series = pd.to_numeric(df["latitude"], errors="coerce")
+    lon_series = pd.to_numeric(df["longitude"], errors="coerce")
+
+    try:
+        lat_bin = pd.cut(lat_series, bins=n_bins, labels=False, duplicates="drop")
+    except Exception:
+        lat_bin = pd.Series([None] * len(df), index=df.index)
+    try:
+        lon_bin = pd.cut(lon_series, bins=n_bins, labels=False, duplicates="drop")
+    except Exception:
+        lon_bin = pd.Series([None] * len(df), index=df.index)
+
+    df["lat_bin"] = lat_bin.astype("Int64")
+    df["lon_bin"] = lon_bin.astype("Int64")
+
+    def make_geo_bucket(has_geo: Any, lat_b: Any, lon_b: Any) -> Optional[str]:
+        if to_int(has_geo) != 1:
+            return None
+        if pd.isna(lat_b) or pd.isna(lon_b):
+            return None
+        return f"{int(lat_b)}_{int(lon_b)}"
+
+    df["geo_cluster"] = [
+        make_geo_bucket(h, a, b)
+        for h, a, b in zip(df["has_geo"], df["lat_bin"], df["lon_bin"])
+    ]
+    return df
+
+
+def add_label_features(df: pd.DataFrame) -> pd.DataFrame:
+    if "label" not in df.columns:
+        return df
+    df["label_log1p"] = df["label"].map(lambda x: math.log1p(x) if x is not None and not pd.isna(x) and x >= 0 else None)
+    return df
+
+
+def add_account_age_features(df: pd.DataFrame) -> pd.DataFrame:
+    def diff_days(a: Any, b: Any) -> Optional[float]:
+        a = to_float(a)
+        b = to_float(b)
+        if a is None or b is None:
+            return None
+        return (a - b) / 86400.0
+
+    if "postdate" not in df.columns:
+        df["postdate"] = None
+    if "photo_firstdate" not in df.columns:
+        df["photo_firstdate"] = None
+    if "photo_firstdatetaken" not in df.columns:
+        df["photo_firstdatetaken"] = None
+
+    df["account_age_days"] = [diff_days(a, b) for a, b in zip(df["postdate"], df["photo_firstdate"])]
+    df["camera_age_days"] = [diff_days(a, b) for a, b in zip(df["postdate"], df["photo_firstdatetaken"])]
+
+    # 負值代表資料異常（firstdate > postdate），clip 到 0 避免 log1p 出錯
+    for col in ["account_age_days", "camera_age_days"]:
+        df[col] = df[col].map(lambda x: max(x, 0.0) if x is not None else None)
+    return df
+
+
+def add_user_aggregate_features(train_df: pd.DataFrame, target_df: pd.DataFrame) -> pd.DataFrame:
+    if train_df.empty or "Uid" not in train_df.columns or "Uid" not in target_df.columns:
+        return target_df
+
+    work = train_df.copy()
+    work["label"] = pd.to_numeric(work["label"] if "label" in work.columns else None, errors="coerce")
+    work["hour"] = pd.to_numeric(work["hour"] if "hour" in work.columns else None, errors="coerce")
+
+    agg = (
+        work.groupby("Uid", dropna=True)
+        .agg(
+            user_post_count_global=("post_id", "count"),
+            user_mean_label_global=("label", "mean"),
+            user_median_label_global=("label", "median"),
+            user_std_label_global=("label", "std"),
+            user_category_nunique_global=("category", _safe_nunique),
+            user_active_hour_mean_global=("hour", "mean"),
+        )
+        .reset_index()
+    )
+
+    if target_df is train_df:
+        sort_cols = [c for c in ["Uid", "postdate", "post_id"] if c in work.columns]
+        work = work.sort_values(sort_cols, kind="mergesort", na_position="first").copy()
+        g = work.groupby("Uid", dropna=False)
+
+        work["user_prev_post_count"] = g.cumcount()
+        work["_label_filled"] = work["label"].fillna(0.0)
+        work["_label_seen"] = work["label"].notna().astype(int)
+
+        work["_cum_label_sum"] = g["_label_filled"].cumsum() - work["_label_filled"]
+        work["_cum_label_cnt"] = g["_label_seen"].cumsum() - work["_label_seen"]
+        work["user_mean_label"] = work["_cum_label_sum"] / work["_cum_label_cnt"].replace(0, pd.NA)
+
+        work["user_active_hour_mean"] = (
+            g["hour"].expanding().mean().reset_index(level=0, drop=True).shift(1)
+        )
+
+        # 向量化計算 expanding category nunique（每個 user 在當前 post 之前看過的 category 種數）
+        def _expanding_nunique(series: pd.Series) -> pd.Series:
+            result = []
+            seen = set()
+            for val in series:
+                result.append(len(seen))
+                cat = empty_to_none(val)
+                if cat is not None:
+                    seen.add(cat)
+            return pd.Series(result, index=series.index)
+
+        cat_col = work["category"] if "category" in work.columns else pd.Series([None] * len(work), index=work.index)
+        work["user_category_nunique"] = (
+            work.groupby("Uid", dropna=False)["category"]
+            .transform(_expanding_nunique)
+            if "category" in work.columns
+            else 0
+        )
+
+        out = target_df.merge(
+            work[[
+                "post_id",
+                "user_prev_post_count",
+                "user_mean_label",
+                "user_active_hour_mean",
+                "user_category_nunique",
+            ]],
+            on="post_id",
+            how="left",
+        )
+        out = out.merge(agg, on="Uid", how="left")
+        return out
+
+    out = target_df.merge(agg, on="Uid", how="left")
+    out = out.rename(columns={
+        "user_post_count_global": "user_prev_post_count",
+        "user_mean_label_global": "user_mean_label",
+        "user_median_label_global": "user_median_label",
+        "user_std_label_global": "user_std_label",
+        "user_category_nunique_global": "user_category_nunique",
+        "user_active_hour_mean_global": "user_active_hour_mean",
+    })
+    return out
+
+
+
 def load_split(input_dir: Path, split: str) -> pd.DataFrame:
     prefix = split
-
     split_dir = input_dir / split
 
     img_path_file = split_dir / f"{prefix}_img_filepath.txt"
@@ -526,23 +852,44 @@ def load_split(input_dir: Path, split: str) -> pd.DataFrame:
         LOGGER.warning("%s split: user table is empty or missing", split)
 
     out = add_time_features(out)
+    out = add_cyclic_time_features(out)
     out = add_extra_features(out)
+    out = add_text_stats_features(out)
+    out = add_category_combo_features(out)
+    out = add_geo_bin_features(out)
+    out = add_account_age_features(out)
+    out = add_user_history_features(out)
+    out = add_label_features(out)
 
     front = [
-        "split", "post_id", "Uid", "Pid", "image_path", "label",
-        "category", "subcategory", "concept",
+        "split", "post_id", "Uid", "Pid", "image_path", "label", "label_log1p",
+        "category", "subcategory", "concept", "category_subcategory_combo", "category_concept_combo",
         "title", "mediatype", "alltags", "full_text",
-        "postdate", "datetime_utc", "year", "month", "day", "hour", "weekday", "is_weekend",
-        "latitude", "longitude", "geoaccuracy", "has_geo",
+        "has_title", "has_tags", "title_len", "tags_len", "full_text_len",
+        "title_word_count", "full_text_word_count", "tag_count", "avg_tag_len",
+        "title_digit_ratio", "title_upper_ratio", "title_punct_ratio",
+        "full_text_digit_ratio", "full_text_punct_ratio",
+        "postdate", "datetime_utc", "year", "month", "day", "hour", "weekday", "weekofyear",
+        "is_weekend", "is_night", "is_workhour",
+        "hour_sin", "hour_cos", "weekday_sin", "weekday_cos", "month_sin", "month_cos",
+        "latitude", "longitude", "geoaccuracy", "has_geo", "lat_bin", "lon_bin", "geo_cluster",
         "pathalias", "ispublic", "mediastatus",
         "photo_firstdate", "photo_count", "ispro", "canbuypro",
         "timezone_offset", "photo_firstdatetaken", "timezone_id",
+        "follower_count", "following_count", "total_views", "total_favorites",
+        "mean_views", "mean_favorites", "mean_tags",
+        "follower_following_ratio", "views_per_photo", "favorites_per_photo",
+        "photo_count_log1p", "follower_count_log1p", "following_count_log1p",
+        "total_views_log1p", "total_favorites_log1p",
+        "mean_views_log1p", "mean_favorites_log1p", "mean_tags_log1p",
+        "account_age_days", "camera_age_days",
+        "account_age_days_log1p", "camera_age_days_log1p",
+        "has_user_description", "has_location_description",
         "user_description", "location_description",
     ]
     existing_front = [c for c in front if c in out.columns]
     remaining = [c for c in out.columns if c not in existing_front]
     out = out[existing_front + remaining]
-
     return out
 
 
@@ -611,6 +958,9 @@ def main() -> None:
     train_df = load_split(input_dir, "train")
     test_df = load_split(input_dir, "test")
 
+    train_df = add_user_aggregate_features(train_df, train_df)
+    test_df = add_user_aggregate_features(train_df, test_df)
+
     save_split(train_df, output_dir, "train")
     save_split(test_df, output_dir, "test")
     save_summary(train_df, test_df, output_dir)
@@ -623,4 +973,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# python build_dataset.py --input_dir ./data/raw --output_dir ./data/processed
+# python build_dataset_v1.py --input_dir ./data/raw --output_dir ./data/processed
