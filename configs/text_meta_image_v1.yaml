@@ -1,0 +1,43 @@
+base: base.yaml
+
+exp_name: text_meta_image_cross_v1
+
+model:
+  use_text: true
+  use_meta: true
+  use_image: true
+  hidden_dim: 128
+  dropout: 0.1
+
+text:
+  model_name: openai/clip-vit-base-patch32
+  max_length: 77
+  pooling: clip
+  trainable: false
+
+image:
+  model_name: openai/clip-vit-base-patch32
+  pretrained: true
+  trainable: false
+  path_col: image_path
+  root_dir: /local/smp/data
+
+meta:
+  branch_dim: 128
+
+fusion:
+  type: cross_feature
+
+loss:
+  name: hybrid
+
+train:
+  batch_size: 256
+  num_workers: 6 # BUG: Windows DataLoader multiprocessing pickle problem (use 0)
+  pin_memory: true
+  persistent_workers: false
+  drop_last: false
+  lr: 2.0e-3
+  epochs: 8
+  weight_decay: 1.0e-2
+  grad_clip_norm: 1.0
