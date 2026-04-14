@@ -8,7 +8,7 @@ data:
 model:
   use_text: true
   use_meta: true
-  use_image: false
+  use_image: True
   hidden_dim: 128
   dropout: 0.1
 
@@ -20,7 +20,7 @@ text:
 
 
 image:
-  model_name: resnet50
+  model_name: openai/clip-vit-base-patch32
   pretrained: true
   trainable: true
 
@@ -34,7 +34,7 @@ train:
   batch_size: 16
   num_workers: 6 # BUG: Windows DataLoader multiprocessing pickle problem (use 0)
   pin_memory: true
-  epochs: 8
+  epochs: 24
   lr: 2.0e-5
   weight_decay: 1.0e-2
   grad_clip_norm: 1.0

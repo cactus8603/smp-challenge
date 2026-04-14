@@ -32,12 +32,13 @@ loss:
   name: hybrid
 
 train:
-  batch_size: 256
+  batch_size: 512
   num_workers: 6 # BUG: Windows DataLoader multiprocessing pickle problem (use 0)
   pin_memory: true
   persistent_workers: false
   drop_last: false
   lr: 2.0e-3
-  epochs: 8
+  epochs: 24
   weight_decay: 1.0e-2
   grad_clip_norm: 1.0
+  warmup_ratio: 0.1
