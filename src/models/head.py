@@ -65,6 +65,7 @@ class RegressionHead(BaseHead):
                 layers.append(nn.Dropout(dropout))
 
             layers.append(nn.Linear(hidden_dim, 1))
+            # layers.append(nn.Softplus())  # 確保輸出非負（log-views >= 0）
             self.head = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
