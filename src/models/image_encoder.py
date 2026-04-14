@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from transformers import CLIPVisionModelWithProjection
 
 
 class ImageEncoderPlaceholder(nn.Module):
@@ -37,76 +38,82 @@ class ImageEncoderPlaceholder(nn.Module):
         return torch.zeros(batch_size, self.output_dim, device=device)
 
 
-class TimmImageEncoder(nn.Module):
+class CLIPImageEncoder(nn.Module):
     """
-    Image encoder based on timm backbone.
+    CLIP-based image encoder.
 
-    Expected usage later:
-        encoder = TimmImageEncoder(
-            model_name="resnet50",
-            output_dim=256,
-            pretrained=True,
-            trainable=True,
-        )
+    Design goals:
+    - Align image features with CLIP text space
+    - Output a unified image representation [B, output_dim]
+    - Support optional freezing for lower training cost
+    - Keep the interface simple for multimodal fusion
 
-    Notes:
-    - This class requires timm to be installed.
-    - The backbone is created with num_classes=0 so it returns features.
-    - A projection layer maps backbone output to a unified output_dim.
+    Recommended model_name:
+        "openai/clip-vit-base-patch32"
+
+    Important:
+    - The input image tensor should already be processed with the matching
+      CLIP image processor / normalization pipeline.
+    - Expected input shape: [B, 3, H, W]
     """
 
     def __init__(
         self,
-        model_name: str = "resnet50",
-        output_dim: int = 256,
-        pretrained: bool = True,
-        trainable: bool = True,
+        model_name: str = "openai/clip-vit-base-patch32",
+        output_dim: Optional[int] = None,
+        trainable: bool = False,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
 
-        try:
-            import timm
-        except ImportError as e:
-            raise ImportError(
-                "timm is required for TimmImageEncoder. Please install it with: pip install timm"
-            ) from e
-
-        self.backbone = timm.create_model(
+        self.model = CLIPVisionModelWithProjection.from_pretrained(
             model_name,
-            pretrained=pretrained,
-            num_classes=0,
-            global_pool="avg",
+            use_safetensors=True,
         )
-
-        if hasattr(self.backbone, "num_features"):
-            backbone_dim = self.backbone.num_features
-        else:
-            raise ValueError(f"Cannot infer num_features from timm model: {model_name}")
+        self.hidden_size = self.model.config.hidden_size
+        self.projection_dim = self.model.config.projection_dim
 
         if not trainable:
-            for param in self.backbone.parameters():
+            for param in self.model.parameters():
                 param.requires_grad = False
 
-        self.output_dim = output_dim
-        self.proj = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(backbone_dim, output_dim),
-            nn.LayerNorm(output_dim),
-        )
+        self.output_dim = output_dim if output_dim is not None else self.projection_dim
+        self.dropout = nn.Dropout(dropout)
+
+        if self.output_dim != self.projection_dim:
+            self.proj = nn.Sequential(
+                nn.Linear(self.projection_dim, self.output_dim),
+                nn.LayerNorm(self.output_dim),
+            )
+        else:
+            self.proj = None
 
     def forward(self, image_tensor: torch.Tensor) -> torch.Tensor:
-        feats = self.backbone(image_tensor)
-        feats = self.proj(feats)
-        return feats
+        """
+        Args:
+            image_tensor: [B, 3, H, W], already normalized for CLIP
+
+        Returns:
+            image_repr: [B, output_dim]
+        """
+        outputs = self.model(pixel_values=image_tensor)
+
+        # [B, projection_dim]
+        x = outputs.image_embeds
+        x = self.dropout(x)
+
+        if self.proj is not None:
+            x = self.proj(x)
+
+        return x
 
 
 def build_image_encoder(
     use_image: bool,
-    image_model_name: str = "resnet50",
+    image_model_name: str = "openai/clip-vit-base-patch32",
     output_dim: int = 256,
     pretrained: bool = True,
-    trainable: bool = True,
+    trainable: bool = False,
     dropout: float = 0.1,
     placeholder_when_disabled: bool = True,
 ):
@@ -114,16 +121,19 @@ def build_image_encoder(
     Factory function for image encoder.
 
     Rules:
-    - if use_image=True: build real timm encoder
+    - if use_image=True: build real CLIP vision encoder
     - if use_image=False and placeholder_when_disabled=True:
         build placeholder encoder
     - else: return None
+
+    Notes:
+    - `pretrained` is kept for interface compatibility with the old version.
+      CLIPVisionModelWithProjection.from_pretrained(...) always loads pretrained weights.
     """
     if use_image:
-        return TimmImageEncoder(
+        return CLIPImageEncoder(
             model_name=image_model_name,
             output_dim=output_dim,
-            pretrained=pretrained,
             trainable=trainable,
             dropout=dropout,
         )
@@ -132,3 +142,20 @@ def build_image_encoder(
         return ImageEncoderPlaceholder(output_dim=output_dim)
 
     return None
+
+
+if __name__ == "__main__":
+    batch_size = 2
+    height = 224
+    width = 224
+
+    model = CLIPImageEncoder(
+        model_name="openai/clip-vit-base-patch32",
+        output_dim=256,
+        trainable=False,
+        dropout=0.1,
+    )
+
+    image_tensor = torch.randn(batch_size, 3, height, width)
+    y = model(image_tensor=image_tensor)
+    print("output shape:", y.shape)
