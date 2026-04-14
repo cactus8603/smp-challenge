@@ -4,6 +4,7 @@ from typing import Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.models.text_encoder import TextEncoder
 from src.models.meta_encoder import MetaEncoder
@@ -16,13 +17,13 @@ class SMPFusionModel(nn.Module):
     """
     Main multimodal model for SMP popularity prediction.
 
-    Current supported branches:
+    Supported branches:
     - text
     - metadata
-    - image (placeholder-ready / future extension)
+    - image
 
-    Current recommended fusion for this stage:
-    - CrossFeatureFusion for text + metadata
+    Recommended fusion for current multimodal stage:
+    - CrossFeatureFusion for text + metadata + image
     """
 
     def __init__(
@@ -35,12 +36,12 @@ class SMPFusionModel(nn.Module):
         dropout: float = 0.1,
         use_text: bool = True,
         use_meta: bool = True,
-        use_image: bool = False,
-        image_model_name: str = "resnet50",
+        use_image: bool = True,
+        image_model_name: str = "openai/clip-vit-base-patch32",
         text_pooling: str = "clip",
         text_trainable: bool = False,
-        image_pretrained: bool = True,
-        image_trainable: bool = True,
+        image_pretrained: bool = True,   # kept for interface compatibility
+        image_trainable: bool = False,
         fusion_type: str = "cross_feature",
         meta_branch_dim: int = 128,
     ) -> None:
@@ -61,7 +62,9 @@ class SMPFusionModel(nn.Module):
 
         fusion_input_dims: Dict[str, int] = {}
 
+        # -------------------------
         # text branch
+        # -------------------------
         if self.use_text:
             self.text_encoder = TextEncoder(
                 model_name=text_model_name,
@@ -72,11 +75,14 @@ class SMPFusionModel(nn.Module):
             )
             fusion_input_dims["text"] = hidden_dim
 
+        # -------------------------
         # metadata branch
+        # -------------------------
         if self.use_meta:
             if meta_num_dim <= 0 and meta_bin_dim <= 0 and not meta_cat_cardinalities:
                 raise ValueError(
-                    "When use_meta=True, at least one of meta_num_dim/meta_bin_dim/meta_cat_cardinalities must be non-empty."
+                    "When use_meta=True, at least one of "
+                    "meta_num_dim/meta_bin_dim/meta_cat_cardinalities must be non-empty."
                 )
 
             self.meta_encoder = MetaEncoder(
@@ -91,7 +97,9 @@ class SMPFusionModel(nn.Module):
             )
             fusion_input_dims["meta"] = hidden_dim
 
-        # image branch placeholder
+        # -------------------------
+        # image branch
+        # -------------------------
         self.image_encoder = build_image_encoder(
             use_image=use_image,
             image_model_name=image_model_name,
@@ -101,9 +109,12 @@ class SMPFusionModel(nn.Module):
             dropout=dropout,
             placeholder_when_disabled=True,
         )
-        fusion_input_dims["image"] = hidden_dim
+        if self.use_image:
+            fusion_input_dims["image"] = hidden_dim
 
+        # -------------------------
         # fusion
+        # -------------------------
         if self.fusion_type == "concat":
             self.fusion = ConcatFusion(
                 input_dims=fusion_input_dims,
@@ -114,8 +125,11 @@ class SMPFusionModel(nn.Module):
                 use_layernorm=True,
             )
         elif self.fusion_type == "cross_feature":
-            if not (self.use_text and self.use_meta):
-                raise ValueError("cross_feature fusion requires both use_text=True and use_meta=True.")
+            if not (self.use_text and self.use_meta and self.use_image):
+                raise ValueError(
+                    "cross_feature fusion requires "
+                    "use_text=True, use_meta=True, and use_image=True."
+                )
             self.fusion = CrossFeatureFusion(
                 hidden_dim=hidden_dim,
                 output_dim=hidden_dim,
@@ -126,7 +140,9 @@ class SMPFusionModel(nn.Module):
         else:
             raise ValueError(f"Unsupported fusion_type: {fusion_type}")
 
+        # -------------------------
         # prediction head
+        # -------------------------
         self.head = RegressionHead(
             input_dim=hidden_dim,
             hidden_dim=hidden_dim,
@@ -205,28 +221,46 @@ class SMPFusionModel(nn.Module):
             "image": None,
         }
 
+        # -------------------------
+        # text feature
+        # -------------------------
         if self.use_text:
             if input_ids is None or attention_mask is None:
-                raise ValueError("Text branch enabled but input_ids/attention_mask is missing.")
-            features["text"] = self.text_encoder(
+                raise ValueError(
+                    "Text branch enabled but input_ids/attention_mask is missing."
+                )
+            text_feat = self.text_encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
             )
+            # CLIP text embeddings live in cosine space
+            features["text"] = F.normalize(text_feat, dim=-1)
 
+        # -------------------------
+        # metadata feature
+        # -------------------------
         if self.use_meta:
             if meta_num is None and meta_cat is None and meta_bin is None:
-                raise ValueError("Meta branch enabled but meta_num/meta_cat/meta_bin are all missing.")
+                raise ValueError(
+                    "Meta branch enabled but meta_num/meta_cat/meta_bin are all missing."
+                )
             features["meta"] = self.meta_encoder(
                 meta_num=meta_num,
                 meta_cat=meta_cat,
                 meta_bin=meta_bin,
             )
 
+        # -------------------------
+        # image feature
+        # -------------------------
         if self.use_image:
             if image_tensor is None:
                 raise ValueError("Image branch enabled but image_tensor is missing.")
-            features["image"] = self.image_encoder(image_tensor)
+            image_feat = self.image_encoder(image_tensor)
+            # CLIP image embeddings should also be normalized to cosine space
+            features["image"] = F.normalize(image_feat, dim=-1)
         else:
+            # placeholder path for shape compatibility in concat-only experiments
             features["image"] = self.image_encoder(
                 image_tensor=None,
                 batch_size=batch_size,

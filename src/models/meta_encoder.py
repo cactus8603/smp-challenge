@@ -294,11 +294,9 @@ class MetaEncoder(nn.Module):
         # Final fusion MLP
         # -------------------------
         if fusion_hidden_dims is None:
-            # 避免 output_dim == branch_dim 時產生兩層相同維度 + 多餘 projection
-            if output_dim > branch_dim:
-                fusion_hidden_dims = [output_dim]
-            else:
-                fusion_hidden_dims = [max(branch_dim, 256), output_dim]
+            # output_dim == branch_dim：直接一層，不做無意義的升維再降維
+            # output_dim > branch_dim：一層升維到 output_dim
+            fusion_hidden_dims = [output_dim]
 
         self.fusion_mlp = build_mlp(
             input_dim=branch_dim,

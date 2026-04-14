@@ -56,13 +56,16 @@ class TextEncoder(nn.Module):
 
         self.output_dim = output_dim if output_dim is not None else self.projection_dim
 
-        self.proj = None
+        # Dropout 永遠存在，避免 output_dim == projection_dim 時沒有正則化
+        self.dropout = nn.Dropout(dropout)
+
         if self.output_dim != self.projection_dim:
             self.proj = nn.Sequential(
-                nn.Dropout(dropout),
                 nn.Linear(self.projection_dim, self.output_dim),
                 nn.LayerNorm(self.output_dim),
             )
+        else:
+            self.proj = None
 
     def forward(
         self,
@@ -76,6 +79,7 @@ class TextEncoder(nn.Module):
 
         # [B, projection_dim]
         x = outputs.text_embeds
+        x = self.dropout(x)  # 無論是否有 proj 都做 dropout
 
         if self.proj is not None:
             x = self.proj(x)

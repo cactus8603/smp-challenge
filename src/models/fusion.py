@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class BaseFusion(nn.Module, ABC):
@@ -94,19 +95,38 @@ class ConcatFusion(BaseFusion):
 
 class CrossFeatureFusion(BaseFusion):
     """
-    Explicit text-metadata interaction fusion.
+    Explicit multimodal interaction fusion for text + metadata + image.
 
     Design:
-        text_repr: [B, H]
-        meta_repr: [B, H]
-        cross_raw = text_repr * meta_repr                  # [B, H]
-        cross_repr = cross_proj(cross_raw)                # [B, H]
-        fused_input = concat(text_repr, meta_repr, cross_repr)  # [B, 3H]
-        fused = fusion_mlp(fused_input)                   # [B, H]
+        text_repr:  [B, H]
+        meta_repr:  [B, H]
+        image_repr: [B, H]
+
+        tm_raw = text_repr * meta_repr
+        it_raw = image_repr * text_repr
+        im_raw = image_repr * meta_repr
+
+        tm_repr = tm_proj(tm_raw)
+        it_repr = it_proj(it_raw)
+        im_repr = im_proj(im_raw)
+
+        sim_it = cosine_similarity(image_repr, text_repr)   # [B, 1]
+
+        fused_input = concat(
+            text_repr,
+            meta_repr,
+            image_repr,
+            tm_repr,
+            it_repr,
+            im_repr,
+            sim_it
+        )  # [B, 6H + 1]
+
+        fused = fusion_mlp(fused_input)  # [B, output_dim]
 
     Notes:
-    - This version is intended for the current text + metadata stage.
-    - Image features are ignored for now even if present in `features`.
+    - This version expects all three modalities to be present.
+    - If you want optional image support later, we can extend this to a more flexible variant.
     """
 
     def __init__(
@@ -129,18 +149,25 @@ class CrossFeatureFusion(BaseFusion):
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
 
-        cross_layers: List[nn.Module] = [
-            nn.Linear(hidden_dim, hidden_dim),
-            act_layer(),
-        ]
-        if use_layernorm:
-            cross_layers.append(nn.LayerNorm(hidden_dim))
-        if dropout > 0:
-            cross_layers.append(nn.Dropout(dropout))
-        self.cross_proj = nn.Sequential(*cross_layers)
+        def build_interaction_proj() -> nn.Sequential:
+            layers: List[nn.Module] = [
+                nn.Linear(hidden_dim, hidden_dim),
+                act_layer(),
+            ]
+            if use_layernorm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            return nn.Sequential(*layers)
+
+        self.tm_proj = build_interaction_proj()
+        self.it_proj = build_interaction_proj()
+        self.im_proj = build_interaction_proj()
+
+        fusion_input_dim = hidden_dim * 6 + 1  # text, meta, image, tm, it, im, sim_it
 
         fusion_layers: List[nn.Module] = [
-            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.Linear(fusion_input_dim, hidden_dim),
             act_layer(),
         ]
         if use_layernorm:
@@ -159,33 +186,47 @@ class CrossFeatureFusion(BaseFusion):
 
         self.fusion = nn.Sequential(*fusion_layers)
 
+    def _validate_feature(self, feat: Optional[torch.Tensor], name: str) -> torch.Tensor:
+        if feat is None:
+            raise ValueError(f"CrossFeatureFusion requires '{name}' feature, but got None.")
+        if feat.ndim != 2:
+            raise ValueError(f"Feature '{name}' must have shape [B, D], got {tuple(feat.shape)}")
+        if feat.size(1) != self.hidden_dim:
+            raise ValueError(
+                f"Feature '{name}' dim mismatch: expected {self.hidden_dim}, got {feat.size(1)}"
+            )
+        return feat
+
     def forward(
         self,
         features: Dict[str, Optional[torch.Tensor]],
     ) -> torch.Tensor:
-        text_feat = features.get("text", None)
-        meta_feat = features.get("meta", None)
+        text_feat = self._validate_feature(features.get("text", None), "text")
+        meta_feat = self._validate_feature(features.get("meta", None), "meta")
+        image_feat = self._validate_feature(features.get("image", None), "image")
 
-        if text_feat is None or meta_feat is None:
-            raise ValueError("CrossFeatureFusion requires both 'text' and 'meta' features.")
+        tm_raw = text_feat * meta_feat
+        it_raw = image_feat * text_feat
+        im_raw = image_feat * meta_feat
 
-        if text_feat.ndim != 2 or meta_feat.ndim != 2:
-            raise ValueError(
-                f"text/meta features must be [B, D], got text={tuple(text_feat.shape)}, meta={tuple(meta_feat.shape)}"
-            )
+        tm_repr = self.tm_proj(tm_raw)
+        it_repr = self.it_proj(it_raw)
+        im_repr = self.im_proj(im_raw)
 
-        if text_feat.size(1) != self.hidden_dim:
-            raise ValueError(
-                f"text feature dim mismatch: expected {self.hidden_dim}, got {text_feat.size(1)}"
-            )
-        if meta_feat.size(1) != self.hidden_dim:
-            raise ValueError(
-                f"meta feature dim mismatch: expected {self.hidden_dim}, got {meta_feat.size(1)}"
-            )
+        sim_it = F.cosine_similarity(image_feat, text_feat, dim=-1).unsqueeze(-1)
 
-        cross_raw = text_feat * meta_feat
-        cross_repr = self.cross_proj(cross_raw)
+        fused_input = torch.cat(
+            [
+                text_feat,
+                meta_feat,
+                image_feat,
+                tm_repr,
+                it_repr,
+                im_repr,
+                sim_it,
+            ],
+            dim=-1,
+        )
 
-        fused_input = torch.cat([text_feat, meta_feat, cross_repr], dim=-1)
         fused = self.fusion(fused_input)
         return fused

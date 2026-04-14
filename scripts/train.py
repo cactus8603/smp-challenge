@@ -77,13 +77,12 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-
 def build_loss(loss_name: str):
     name = loss_name.lower()
 
     if name == "mse":
         base_loss = torch.nn.MSELoss()
-    elif name == "mae" or name == "l1":
+    elif name in {"mae", "l1"}:
         base_loss = torch.nn.L1Loss()
     elif name == "smoothl1":
         base_loss = torch.nn.SmoothL1Loss()
@@ -133,21 +132,54 @@ def main() -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     tb_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save the resolved config for reproducibility
+    # Save resolved config for reproducibility
     with (exp_dir / "resolved_config.json").open("w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
     # -------------------------
+    # config shortcuts
+    # -------------------------
+    model_cfg = cfg["model"]
+    text_cfg = cfg["text"]
+    image_cfg = cfg["image"]
+    meta_cfg = cfg["meta"]
+    train_cfg = cfg["train"]
+    preprocess_cfg = cfg["preprocess"]
+    fusion_cfg = cfg["fusion"]
+    loss_cfg = cfg["loss"]
+    data_cfg = cfg["data"]
+
+    use_text = bool(model_cfg["use_text"])
+    use_meta = bool(model_cfg["use_meta"])
+    use_image = bool(model_cfg["use_image"])
+
+    text_model_name = text_cfg["model_name"]
+    image_model_name = image_cfg["model_name"]
+    image_path_col = image_cfg.get("path_col", "image_path")
+
+    batch_size = int(train_cfg["batch_size"])
+    num_workers = int(train_cfg["num_workers"])
+    pin_memory = bool(train_cfg.get("pin_memory", True))
+    persistent_workers = bool(train_cfg.get("persistent_workers", num_workers > 0))
+    drop_last = bool(train_cfg.get("drop_last", False))
+
+    # -------------------------
     # data loading
     # -------------------------
-    train_df = load_dataframe(cfg["data"]["train_path"])
-    val_df = load_dataframe(cfg["data"]["val_path"])
+    train_df = load_dataframe(data_cfg["train_path"])
+    val_df = load_dataframe(data_cfg["val_path"])
+
+    if use_image:
+        if image_path_col not in train_df.columns:
+            raise ValueError(f"train_df missing image path column: {image_path_col}")
+        if image_path_col not in val_df.columns:
+            raise ValueError(f"val_df missing image path column: {image_path_col}")
 
     preprocessor = MetadataPreprocessor(
-        num_cols=cfg["preprocess"].get("num_cols"),
-        cat_cols=cfg["preprocess"].get("cat_cols"),
-        bin_cols=cfg["preprocess"].get("bin_cols"),
-        log1p_cols=cfg["preprocess"].get("log1p_cols"),
+        num_cols=preprocess_cfg.get("num_cols"),
+        cat_cols=preprocess_cfg.get("cat_cols"),
+        bin_cols=preprocess_cfg.get("bin_cols"),
+        log1p_cols=preprocess_cfg.get("log1p_cols"),
     )
 
     train_df = preprocessor.fit_transform(train_df)
@@ -155,45 +187,57 @@ def main() -> None:
 
     # Save metadata preprocessor state
     preprocessor.save(exp_dir / "metadata_preprocessor.json")
+    image_root_dir = cfg["image"].get("root_dir", None)
+
 
     train_dataset = SMPDataset(
         df=train_df,
         preprocessor=preprocessor,
-        text_model_name=cfg["text"]["model_name"],
-        max_length=int(cfg["text"]["max_length"]),
-        use_text=bool(cfg["model"]["use_text"]),
-        use_meta=bool(cfg["model"]["use_meta"]),
-        use_image=bool(cfg["model"]["use_image"]),
+        text_model_name=text_model_name,
+        image_model_name=image_model_name,
+        max_length=int(text_cfg["max_length"]),
+        use_text=use_text,
+        use_meta=use_meta,
+        use_image=use_image,
+        image_path_col=image_path_col,
+        image_root_dir=image_root_dir,
         is_train=True,
     )
 
     val_dataset = SMPDataset(
         df=val_df,
         preprocessor=preprocessor,
-        text_model_name=cfg["text"]["model_name"],
-        max_length=int(cfg["text"]["max_length"]),
-        use_text=bool(cfg["model"]["use_text"]),
-        use_meta=bool(cfg["model"]["use_meta"]),
-        use_image=bool(cfg["model"]["use_image"]),
+        text_model_name=text_model_name,
+        image_model_name=image_model_name,
+        max_length=int(text_cfg["max_length"]),
+        use_text=use_text,
+        use_meta=use_meta,
+        use_image=use_image,
+        image_path_col=image_path_col,
+        image_root_dir=image_root_dir,
         is_train=False,
     )
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=int(cfg["train"]["batch_size"]),
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=int(cfg["train"]["num_workers"]),
-        pin_memory=bool(cfg["train"].get("pin_memory", True)),
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
         collate_fn=smp_collate_fn,
+        drop_last=drop_last,
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=int(cfg["train"]["batch_size"]),
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=int(cfg["train"]["num_workers"]),
-        pin_memory=bool(cfg["train"].get("pin_memory", True)),
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
         collate_fn=smp_collate_fn,
+        drop_last=False,
     )
 
     # -------------------------
@@ -205,22 +249,22 @@ def main() -> None:
     ]
 
     model = SMPFusionModel(
-        text_model_name=cfg["text"]["model_name"],
+        text_model_name=text_model_name,
         meta_num_dim=len(preprocessor.transformed_num_cols),
         meta_cat_cardinalities=cat_cardinalities,
         meta_bin_dim=len(preprocessor.transformed_bin_cols),
-        hidden_dim=int(cfg["model"]["hidden_dim"]),
-        dropout=float(cfg["model"]["dropout"]),
-        use_text=bool(cfg["model"]["use_text"]),
-        use_meta=bool(cfg["model"]["use_meta"]),
-        use_image=bool(cfg["model"]["use_image"]),
-        image_model_name=cfg["image"]["model_name"],
-        text_pooling=cfg["text"]["pooling"],
-        text_trainable=bool(cfg["text"]["trainable"]),
-        image_pretrained=bool(cfg["image"]["pretrained"]),
-        image_trainable=bool(cfg["image"]["trainable"]),
-        fusion_type=cfg["fusion"]["type"],
-        meta_branch_dim=int(cfg["meta"]["branch_dim"]),
+        hidden_dim=int(model_cfg["hidden_dim"]),
+        dropout=float(model_cfg["dropout"]),
+        use_text=use_text,
+        use_meta=use_meta,
+        use_image=use_image,
+        image_model_name=image_model_name,
+        text_pooling=text_cfg["pooling"],
+        text_trainable=bool(text_cfg["trainable"]),
+        image_pretrained=bool(image_cfg.get("pretrained", True)),
+        image_trainable=bool(image_cfg["trainable"]),
+        fusion_type=fusion_cfg["type"],
+        meta_branch_dim=int(meta_cfg["branch_dim"]),
     ).to(device)
 
     # -------------------------
@@ -228,11 +272,11 @@ def main() -> None:
     # -------------------------
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=float(cfg["train"]["lr"]),
-        weight_decay=float(cfg["train"].get("weight_decay", 1e-4)),
+        lr=float(train_cfg["lr"]),
+        weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
     )
 
-    criterion = build_loss(cfg["loss"]["name"])
+    criterion = build_loss(loss_cfg["name"])
 
     trainer = Trainer(
         model=model,
@@ -243,17 +287,17 @@ def main() -> None:
         exp_dir=exp_dir,
         ckpt_dir=ckpt_dir,
         tb_dir=tb_dir,
-        grad_clip_norm=cfg["train"].get("grad_clip_norm"),
+        grad_clip_norm=train_cfg.get("grad_clip_norm"),
     )
 
     trainer.fit(
         train_loader=train_loader,
         val_loader=val_loader,
-        epochs=int(cfg["train"]["epochs"]),
+        epochs=int(train_cfg["epochs"]),
     )
 
 
 if __name__ == "__main__":
     main()
 
-# python3 scripts/train.py --config configs/text_meta_v1.yaml
+# python3 scripts/train.py --config configs/text_meta_image_v1.yaml
