@@ -58,8 +58,9 @@ if __name__ == "__main__":
 
 
 #    python analyze_category_distribution.py --input ./raw/train/train_category.json
+#    python analyze_category_distribution.py --input ./raw/test/test_category.json
 
-"""
+""" train_category.json 的分析結果：
 === Category Distribution ===
                       count  ratio (%)
 Category
@@ -74,4 +75,21 @@ Food                  16727       5.47
 Urban                 15272       5.00
 Electronics            5613       1.84
 Family                 4274       1.40
+"""
+
+""" test_category.json 的分析結果：
+=== Category Distribution ===
+                      count  ratio (%)
+Category
+Travel&Active&Sports  45462      25.18
+Holiday&Celebrations  19485      10.79
+Animal                18482      10.23
+Entertainment         17969       9.95
+Fashion               17961       9.95
+Whether&Season        14926       8.27
+Social&People         14447       8.00
+Urban                 12000       6.65
+Food                  11833       6.55
+Electronics            5987       3.32
+Family                 2029       1.12
 """

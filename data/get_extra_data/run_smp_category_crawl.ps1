@@ -9,20 +9,22 @@ $SLEEP_MIN = if ($env:SLEEP_MIN) { $env:SLEEP_MIN } else { "0.8" }
 $SLEEP_MAX = if ($env:SLEEP_MAX) { $env:SLEEP_MAX } else { "2.0" }
 $FLUSH_EVERY = if ($env:FLUSH_EVERY) { $env:FLUSH_EVERY } else { "200" }
 $PER_PAGE = if ($env:PER_PAGE) { $env:PER_PAGE } else { "100" }
-$SORT = if ($env:SORT) { $env:SORT } else { "relevance" }
+$SORT = if ($env:SORT) { $env:SORT } else { "date-posted-desc" }
 
+# Category distribution aligned to test set
+# Family base_target raised to 3000 (original ratio gives only 1120, too few)
 $categories = @(
-    @{ category="Travel&Active&Sports"; ratio=0.2175; query="travel"; base_target=21750 },
-    @{ category="Holiday&Celebrations"; ratio=0.1792; query="holiday"; base_target=17920 },
-    @{ category="Fashion"; ratio=0.1613; query="fashion"; base_target=16130 },
-    @{ category="Entertainment"; ratio=0.0968; query="concert"; base_target=9680 },
-    @{ category="Social&People"; ratio=0.0764; query="people"; base_target=7640 },
-    @{ category="Whether&Season"; ratio=0.0664; query="winter"; base_target=6640 },
-    @{ category="Animal"; ratio=0.0654; query="animal"; base_target=6540 },
-    @{ category="Food"; ratio=0.0547; query="food"; base_target=5470 },
-    @{ category="Urban"; ratio=0.0500; query="city"; base_target=5000 },
-    @{ category="Electronics"; ratio=0.0184; query="electronics"; base_target=1840 },
-    @{ category="Family"; ratio=0.0140; query="family"; base_target=1400 }
+    @{ category="Travel&Active&Sports"; ratio=0.2518; query="travel";      base_target=25180 },
+    @{ category="Holiday&Celebrations"; ratio=0.1079; query="holiday";     base_target=10790 },
+    @{ category="Animal";               ratio=0.1023; query="animal";      base_target=10230 },
+    @{ category="Entertainment";        ratio=0.0995; query="concert";     base_target=9950  },
+    @{ category="Fashion";              ratio=0.0995; query="fashion";     base_target=9950  },
+    @{ category="Whether&Season";       ratio=0.0827; query="winter";      base_target=8270  },
+    @{ category="Social&People";        ratio=0.0800; query="people";      base_target=8000  },
+    @{ category="Urban";                ratio=0.0665; query="city";        base_target=6650  },
+    @{ category="Food";                 ratio=0.0655; query="food";        base_target=6550  },
+    @{ category="Electronics";          ratio=0.0332; query="electronics"; base_target=3320  },
+    @{ category="Family";               ratio=0.0112; query="family";      base_target=3000  }
 )
 
 function Sanitize-Name {
@@ -67,8 +69,7 @@ foreach ($item in $categories) {
         --per_page $PER_PAGE `
         --sort $SORT `
         --resume `
-        --dedupe_on_image_path `
-        --write_pretty_json
+        --dedupe_on_image_path
 
     Write-Host ""
 }
