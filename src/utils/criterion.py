@@ -27,7 +27,7 @@ class PairwiseRankingLoss(nn.Module):
         return loss.mean()
 
 class HybridLoss(nn.Module):
-    def __init__(self, alpha=1.0, beta=0.2):
+    def __init__(self, alpha=1.0, beta=0.5):
         super().__init__()
         self.reg_loss = nn.SmoothL1Loss()
         self.rank_loss = PairwiseRankingLoss()

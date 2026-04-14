@@ -13,6 +13,7 @@ import pandas as pd
 import torch
 import yaml
 from torch.utils.data import DataLoader
+from transformers import get_cosine_schedule_with_warmup
 
 # Allow scripts/ to import from src/
 ROOT = Path(__file__).resolve().parents[1]
@@ -276,12 +277,28 @@ def main() -> None:
         weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
     )
 
+    # -------------------------
+    # loss    
+    # -------------------------
     criterion = build_loss(loss_cfg["name"])
+
+    # -------------------------
+    # Scheduler 
+    # -------------------------
+    total_steps = len(train_loader) * train_cfg["epochs"]
+    warmup_steps = int(total_steps * train_cfg["warmup_ratio"])
+
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+    )
 
     trainer = Trainer(
         model=model,
         optimizer=optimizer,
         criterion=criterion,
+        scheduler=scheduler,
         device=str(device),
         exp_name=exp_name,
         exp_dir=exp_dir,

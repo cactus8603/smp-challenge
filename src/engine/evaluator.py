@@ -64,7 +64,13 @@ def validate(
 
     print("pred std:", np.std(all_preds))
     print("label std:", np.std(all_labels))
+
     print("pred sample:", all_preds[:10])
     print("label sample:", all_labels[:10])
+    
+    print("pred mean:", np.mean(all_preds))
+    print("label mean:", np.mean(all_labels))
+
+    print("pred min/max:", np.min(all_preds), np.max(all_preds))
 
     return avg_loss, mae, spearman

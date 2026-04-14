@@ -70,6 +70,7 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     criterion: torch.nn.Module,
+    scheduler: torch.optim.lr_scheduler,
     device: str,
     grad_clip_norm: Optional[float] = None,
     writer: Optional[SummaryWriter] = None,
@@ -117,6 +118,8 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
 
         optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
 
         total_loss += loss.item()
 
@@ -146,6 +149,7 @@ class Trainer:
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         criterion: torch.nn.Module,
+        scheduler: torch.optim.lr_scheduler,
         device: str,
         exp_name: str,
         exp_dir: Path,
@@ -157,6 +161,7 @@ class Trainer:
         self.model = model
         self.optimizer = optimizer
         self.criterion = criterion
+        self.scheduler = scheduler
         self.device = device
         self.exp_name = exp_name
         self.exp_dir = exp_dir
@@ -186,6 +191,7 @@ class Trainer:
                 loader=train_loader,
                 optimizer=self.optimizer,
                 criterion=self.criterion,
+                scheduler=self.scheduler,
                 device=self.device,
                 grad_clip_norm=self.grad_clip_norm,
                 writer=self.writer,

@@ -234,7 +234,8 @@ class SMPFusionModel(nn.Module):
                 attention_mask=attention_mask,
             )
             # CLIP text embeddings live in cosine space
-            features["text"] = F.normalize(text_feat, dim=-1)
+            # features["text"] = F.normalize(text_feat, dim=-1)
+            features["text"] = self.text_encoder(input_ids, attention_mask)
 
         # -------------------------
         # metadata feature
