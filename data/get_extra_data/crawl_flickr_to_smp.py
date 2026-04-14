@@ -543,7 +543,7 @@ def extract_category_record(photo: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
-MIN_POST_AGE_DAYS = 180  # 至少發文 6 個月，確保 views 已穩定
+MIN_POST_AGE_DAYS = 30  # 至少發文 1 個月，確保 views 已穩定
 
 
 def extract_pseudo_label_record(photo: Dict[str, Any], info_photo: Dict[str, Any]) -> Dict[str, Any]:
@@ -648,15 +648,25 @@ def main() -> int:
         logging.error("Invalid sleep range: sleep_min must be <= sleep_max and both >= 0.")
         return 1
 
-    # 如果沒有指定 max_upload_date，自動設為 MIN_POST_AGE_DAYS 天前
-    # 確保抓到的照片都是 mature 的，不浪費配額在新照片上
+    # Default crawl window:
+    # from 3 years ago to 30 days ago
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
     if not args.max_upload_date:
-        cutoff_ts = int(datetime.now(timezone.utc).timestamp()) - MIN_POST_AGE_DAYS * 86400
-        args.max_upload_date = str(cutoff_ts)
+        max_cutoff_ts = now_ts - MIN_POST_AGE_DAYS * 86400
+        args.max_upload_date = str(max_cutoff_ts)
         logging.info(
-            "Auto-set max_upload_date to %s (%d days ago) to ensure all photos are mature.",
-            datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d"),
+            "Auto-set max_upload_date to %s (%d days ago).",
+            datetime.fromtimestamp(max_cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d"),
             MIN_POST_AGE_DAYS,
+        )
+
+    if not args.min_upload_date:
+        min_cutoff_ts = now_ts - 365 * 3 * 86400
+        args.min_upload_date = str(min_cutoff_ts)
+        logging.info(
+            "Auto-set min_upload_date to %s (3 years ago).",
+            datetime.fromtimestamp(min_cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d"),
         )
 
     output_dir = Path(args.output_dir)
