@@ -626,6 +626,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--write_pretty_json", action="store_true", help="Also emit array-style .json files at the end. Not recommended for very large crawls.")
     parser.add_argument("--dedupe_on_image_path", action="store_true", help="Also skip items with duplicate relative image paths.")
     parser.add_argument("--max_duplicate_log", type=int, default=20, help="How many duplicate skip messages to log before silencing repetitive logs.")
+    parser.add_argument(
+        "--max_no_new_pages",
+        type=int,
+        default=20,
+        help="Stop early if this many consecutive pages produce no new items.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     return parser.parse_args()
 
@@ -714,11 +720,14 @@ def main() -> int:
     skipped_duplicates = 0
     duplicate_log_count = 0
     page = 1
+    consecutive_no_new_pages = 0
+    max_no_new_pages = max(1, args.max_no_new_pages)
 
     with text_jsonl_path.open("a", encoding="utf-8") as f_text,          temporal_jsonl_path.open("a", encoding="utf-8") as f_temporal,          user_jsonl_path.open("a", encoding="utf-8") as f_user,          additional_jsonl_path.open("a", encoding="utf-8") as f_additional,          category_jsonl_path.open("a", encoding="utf-8") as f_category,          pseudo_jsonl_path.open("a", encoding="utf-8") as f_pseudo,          img_txt_path.open("a", encoding="utf-8") as f_img,          manifest_jsonl_path.open("a", encoding="utf-8") as f_manifest:
 
         while kept < args.max_items:
             logging.info("Searching page %d...", page)
+            page_kept_before = kept
             try:
                 search_data = client.search_photos(
                     text=args.text,
@@ -862,6 +871,27 @@ def main() -> int:
                 existing_rel_paths.add(rel_path)
                 seen_rel_paths_this_run.add(rel_path)
                 kept += 1
+
+            page_new_items = kept - page_kept_before
+
+            if page_new_items == 0:
+                consecutive_no_new_pages += 1
+                logging.info(
+                    "Page %d produced no new items. consecutive_no_new_pages=%d/%d",
+                    page,
+                    consecutive_no_new_pages,
+                    max_no_new_pages,
+                )
+            else:
+                consecutive_no_new_pages = 0
+                logging.info("Page %d added %d new items.", page, page_new_items)
+
+            if consecutive_no_new_pages >= max_no_new_pages:
+                logging.info(
+                    "Stopping early: %d consecutive pages produced no new items.",
+                    consecutive_no_new_pages,
+                )
+                break
 
             if page >= pages_total:
                 break

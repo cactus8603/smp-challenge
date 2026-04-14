@@ -18,6 +18,7 @@ SLEEP_MAX="${SLEEP_MAX:-2.0}"
 FLUSH_EVERY="${FLUSH_EVERY:-200}"
 PER_PAGE="${PER_PAGE:-100}"
 SORT="${SORT:-date-posted-desc}"
+MAX_NO_NEW_PAGES="${MAX_NO_NEW_PAGES:-20}"
 
 # -----------------------------
 # Category distribution (test set)
@@ -89,6 +90,7 @@ for entry in "${CATEGORIES[@]}"; do
         --flush_every "$FLUSH_EVERY" \
         --per_page "$PER_PAGE" \
         --sort "$SORT" \
+        --max_no_new_pages "$MAX_NO_NEW_PAGES" \
         --resume \
         --dedupe_on_image_path
 
