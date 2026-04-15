@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.text_encoder import TextEncoder
-from src.models.glove_encoder import GloveEncoder
 from src.models.meta_encoder import MetaEncoder
 from src.models.image_encoder import build_image_encoder
 from src.models.fusion import ConcatFusion, CrossFeatureFusion
@@ -18,17 +17,10 @@ class SMPFusionModel(nn.Module):
     """
     Main multimodal model for SMP popularity prediction.
 
-    Supported branches:
-    - CLIP text
-    - optional GloVe lexical text
-    - metadata
-    - image
-
-    Design choice for GloVe:
-    - GloVe is treated as an extra lexical text branch.
-    - We first combine CLIP text + GloVe text into a unified text feature.
-    - Then the downstream fusion module still sees a single "text" feature,
-      so existing fusion/head code can stay mostly unchanged.
+    Anti-collapse changes:
+    - Treat GloVe as a residual lexical correction on top of CLIP
+    - Reduce normalization inside fusion/head
+    - Keep CLIP as the main text backbone
     """
 
     def __init__(
@@ -71,9 +63,6 @@ class SMPFusionModel(nn.Module):
 
         fusion_input_dims: Dict[str, int] = {}
 
-        # -------------------------
-        # text branches
-        # -------------------------
         clip_text_dim = 0
         glove_text_dim = 0
 
@@ -91,24 +80,34 @@ class SMPFusionModel(nn.Module):
             if glove_encoder is None:
                 raise ValueError("use_glove=True but glove_encoder is None.")
             self.glove_encoder = glove_encoder
-            glove_text_dim = int(getattr(glove_encoder, "output_dim", getattr(glove_encoder, "embed_dim", hidden_dim)))
+            glove_text_dim = int(
+                getattr(glove_encoder, "output_dim", getattr(glove_encoder, "embed_dim", hidden_dim))
+            )
 
         self.text_branch_enabled = self.use_text or self.use_glove
 
-        self.text_merge: Optional[nn.Module] = None
+        self.glove_proj: Optional[nn.Module] = None
+        self.glove_only_proj: Optional[nn.Module] = None
+        self.text_dropout = nn.Dropout(dropout)
+        self.glove_alpha = nn.Parameter(torch.tensor(0.10))
+
+        if self.use_glove and glove_text_dim != hidden_dim:
+            self.glove_proj = nn.Sequential(
+                nn.Linear(glove_text_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+
+        if (not self.use_text) and self.use_glove and glove_text_dim != hidden_dim:
+            self.glove_only_proj = nn.Sequential(
+                nn.Linear(glove_text_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+
         if self.text_branch_enabled:
-            if self.use_text and self.use_glove:
-                self.text_merge = nn.Sequential(
-                    nn.Linear(clip_text_dim + glove_text_dim, hidden_dim),
-                    nn.ReLU(),
-                    nn.LayerNorm(hidden_dim),
-                    nn.Dropout(dropout),
-                )
             fusion_input_dims["text"] = hidden_dim
 
-        # -------------------------
-        # metadata branch
-        # -------------------------
         if self.use_meta:
             if meta_num_dim <= 0 and meta_bin_dim <= 0 and not meta_cat_cardinalities:
                 raise ValueError(
@@ -128,9 +127,6 @@ class SMPFusionModel(nn.Module):
             )
             fusion_input_dims["meta"] = hidden_dim
 
-        # -------------------------
-        # image branch
-        # -------------------------
         self.image_encoder = build_image_encoder(
             use_image=use_image,
             image_model_name=image_model_name,
@@ -143,9 +139,6 @@ class SMPFusionModel(nn.Module):
         if self.use_image:
             fusion_input_dims["image"] = hidden_dim
 
-        # -------------------------
-        # fusion
-        # -------------------------
         if self.fusion_type == "concat":
             self.fusion = ConcatFusion(
                 input_dims=fusion_input_dims,
@@ -153,7 +146,7 @@ class SMPFusionModel(nn.Module):
                 output_dim=hidden_dim,
                 dropout=dropout,
                 activation="relu",
-                use_layernorm=True,
+                use_layernorm=False,
             )
         elif self.fusion_type == "cross_feature":
             if not (self.text_branch_enabled and self.use_meta and self.use_image):
@@ -166,20 +159,18 @@ class SMPFusionModel(nn.Module):
                 output_dim=hidden_dim,
                 dropout=dropout,
                 activation="relu",
-                use_layernorm=True,
+                use_layernorm=False,
             )
         else:
             raise ValueError(f"Unsupported fusion_type: {fusion_type}")
 
-        # -------------------------
-        # prediction head
-        # -------------------------
         self.head = RegressionHead(
             input_dim=hidden_dim,
             hidden_dim=hidden_dim,
             dropout=dropout,
             activation="relu",
-            use_layernorm=True,
+            use_layernorm=False,
+            use_skip=True,
         )
 
     def _infer_batch_size(
@@ -240,7 +231,7 @@ class SMPFusionModel(nn.Module):
         meta_bin: Optional[torch.Tensor] = None,
         image_tensor: Optional[torch.Tensor] = None,
         glove_tokens: Optional[Sequence[Sequence[str]]] = None,
-        glove_text: Optional[Sequence[str]] = None,   # kept for interface compatibility
+        glove_text: Optional[Sequence[str]] = None,
         glove_token_count: Optional[torch.Tensor] = None,
     ) -> Dict[str, Optional[torch.Tensor]]:
         batch_size = self._infer_batch_size(
@@ -269,24 +260,16 @@ class SMPFusionModel(nn.Module):
             "glove_text": None,
         }
 
-        # -------------------------
-        # CLIP text feature
-        # -------------------------
         clip_text_feat: Optional[torch.Tensor] = None
         if self.use_text:
             if input_ids is None or attention_mask is None:
-                raise ValueError(
-                    "CLIP text branch enabled but input_ids/attention_mask is missing."
-                )
+                raise ValueError("CLIP text branch enabled but input_ids/attention_mask is missing.")
             clip_text_feat = self.text_encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
             )
             features["clip_text"] = clip_text_feat
 
-        # -------------------------
-        # GloVe text feature
-        # -------------------------
         glove_text_feat: Optional[torch.Tensor] = None
         if self.use_glove:
             if glove_tokens is None:
@@ -294,41 +277,33 @@ class SMPFusionModel(nn.Module):
             glove_text_feat = self.glove_encoder(glove_tokens=glove_tokens)
             features["glove_text"] = glove_text_feat
 
-        # -------------------------
-        # merge text branches
-        # -------------------------
         if self.text_branch_enabled:
             if clip_text_feat is not None and glove_text_feat is not None:
-                merged_text = torch.cat([clip_text_feat, glove_text_feat], dim=-1)
-                features["text"] = self.text_merge(merged_text)
+                glove_delta = glove_text_feat
+                if self.glove_proj is not None:
+                    glove_delta = self.glove_proj(glove_delta)
+                features["text"] = self.text_dropout(clip_text_feat + self.glove_alpha * glove_delta)
             elif clip_text_feat is not None:
                 features["text"] = clip_text_feat
             elif glove_text_feat is not None:
-                # If only glove is used, project to hidden_dim if needed.
-                if glove_text_feat.size(-1) != self.hidden_dim:
-                    raise ValueError(
-                        f"GloVe-only text feature dim mismatch: expected {self.hidden_dim}, got {glove_text_feat.size(-1)}. "
-                        "Set glove_encoder.output_dim == hidden_dim or enable use_text with merging."
-                    )
-                features["text"] = glove_text_feat
+                glove_only = glove_text_feat
+                if glove_only.size(-1) != self.hidden_dim:
+                    if self.glove_only_proj is None:
+                        raise ValueError(
+                            f"GloVe-only text feature dim mismatch: expected {self.hidden_dim}, got {glove_only.size(-1)}."
+                        )
+                    glove_only = self.glove_only_proj(glove_only)
+                features["text"] = glove_only
 
-        # -------------------------
-        # metadata feature
-        # -------------------------
         if self.use_meta:
             if meta_num is None and meta_cat is None and meta_bin is None:
-                raise ValueError(
-                    "Meta branch enabled but meta_num/meta_cat/meta_bin are all missing."
-                )
+                raise ValueError("Meta branch enabled but meta_num/meta_cat/meta_bin are all missing.")
             features["meta"] = self.meta_encoder(
                 meta_num=meta_num,
                 meta_cat=meta_cat,
                 meta_bin=meta_bin,
             )
 
-        # -------------------------
-        # image feature
-        # -------------------------
         if self.use_image:
             if image_tensor is None:
                 raise ValueError("Image branch enabled but image_tensor is missing.")

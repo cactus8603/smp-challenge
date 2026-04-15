@@ -8,16 +8,6 @@ import torch.nn as nn
 
 
 class BaseHead(nn.Module, ABC):
-    """
-    Base prediction head.
-
-    Input:
-        fused feature tensor [B, D]
-
-    Output:
-        task-specific prediction
-    """
-
     @abstractmethod
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -25,12 +15,12 @@ class BaseHead(nn.Module, ABC):
 
 class RegressionHead(BaseHead):
     """
-    Regression head for popularity prediction.
+    Anti-collapse regression head.
 
-    Design goals:
-    - Simple and stable baseline
-    - Easy to deepen later
-    - Output shape: [B, 1]
+    Main changes:
+    - remove LayerNorm by default
+    - add a skip projection so the output can preserve variance from fused features
+    - keep the MLP shallow
     """
 
     def __init__(
@@ -39,7 +29,8 @@ class RegressionHead(BaseHead):
         hidden_dim: Optional[int] = None,
         dropout: float = 0.1,
         activation: str = "relu",
-        use_layernorm: bool = True,
+        use_layernorm: bool = False,
+        use_skip: bool = True,
     ) -> None:
         super().__init__()
 
@@ -50,9 +41,11 @@ class RegressionHead(BaseHead):
         else:
             raise ValueError(f"Unsupported activation: {activation}")
 
+        self.use_skip = use_skip
+
         if hidden_dim is None:
-            # single linear layer head
             self.head = nn.Linear(input_dim, 1)
+            self.skip = None
         else:
             layers = [
                 nn.Linear(input_dim, hidden_dim),
@@ -65,15 +58,11 @@ class RegressionHead(BaseHead):
                 layers.append(nn.Dropout(dropout))
 
             layers.append(nn.Linear(hidden_dim, 1))
-            # layers.append(nn.Softplus())  # 確保輸出非負（log-views >= 0）
             self.head = nn.Sequential(*layers)
+            self.skip = nn.Linear(input_dim, 1) if use_skip else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, D]
-
-        Returns:
-            prediction: [B, 1]
-        """
-        return self.head(x)
+        out = self.head(x)
+        if self.skip is not None:
+            out = out + self.skip(x)
+        return out

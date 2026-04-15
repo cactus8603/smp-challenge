@@ -9,10 +9,6 @@ import torch.nn.functional as F
 
 
 class BaseFusion(nn.Module, ABC):
-    """
-    Base class for multimodal fusion modules.
-    """
-
     @abstractmethod
     def forward(
         self,
@@ -23,8 +19,7 @@ class BaseFusion(nn.Module, ABC):
 
 class ConcatFusion(BaseFusion):
     """
-    Concatenate available modality features, then apply an MLP.
-    Kept as a simple baseline.
+    Concatenate available modality features, then apply a light MLP plus residual skip.
     """
 
     def __init__(
@@ -34,7 +29,7 @@ class ConcatFusion(BaseFusion):
         output_dim: int = 256,
         dropout: float = 0.1,
         activation: str = "relu",
-        use_layernorm: bool = True,
+        use_layernorm: bool = False,
     ) -> None:
         super().__init__()
 
@@ -69,6 +64,7 @@ class ConcatFusion(BaseFusion):
 
         self.input_dims = input_dims
         self.fusion = nn.Sequential(*layers)
+        self.skip = nn.Linear(total_input_dim, output_dim)
 
     def forward(
         self,
@@ -90,43 +86,16 @@ class ConcatFusion(BaseFusion):
             raise ValueError("No valid features provided to fusion.")
 
         x = torch.cat(collected, dim=-1)
-        return self.fusion(x)
+        return self.fusion(x) + self.skip(x)
 
 
 class CrossFeatureFusion(BaseFusion):
     """
-    Explicit multimodal interaction fusion for text + metadata + image.
+    Explicit multimodal interaction fusion with a residual base path.
 
-    Design:
-        text_repr:  [B, H]
-        meta_repr:  [B, H]
-        image_repr: [B, H]
-
-        tm_raw = text_repr * meta_repr
-        it_raw = image_repr * text_repr
-        im_raw = image_repr * meta_repr
-
-        tm_repr = tm_proj(tm_raw)
-        it_repr = it_proj(it_raw)
-        im_repr = im_proj(im_raw)
-
-        sim_it = cosine_similarity(image_repr, text_repr)   # [B, 1]
-
-        fused_input = concat(
-            text_repr,
-            meta_repr,
-            image_repr,
-            tm_repr,
-            it_repr,
-            im_repr,
-            sim_it
-        )  # [B, 6H + 1]
-
-        fused = fusion_mlp(fused_input)  # [B, output_dim]
-
-    Notes:
-    - This version expects all three modalities to be present.
-    - If you want optional image support later, we can extend this to a more flexible variant.
+    Anti-collapse change:
+    - preserve a direct base representation from the average of text/meta/image
+      so interaction MLPs do not completely flatten the feature variance.
     """
 
     def __init__(
@@ -135,7 +104,7 @@ class CrossFeatureFusion(BaseFusion):
         output_dim: int = 256,
         dropout: float = 0.1,
         activation: str = "relu",
-        use_layernorm: bool = True,
+        use_layernorm: bool = False,
     ) -> None:
         super().__init__()
 
@@ -164,7 +133,7 @@ class CrossFeatureFusion(BaseFusion):
         self.it_proj = build_interaction_proj()
         self.im_proj = build_interaction_proj()
 
-        fusion_input_dim = hidden_dim * 6 + 1  # text, meta, image, tm, it, im, sim_it
+        fusion_input_dim = hidden_dim * 6 + 1
 
         fusion_layers: List[nn.Module] = [
             nn.Linear(fusion_input_dim, hidden_dim),
@@ -185,6 +154,7 @@ class CrossFeatureFusion(BaseFusion):
             fusion_layers.append(nn.Dropout(dropout))
 
         self.fusion = nn.Sequential(*fusion_layers)
+        self.base_proj = nn.Linear(hidden_dim, output_dim)
 
     def _validate_feature(self, feat: Optional[torch.Tensor], name: str) -> torch.Tensor:
         if feat is None:
@@ -228,5 +198,6 @@ class CrossFeatureFusion(BaseFusion):
             dim=-1,
         )
 
-        fused = self.fusion(fused_input)
+        base = (text_feat + meta_feat + image_feat) / 3.0
+        fused = self.fusion(fused_input) + self.base_proj(base)
         return fused
