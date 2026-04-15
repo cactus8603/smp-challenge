@@ -85,6 +85,17 @@ def train_one_epoch(
     step = 0
 
     for batch in progress:
+        # --------------------------
+        # debugging: check batch contents and shapes
+        # # --------------------------
+        # print(batch["input_ids"].shape)          # CLIP
+        # print(batch["attention_mask"].shape)
+        # print(batch["clip_text"][:2])
+
+        # print(batch["glove_token_count"][:5])    # GloVe
+        # print(batch["glove_tokens"][:2])
+        # print(batch["glove_text"][:2])
+
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         meta_num = batch["meta_num"].to(device)
@@ -100,6 +111,13 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
+        # GloVe branch inputs
+        glove_tokens = batch.get("glove_tokens", None)
+        glove_text = batch.get("glove_text", None)
+        glove_token_count = batch.get("glove_token_count", None)
+        if glove_token_count is not None:
+            glove_token_count = glove_token_count.to(device)
+
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -107,6 +125,9 @@ def train_one_epoch(
             meta_cat=meta_cat,
             meta_bin=meta_bin,
             image_tensor=image_tensor,
+            glove_tokens=glove_tokens,
+            glove_text=glove_text,
+            glove_token_count=glove_token_count,
         )
 
         preds = outputs.squeeze(-1)
@@ -119,7 +140,6 @@ def train_one_epoch(
 
         optimizer.step()
         scheduler.step()
-        optimizer.zero_grad()
 
         total_loss += loss.item()
 

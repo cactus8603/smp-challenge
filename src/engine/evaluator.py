@@ -40,6 +40,12 @@ def validate(
         else:
             image_tensor = None
 
+        glove_tokens = batch.get("glove_tokens", None)
+        glove_text = batch.get("glove_text", None)
+        glove_token_count = batch.get("glove_token_count", None)
+        if glove_token_count is not None:
+            glove_token_count = glove_token_count.to(device)
+
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -47,6 +53,9 @@ def validate(
             meta_cat=meta_cat,
             meta_bin=meta_bin,
             image_tensor=image_tensor,
+            glove_tokens=glove_tokens,
+            glove_text=glove_text,
+            glove_token_count=glove_token_count,
         )
 
         preds = outputs.squeeze(-1)

@@ -16,13 +16,15 @@ text:
   model_name: openai/clip-vit-base-patch32
   max_length: 77
   pooling: clip
-  trainable: true
+  trainable: false
 
 
 image:
   model_name: openai/clip-vit-base-patch32
+  root_dir: /local/smp/data
   pretrained: true
-  trainable: true
+  trainable: false
+
 
 fusion:
   type: cross_feature
