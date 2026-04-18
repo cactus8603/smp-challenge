@@ -131,7 +131,9 @@ def train_one_epoch(
         )
 
         preds = outputs.squeeze(-1)
+        
         loss = criterion(preds, labels)
+        # print(preds[:5], labels[:5], loss.item())  # Debugging: print predictions, labels, and loss
 
         loss.backward()
 

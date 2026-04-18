@@ -1,6 +1,6 @@
 base: base.yaml
 
-exp_name: text_meta_image_cross_v1
+exp_name: text_meta_image_cross_v2
 
 model:
   use_text: true
@@ -27,6 +27,7 @@ meta:
 
 fusion:
   type: pairwise_gated
+
 
 
 loss:

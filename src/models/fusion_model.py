@@ -4,12 +4,11 @@ from typing import Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from src.models.text_encoder import TextEncoder
 from src.models.meta_encoder import MetaEncoder
 from src.models.image_encoder import build_image_encoder
-from src.models.fusion import ConcatFusion, CrossFeatureFusion
+from src.models.fusion import ConcatFusion, CrossFeatureFusion, PairwiseGatedFusion
 from src.models.head import RegressionHead
 
 
@@ -17,10 +16,10 @@ class SMPFusionModel(nn.Module):
     """
     Main multimodal model for SMP popularity prediction.
 
-    Anti-collapse changes:
-    - Treat GloVe as a residual lexical correction on top of CLIP
-    - Reduce normalization inside fusion/head
-    - Keep CLIP as the main text backbone
+    Score-first version:
+    - keep CLIP text / image encoders frozen by default
+    - keep each modality projected to the same hidden_dim
+    - support stronger fusion via PairwiseGatedFusion
     """
 
     def __init__(
@@ -41,7 +40,7 @@ class SMPFusionModel(nn.Module):
         text_trainable: bool = False,
         image_pretrained: bool = True,
         image_trainable: bool = False,
-        fusion_type: str = "cross_feature",
+        fusion_type: str = "pairwise_gated",
         meta_branch_dim: int = 128,
     ) -> None:
         super().__init__()
@@ -161,8 +160,24 @@ class SMPFusionModel(nn.Module):
                 activation="relu",
                 use_layernorm=False,
             )
+        elif self.fusion_type == "pairwise_gated":
+            if not (self.text_branch_enabled and self.use_meta and self.use_image):
+                raise ValueError(
+                    "pairwise_gated fusion requires text_branch_enabled=True, "
+                    "use_meta=True, and use_image=True."
+                )
+            self.fusion = PairwiseGatedFusion(
+                hidden_dim=hidden_dim,
+                output_dim=hidden_dim,
+                pair_hidden_dim=hidden_dim,
+                dropout=dropout,
+                activation="relu",
+                use_layernorm=False,
+            )
         else:
             raise ValueError(f"Unsupported fusion_type: {fusion_type}")
+
+        print(f"[DEBUG] fusion_type = {self.fusion_type}, fusion_class = {self.fusion.__class__.__name__}")
 
         self.head = RegressionHead(
             input_dim=hidden_dim,
@@ -308,7 +323,7 @@ class SMPFusionModel(nn.Module):
             if image_tensor is None:
                 raise ValueError("Image branch enabled but image_tensor is missing.")
             image_feat = self.image_encoder(image_tensor)
-            features["image"] = F.normalize(image_feat, dim=-1)
+            features["image"] = image_feat
         else:
             features["image"] = self.image_encoder(
                 image_tensor=None,

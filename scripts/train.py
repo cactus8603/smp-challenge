@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from src.datasets.metadata_preprocessor import MetadataPreprocessor
-from src.datasets.smp_datasets import SMPDataset, smp_collate_fn
+from src.datasets.smp_dataset import SMPDataset, smp_collate_fn
 from src.engine.trainer import Trainer
 from src.models.fusion_model import SMPFusionModel
 from src.utils.criterion import PairwiseRankingLoss, HybridLoss
@@ -88,7 +88,14 @@ def build_loss(loss_name: str):
     elif name == "smoothl1":
         base_loss = torch.nn.SmoothL1Loss()
     elif name == "ranking":
-        return PairwiseRankingLoss()
+        return HybridLoss(
+                    alpha=1.0,
+                    beta=0.3,
+                    margin=0.0,
+                    min_target_diff=0.1,
+                    weight_by_target_diff=True,
+                    max_weight=3.0,
+                )
     elif name == "hybrid":
         return HybridLoss()
     else:
@@ -170,6 +177,9 @@ def main() -> None:
     train_df = load_dataframe(data_cfg["train_path"])
     val_df = load_dataframe(data_cfg["val_path"])
 
+    label_mean = train_df["label"].mean()
+    label_std = train_df["label"].std()
+
     if use_image:
         if image_path_col not in train_df.columns:
             raise ValueError(f"train_df missing image path column: {image_path_col}")
@@ -196,6 +206,9 @@ def main() -> None:
         preprocessor=preprocessor,
         text_model_name=text_model_name,
         image_model_name=image_model_name,
+        normalize_label=True,
+        label_mean=label_mean,
+        label_std=label_std,
         max_length=int(text_cfg["max_length"]),
         use_text=use_text,
         use_meta=use_meta,
@@ -210,6 +223,9 @@ def main() -> None:
         preprocessor=preprocessor,
         text_model_name=text_model_name,
         image_model_name=image_model_name,
+        normalize_label=True,
+        label_mean=label_mean,
+        label_std=label_std,
         max_length=int(text_cfg["max_length"]),
         use_text=use_text,
         use_meta=use_meta,
@@ -318,3 +334,4 @@ if __name__ == "__main__":
     main()
 
 # python3 scripts/train.py --config configs/text_meta_image_v1.yaml
+# nohup python3 scripts/train.py --config configs/text_meta_image_v2.yaml > train2.log 2>&1 &

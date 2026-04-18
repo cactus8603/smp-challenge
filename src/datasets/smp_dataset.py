@@ -56,6 +56,9 @@ class SMPDataset(Dataset):
         preprocessor: MetadataPreprocessor,
         text_model_name: str = "openai/clip-vit-base-patch32",
         image_model_name: str = "openai/clip-vit-base-patch32",
+        label_mean: float | None = None,
+        label_std: float | None = None,
+        normalize_label: bool = False,
         max_length: int = 77,
         use_text: bool = True,
         use_meta: bool = True,
@@ -70,6 +73,9 @@ class SMPDataset(Dataset):
         self.df = df.reset_index(drop=True).copy()
         self.image_root_dir = Path(image_root_dir) if image_root_dir else None
         self.preprocessor = preprocessor
+        self.label_mean = label_mean
+        self.label_std = label_std
+        self.normalize_label = normalize_label
         self.max_length = max_length
         self.use_text = use_text
         self.use_meta = use_meta
@@ -186,8 +192,9 @@ class SMPDataset(Dataset):
             return 0
         encoded = self.tokenizer(
             text,
-            truncation=False,
+            truncation=True,
             padding=False,
+            max_length=77,
             return_tensors=None,
         )
         return len(encoded["input_ids"])
@@ -398,8 +405,9 @@ class SMPDataset(Dataset):
         if self.use_text:
             raw_encoded = self.tokenizer(
                 clip_text,
-                truncation=False,
+                truncation=True,   # ⭐ 改這裡
                 padding=False,
+                max_length=77,
                 return_tensors=None,
             )
             raw_token_count = len(raw_encoded["input_ids"])
@@ -468,7 +476,17 @@ class SMPDataset(Dataset):
         # -------------------------
         # labels / ids
         # -------------------------
-        item["labels"] = torch.tensor(float(row.get("label", 0.0)), dtype=torch.float32)
+        label = float(row.get("label", 0.0))
+
+        item["label_raw"] = torch.tensor(label, dtype=torch.float32)
+
+        if self.normalize_label:
+            if self.label_mean is None or self.label_std is None:
+                raise ValueError("normalize_label=True but label_mean/std is None")
+
+            label = (label - self.label_mean) / (self.label_std + 1e-8)
+
+        item["labels"] = torch.tensor(label, dtype=torch.float32)
         item["pad_token_id"] = self.pad_token_id
         item["post_id"] = safe_str(row.get("post_id", ""))
         item["uid"] = safe_str(row.get("Uid", ""))
@@ -534,6 +552,7 @@ def smp_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     # labels / ids / texts
     # -------------------------
     output["labels"] = torch.stack([x["labels"] for x in batch], dim=0)
+    output["label_raw"] = torch.stack([x["label_raw"] for x in batch], dim=0)
     output["post_id"] = [x["post_id"] for x in batch]
     output["uid"] = [x["uid"] for x in batch]
     output["pid"] = [x["pid"] for x in batch]
