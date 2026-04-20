@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 import yaml
+from sklearn.model_selection import GroupKFold
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
@@ -24,7 +25,7 @@ from src.datasets.metadata_preprocessor import MetadataPreprocessor
 from src.datasets.smp_dataset import SMPDataset, smp_collate_fn
 from src.engine.trainer import Trainer
 from src.models.fusion_model import SMPFusionModel
-from src.utils.criterion import PairwiseRankingLoss, HybridLoss
+from src.utils.criterion import HybridLoss
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +35,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         required=True,
         help="Path to YAML config file.",
+    )
+    parser.add_argument(
+        "--fold",
+        type=int,
+        default=0,
+        help="Which fold to train. Example: 0 ~ n_folds-1",
+    )
+    parser.add_argument(
+        "--n_folds",
+        type=int,
+        default=5,
+        help="Number of GroupKFold splits.",
     )
     return parser.parse_args()
 
@@ -82,26 +95,52 @@ def build_loss(loss_name: str):
     name = loss_name.lower()
 
     if name == "mse":
-        base_loss = torch.nn.MSELoss()
+        return torch.nn.MSELoss()
     elif name in {"mae", "l1"}:
-        base_loss = torch.nn.L1Loss()
+        return torch.nn.L1Loss()
     elif name == "smoothl1":
-        base_loss = torch.nn.SmoothL1Loss()
+        return torch.nn.SmoothL1Loss()
     elif name == "ranking":
         return HybridLoss(
-                    alpha=1.0,
-                    beta=0.3,
-                    margin=0.0,
-                    min_target_diff=0.1,
-                    weight_by_target_diff=True,
-                    max_weight=3.0,
-                )
+            alpha=1.0,
+            beta=0.3,
+            margin=0.0,
+            min_target_diff=0.1,
+            weight_by_target_diff=True,
+            max_weight=3.0,
+        )
     elif name == "hybrid":
-        return HybridLoss()
+        # return HybridLoss(
+        #     alpha=1.0,
+        #     beta=0.3,
+        #     gamma=0.1,
+        #     margin=0.0,
+        #     min_target_diff=0.1,
+        #     weight_by_target_diff=True,
+        #     max_weight=5.0,
+        #     high_target_scale=0.5,
+        #     reg_max_weight=3.0,
+        # )
+        return HybridLoss(
+            alpha=1.0,
+            beta=0.45,
+            gamma=0.15,
+            delta=0.10,
+            eta=0.08,
+            zeta=0.20,
+
+            hard_scale=1.2,
+            high_target_scale=0.25,
+            reg_max_weight=4.0,
+
+            min_target_diff=0.15,
+            rank_max_weight=4.0,
+
+            variance_floor_ratio=0.60,
+            focal_gamma=1.5,
+        )
     else:
         raise ValueError(f"Unsupported loss: {loss_name}")
-
-    return base_loss
 
 
 def load_dataframe(path: str) -> pd.DataFrame:
@@ -119,6 +158,88 @@ def load_dataframe(path: str) -> pd.DataFrame:
     raise ValueError(f"Unsupported data file format: {p.suffix}")
 
 
+def make_fold_split(
+    df: pd.DataFrame,
+    fold: int,
+    n_folds: int,
+    group_col: str = "Uid",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if group_col not in df.columns:
+        raise ValueError(f"Group column '{group_col}' not found in dataframe.")
+
+    if "label" not in df.columns:
+        raise ValueError("official_train dataframe must contain 'label' column.")
+
+    groups = df[group_col].fillna("UNK_GROUP").astype(str).to_numpy()
+    gkf = GroupKFold(n_splits=n_folds)
+
+    splits = list(gkf.split(df, groups=groups))
+    if fold < 0 or fold >= len(splits):
+        raise ValueError(f"fold must be in [0, {len(splits) - 1}], got {fold}")
+
+    train_idx, val_idx = splits[fold]
+    train_df = df.iloc[train_idx].reset_index(drop=True).copy()
+    val_df = df.iloc[val_idx].reset_index(drop=True).copy()
+
+    train_df["split"] = "train"
+    val_df["split"] = "val"
+
+    return train_df, val_df
+
+
+def _safe_nunique(series: pd.Series) -> int:
+    return int(series.dropna().nunique())
+
+
+def add_user_aggregate_features_fold(train_df: pd.DataFrame, target_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build label-derived user aggregate features using ONLY the current fold train_df,
+    then apply them to target_df. This avoids KFold leakage.
+    """
+    if train_df.empty or "Uid" not in train_df.columns or "Uid" not in target_df.columns:
+        return target_df
+
+    work = train_df.copy()
+    work["label"] = pd.to_numeric(work["label"], errors="coerce")
+    work["hour"] = pd.to_numeric(work["hour"] if "hour" in work.columns else None, errors="coerce")
+
+    agg = (
+        work.groupby("Uid", dropna=True)
+        .agg(
+            user_prev_post_count=("post_id", "count"),
+            user_mean_label=("label", "mean"),
+            user_median_label=("label", "median"),
+            user_std_label=("label", "std"),
+            user_category_nunique=("category", _safe_nunique),
+            user_active_hour_mean=("hour", "mean"),
+        )
+        .reset_index()
+    )
+
+    out = target_df.merge(agg, on="Uid", how="left")
+    return out
+
+
+def ensure_user_aggregate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make sure aggregate columns exist even if they are absent in official_train.
+    This keeps schema stable for downstream preprocessing.
+    """
+    out = df.copy()
+    required_cols = [
+        "user_prev_post_count",
+        "user_mean_label",
+        "user_median_label",
+        "user_std_label",
+        "user_category_nunique",
+        "user_active_hour_mean",
+    ]
+    for c in required_cols:
+        if c not in out.columns:
+            out[c] = None
+    return out
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_config_with_base(Path(args.config).resolve())
@@ -133,16 +254,23 @@ def main() -> None:
     # -------------------------
     exp_name = str(cfg["exp_name"])
     output_root = Path(cfg["output"]["root_dir"])
-    exp_dir = output_root / exp_name
+
+    fold_name = f"fold_{args.fold}"
+    exp_dir = output_root / exp_name / fold_name
     ckpt_dir = exp_dir / "checkpoints"
     tb_dir = exp_dir / "tensorboard"
     exp_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     tb_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save resolved config for reproducibility
+    resolved_cfg = deepcopy(cfg)
+    resolved_cfg["runtime"] = {
+        "fold": args.fold,
+        "n_folds": args.n_folds,
+    }
+
     with (exp_dir / "resolved_config.json").open("w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+        json.dump(resolved_cfg, f, ensure_ascii=False, indent=2)
 
     # -------------------------
     # config shortcuts
@@ -172,10 +300,39 @@ def main() -> None:
     drop_last = bool(train_cfg.get("drop_last", False))
 
     # -------------------------
-    # data loading
+    # data loading: KFold from official_train only
     # -------------------------
-    train_df = load_dataframe(data_cfg["train_path"])
-    val_df = load_dataframe(data_cfg["val_path"])
+    official_train_path = data_cfg.get("official_train_path")
+    if official_train_path is None:
+        raise ValueError(
+            "For KFold training, config.data.official_train_path is required."
+        )
+
+    official_train_df = load_dataframe(official_train_path)
+
+    if "Uid" not in official_train_df.columns:
+        raise ValueError("official_train dataframe must contain 'Uid' for GroupKFold.")
+
+    # make sure missing aggregate cols exist; they will be recomputed after fold split
+    official_train_df = ensure_user_aggregate_columns(official_train_df)
+
+    train_df, val_df = make_fold_split(
+        official_train_df,
+        fold=args.fold,
+        n_folds=args.n_folds,
+        group_col="Uid",
+    )
+
+    # ---------------------------------------------------------
+    # IMPORTANT: recompute label-derived user aggregates
+    # using ONLY fold-train, then apply to train/val
+    # ---------------------------------------------------------
+    train_df = add_user_aggregate_features_fold(train_df, train_df)
+    val_df = add_user_aggregate_features_fold(train_df, val_df)
+
+    print(f"[INFO] Fold {args.fold}/{args.n_folds}")
+    print(f"[INFO] Train rows: {len(train_df)} | Val rows: {len(val_df)}")
+    print(f"[INFO] Train users: {train_df['Uid'].nunique()} | Val users: {val_df['Uid'].nunique()}")
 
     label_mean = train_df["label"].mean()
     label_std = train_df["label"].std()
@@ -186,6 +343,9 @@ def main() -> None:
         if image_path_col not in val_df.columns:
             raise ValueError(f"val_df missing image path column: {image_path_col}")
 
+    # -------------------------
+    # preprocessor: fit on fold-train only
+    # -------------------------
     preprocessor = MetadataPreprocessor(
         num_cols=preprocess_cfg.get("num_cols"),
         cat_cols=preprocess_cfg.get("cat_cols"),
@@ -196,11 +356,13 @@ def main() -> None:
     train_df = preprocessor.fit_transform(train_df)
     val_df = preprocessor.transform(val_df)
 
-    # Save metadata preprocessor state
     preprocessor.save(exp_dir / "metadata_preprocessor.json")
-    image_root_dir = cfg["image"].get("root_dir", None)
 
+    image_root_dir = image_cfg.get("root_dir", None)
 
+    # -------------------------
+    # datasets
+    # -------------------------
     train_dataset = SMPDataset(
         df=train_df,
         preprocessor=preprocessor,
@@ -293,15 +455,9 @@ def main() -> None:
         weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
     )
 
-    # -------------------------
-    # loss    
-    # -------------------------
     criterion = build_loss(loss_cfg["name"])
 
-    # -------------------------
-    # Scheduler 
-    # -------------------------
-    total_steps = len(train_loader) * train_cfg["epochs"]
+    total_steps = len(train_loader) * int(train_cfg["epochs"])
     warmup_steps = int(total_steps * train_cfg["warmup_ratio"])
 
     scheduler = get_cosine_schedule_with_warmup(
@@ -316,7 +472,7 @@ def main() -> None:
         criterion=criterion,
         scheduler=scheduler,
         device=str(device),
-        exp_name=exp_name,
+        exp_name=f"{exp_name}_{fold_name}",
         exp_dir=exp_dir,
         ckpt_dir=ckpt_dir,
         tb_dir=tb_dir,
@@ -333,5 +489,7 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# python3 scripts/train.py --config configs/text_meta_image_v1.yaml
-# nohup python3 scripts/train.py --config configs/text_meta_image_v2.yaml > train2.log 2>&1 &
+# Example:
+# python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 0 --n_folds 5
+# python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 1 --n_folds 5
+# nohup python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 1 --n_folds 5 > kfold.log 2>&1 &
