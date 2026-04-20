@@ -1,9 +1,9 @@
 seed: 42
 exp_name: text_meta_cross_v1
 
+
 data:
-  train_path: data/processed/train.parquet
-  val_path: data/processed/val.parquet
+  official_train_path: /local/smp/processed/official_train.parquet
 
 model:
   use_text: true

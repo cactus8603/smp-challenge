@@ -1,6 +1,6 @@
 base: base.yaml
 
-exp_name: text_meta_image_cross_v2
+exp_name: multimodal_kfold_loss_fold0_v1
 
 model:
   use_text: true
@@ -31,7 +31,7 @@ fusion:
 
 
 loss:
-  name: ranking
+  name: hybrid
 
 train:
   batch_size: 512
