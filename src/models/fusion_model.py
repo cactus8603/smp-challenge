@@ -4,12 +4,13 @@ from typing import Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.models.text_encoder import TextEncoder
 from src.models.meta_encoder import MetaEncoder
 from src.models.image_encoder import build_image_encoder
 from src.models.fusion import ConcatFusion, CrossFeatureFusion, PairwiseGatedFusion
-from src.models.head import RegressionHead
+from src.models.head import RegressionHead, ModalityAwareMoEHead
 
 
 class SMPFusionModel(nn.Module):
@@ -20,6 +21,7 @@ class SMPFusionModel(nn.Module):
     - keep CLIP text / image encoders frozen by default
     - keep each modality projected to the same hidden_dim
     - support stronger fusion via PairwiseGatedFusion
+    - optionally add CLIP text-image cosine similarity as an extra fusion feature
     """
 
     def __init__(
@@ -42,6 +44,7 @@ class SMPFusionModel(nn.Module):
         image_trainable: bool = False,
         fusion_type: str = "pairwise_gated",
         meta_branch_dim: int = 128,
+        use_clip_similarity: bool = False,
     ) -> None:
         super().__init__()
 
@@ -52,8 +55,18 @@ class SMPFusionModel(nn.Module):
         self.use_glove = use_glove
         self.use_meta = use_meta
         self.use_image = use_image
+        self.use_clip_similarity = use_clip_similarity
         self.hidden_dim = hidden_dim
         self.fusion_type = fusion_type.lower()
+
+        if self.use_clip_similarity and not (self.use_text and self.use_image):
+            raise ValueError("use_clip_similarity=True requires both use_text=True and use_image=True.")
+
+        if self.use_clip_similarity and text_model_name != image_model_name:
+            raise ValueError(
+                "use_clip_similarity=True requires text_model_name and image_model_name "
+                "to be the same CLIP model."
+            )
 
         self.text_encoder: Optional[nn.Module] = None
         self.glove_encoder: Optional[nn.Module] = None
@@ -135,8 +148,12 @@ class SMPFusionModel(nn.Module):
             dropout=dropout,
             placeholder_when_disabled=True,
         )
+
         if self.use_image:
             fusion_input_dims["image"] = hidden_dim
+
+        if self.use_clip_similarity:
+            fusion_input_dims["clip_sim"] = 1
 
         if self.fusion_type == "concat":
             self.fusion = ConcatFusion(
@@ -159,6 +176,7 @@ class SMPFusionModel(nn.Module):
                 dropout=dropout,
                 activation="relu",
                 use_layernorm=False,
+                extra_dim=1 if self.use_clip_similarity else 0,
             )
         elif self.fusion_type == "pairwise_gated":
             if not (self.text_branch_enabled and self.use_meta and self.use_image):
@@ -173,19 +191,34 @@ class SMPFusionModel(nn.Module):
                 dropout=dropout,
                 activation="relu",
                 use_layernorm=False,
+                extra_dim=1 if self.use_clip_similarity else 0,
             )
         else:
             raise ValueError(f"Unsupported fusion_type: {fusion_type}")
 
-        print(f"[DEBUG] fusion_type = {self.fusion_type}, fusion_class = {self.fusion.__class__.__name__}")
+        print(
+            f"[DEBUG] fusion_type = {self.fusion_type}, "
+            f"fusion_class = {self.fusion.__class__.__name__}, "
+            f"use_clip_similarity = {self.use_clip_similarity}"
+        )
 
-        self.head = RegressionHead(
+        self.RegressionHead = RegressionHead(
             input_dim=hidden_dim,
             hidden_dim=hidden_dim,
             dropout=dropout,
             activation="relu",
             use_layernorm=False,
             use_skip=True,
+        )
+
+        self.ModalityAwareMoEHead = ModalityAwareMoEHead(
+            input_dim=hidden_dim,
+            num_experts=4,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            activation="relu",
+            use_skip=True,
+            use_clip_similarity=self.use_clip_similarity,
         )
 
     def _infer_batch_size(
@@ -273,18 +306,37 @@ class SMPFusionModel(nn.Module):
             "image": None,
             "clip_text": None,
             "glove_text": None,
+            "clip_sim": None,
         }
 
         clip_text_feat: Optional[torch.Tensor] = None
+        raw_clip_text_feat: Optional[torch.Tensor] = None
+        raw_clip_image_feat: Optional[torch.Tensor] = None
+
+        # -------------------------
+        # CLIP text
+        # -------------------------
         if self.use_text:
             if input_ids is None or attention_mask is None:
                 raise ValueError("CLIP text branch enabled but input_ids/attention_mask is missing.")
-            clip_text_feat = self.text_encoder(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            )
+
+            if self.use_clip_similarity:
+                clip_text_feat, raw_clip_text_feat = self.text_encoder(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_raw_clip=True,
+                )
+            else:
+                clip_text_feat = self.text_encoder(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+
             features["clip_text"] = clip_text_feat
 
+        # -------------------------
+        # GloVe text
+        # -------------------------
         glove_text_feat: Optional[torch.Tensor] = None
         if self.use_glove:
             if glove_tokens is None:
@@ -292,44 +344,84 @@ class SMPFusionModel(nn.Module):
             glove_text_feat = self.glove_encoder(glove_tokens=glove_tokens)
             features["glove_text"] = glove_text_feat
 
+        # -------------------------
+        # Text branch fusion: CLIP + GloVe
+        # -------------------------
         if self.text_branch_enabled:
             if clip_text_feat is not None and glove_text_feat is not None:
                 glove_delta = glove_text_feat
                 if self.glove_proj is not None:
                     glove_delta = self.glove_proj(glove_delta)
-                features["text"] = self.text_dropout(clip_text_feat + self.glove_alpha * glove_delta)
+                features["text"] = self.text_dropout(
+                    clip_text_feat + self.glove_alpha * glove_delta
+                )
+
             elif clip_text_feat is not None:
                 features["text"] = clip_text_feat
+
             elif glove_text_feat is not None:
                 glove_only = glove_text_feat
                 if glove_only.size(-1) != self.hidden_dim:
                     if self.glove_only_proj is None:
                         raise ValueError(
-                            f"GloVe-only text feature dim mismatch: expected {self.hidden_dim}, got {glove_only.size(-1)}."
+                            f"GloVe-only text feature dim mismatch: "
+                            f"expected {self.hidden_dim}, got {glove_only.size(-1)}."
                         )
                     glove_only = self.glove_only_proj(glove_only)
                 features["text"] = glove_only
 
+        # -------------------------
+        # Metadata
+        # -------------------------
         if self.use_meta:
             if meta_num is None and meta_cat is None and meta_bin is None:
                 raise ValueError("Meta branch enabled but meta_num/meta_cat/meta_bin are all missing.")
+
             features["meta"] = self.meta_encoder(
                 meta_num=meta_num,
                 meta_cat=meta_cat,
                 meta_bin=meta_bin,
             )
 
+        # -------------------------
+        # CLIP image
+        # -------------------------
         if self.use_image:
             if image_tensor is None:
                 raise ValueError("Image branch enabled but image_tensor is missing.")
-            image_feat = self.image_encoder(image_tensor)
+
+            if self.use_clip_similarity:
+                image_feat, raw_clip_image_feat = self.image_encoder(
+                    image_tensor,
+                    return_raw_clip=True,
+                )
+            else:
+                image_feat = self.image_encoder(image_tensor)
+
             features["image"] = image_feat
+
         else:
             features["image"] = self.image_encoder(
                 image_tensor=None,
                 batch_size=batch_size,
                 device=device,
             )
+
+        # -------------------------
+        # Raw CLIP text-image similarity
+        # -------------------------
+        if self.use_clip_similarity:
+            if raw_clip_text_feat is None or raw_clip_image_feat is None:
+                raise ValueError(
+                    "use_clip_similarity=True requires raw CLIP text/image features."
+                )
+
+            features["clip_sim"] = F.cosine_similarity(
+                raw_clip_text_feat,
+                raw_clip_image_feat,
+                dim=-1,
+                eps=1e-8,
+            ).unsqueeze(-1)
 
         return features
 
@@ -345,6 +437,7 @@ class SMPFusionModel(nn.Module):
         glove_text: Optional[Sequence[str]] = None,
         glove_token_count: Optional[torch.Tensor] = None,
         return_features: bool = False,
+        modality_mask: Optional[Dict[str, bool]] = None,
     ):
         features = self.extract_features(
             input_ids=input_ids,
@@ -358,8 +451,25 @@ class SMPFusionModel(nn.Module):
             glove_token_count=glove_token_count,
         )
 
+        if modality_mask is not None:
+            for name in ["text", "meta", "image"]:
+                if modality_mask.get(name, False) and features.get(name) is not None:
+                    features[name] = torch.zeros_like(features[name])
+
+            if modality_mask.get("text", False) or modality_mask.get("image", False):
+                if features.get("clip_sim") is not None:
+                    features["clip_sim"] = torch.zeros_like(features["clip_sim"])
+
         fused = self.fusion(features)
-        output = self.head(fused)
+        # output = self.RegressionHead(fused)
+
+        output = self.ModalityAwareMoEHead(
+            fused=fused,
+            text_feat=features["text"],
+            meta_feat=features["meta"],
+            image_feat=features["image"],
+            clip_sim=features["clip_sim"],
+        )
 
         if return_features:
             return {

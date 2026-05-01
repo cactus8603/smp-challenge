@@ -1,6 +1,5 @@
 seed: 42
-exp_name: text_meta_cross_v1
-
+exp_name: base_exp
 
 data:
   official_train_path: /local/smp/processed/official_train.parquet
@@ -8,8 +7,8 @@ data:
 model:
   use_text: true
   use_meta: true
-  use_image: True
-  hidden_dim: 128
+  use_image: true
+  hidden_dim: 256
   dropout: 0.1
 
 text:
@@ -18,28 +17,33 @@ text:
   pooling: clip
   trainable: false
 
-
 image:
   model_name: openai/clip-vit-base-patch32
-  root_dir: /local/smp/data
   pretrained: true
   trainable: false
+  root_dir: /local/smp/data
 
+meta:
+  branch_dim: 256
 
 fusion:
-  type: cross_feature
+  type: pairwise_gated
+  use_clip_similarity: true
 
 loss:
   name: hybrid
 
 train:
-  batch_size: 16
-  num_workers: 6 # BUG: Windows DataLoader multiprocessing pickle problem (use 0)
+  batch_size: 256
+  num_workers: 6
   pin_memory: true
+  persistent_workers: true
+  drop_last: false
   epochs: 24
-  lr: 2.0e-5
+  lr: 1.0e-4
   weight_decay: 1.0e-2
   grad_clip_norm: 1.0
+  warmup_ratio: 0.1
 
 output:
   root_dir: outputs

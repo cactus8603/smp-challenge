@@ -75,3 +75,121 @@ class RegressionHead(BaseHead):
         if self.skip is not None:
             out = out + self.skip(x)
         return out
+
+
+class ModalityAwareMoEHead(BaseHead):
+    def __init__(
+        self,
+        input_dim: int,
+        num_experts: int = 4,
+        hidden_dim: Optional[int] = None,
+        dropout: float = 0.1,
+        activation: str = "relu",
+        use_skip: bool = True,
+        use_clip_similarity: bool = False,
+    ) -> None:
+        super().__init__()
+
+        if hidden_dim is None:
+            hidden_dim = input_dim
+
+        self.use_skip = use_skip
+        self.use_clip_similarity = use_clip_similarity
+
+        def act():
+            return _get_activation(activation)
+
+        extra_dim = 1 if use_clip_similarity else 0
+
+        self.full_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            act(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+        self.meta_proj = nn.Sequential(
+            nn.Linear(input_dim * 2, hidden_dim),
+            act(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+        self.text_proj = nn.Sequential(
+            nn.Linear(input_dim * 2, hidden_dim),
+            act(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+        self.image_proj = nn.Sequential(
+            nn.Linear(input_dim * 2 + extra_dim, hidden_dim),
+            act(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                act(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 1),
+            )
+            for _ in range(num_experts)
+        ])
+
+        gate_input_dim = hidden_dim * num_experts + extra_dim
+
+        self.gate = nn.Sequential(
+            nn.Linear(gate_input_dim, max(hidden_dim // 2, 64)),
+            act(),
+            nn.Dropout(dropout),
+            nn.Linear(max(hidden_dim // 2, 64), num_experts),
+        )
+
+        self.skip = nn.Linear(input_dim, 1) if use_skip else None
+
+    def forward(
+        self,
+        fused: torch.Tensor,
+        text_feat: torch.Tensor,
+        meta_feat: torch.Tensor,
+        image_feat: torch.Tensor,
+        clip_sim: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.use_clip_similarity:
+            if clip_sim is None:
+                raise ValueError("use_clip_similarity=True but clip_sim is None.")
+            image_input = torch.cat([fused, image_feat, clip_sim], dim=-1)
+        else:
+            image_input = torch.cat([fused, image_feat], dim=-1)
+
+        full_h = self.full_proj(fused)
+        meta_h = self.meta_proj(torch.cat([fused, meta_feat], dim=-1))
+        text_h = self.text_proj(torch.cat([fused, text_feat], dim=-1))
+        image_h = self.image_proj(image_input)
+
+        expert_inputs = [full_h, meta_h, text_h, image_h]
+
+        expert_outputs = torch.stack(
+            [expert(h) for expert, h in zip(self.experts, expert_inputs)],
+            dim=1,
+        )  # [B, 4, 1]
+
+        gate_parts = expert_inputs
+        if self.use_clip_similarity:
+            gate_parts = gate_parts + [clip_sim]
+
+        gate_input = torch.cat(gate_parts, dim=-1)
+        gate_weights = torch.softmax(self.gate(gate_input), dim=-1)
+
+        out = (expert_outputs.squeeze(-1) * gate_weights).sum(
+            dim=-1,
+            keepdim=True,
+        )
+
+        if self.skip is not None:
+            out = out + self.skip(fused)
+
+        return out

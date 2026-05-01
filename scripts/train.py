@@ -443,6 +443,7 @@ def main() -> None:
         image_pretrained=bool(image_cfg.get("pretrained", True)),
         image_trainable=bool(image_cfg["trainable"]),
         fusion_type=fusion_cfg["type"],
+        use_clip_similarity=bool(fusion_cfg.get("use_clip_similarity", True)),
         meta_branch_dim=int(meta_cfg["branch_dim"]),
     ).to(device)
 
@@ -492,4 +493,17 @@ if __name__ == "__main__":
 # Example:
 # python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 0 --n_folds 5
 # python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 1 --n_folds 5
-# nohup python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 1 --n_folds 5 > kfold.log 2>&1 &
+# nohup python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 0 --n_folds 5 > ModalityAwareMoEHead.log 2>&1 &
+
+"""
+=== Modality Ablation Summary ===
+      full | loss=0.9288 | mae=1.7273 | spearman=0.5963
+ mask_text | loss=0.9809 | mae=1.7514 | spearman=0.5506
+ mask_meta | loss=1.0550 | mae=1.8767 | spearman=0.4321
+mask_image | loss=0.9371 | mae=1.7072 | spearman=0.5688
+
+=== Spearman Drop From Full ===
+      text: 0.0458
+      meta: 0.1642
+     image: 0.0276
+"""

@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from src.engine.evaluator import validate
+from src.engine.evaluator import validate, validate_modality_ablation
 
 
 def save_json(data: Dict, path: Path) -> None:
@@ -225,6 +225,14 @@ class Trainer:
                 loader=val_loader,
                 criterion=self.criterion,
                 device=self.device,
+            )
+
+            results = validate_modality_ablation(
+                model=self.model,
+                loader=val_loader,
+                criterion=self.criterion,
+                device=self.device,
+                verbose_debug=False,
             )
 
             epoch_time = time.time() - epoch_start

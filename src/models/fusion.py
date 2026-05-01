@@ -200,21 +200,6 @@ class CrossFeatureFusion(BaseFusion):
 
 
 class PairwiseGatedFusion(BaseFusion):
-    """
-    Score-first multimodal fusion:
-    - keep a strong base concat path
-    - add three pairwise interaction branches
-    - use sample-wise gates to weight interaction branches
-
-    Pairwise branches:
-    - text-meta
-    - text-image
-    - meta-image
-
-    Each branch uses:
-    [a, b, a*b, |a-b|]
-    """
-
     def __init__(
         self,
         hidden_dim: int = 256,
@@ -223,6 +208,7 @@ class PairwiseGatedFusion(BaseFusion):
         dropout: float = 0.1,
         activation: str = "relu",
         use_layernorm: bool = False,
+        extra_dim: int = 0,
     ) -> None:
         super().__init__()
 
@@ -230,8 +216,8 @@ class PairwiseGatedFusion(BaseFusion):
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.pair_hidden_dim = pair_hidden_dim or hidden_dim
+        self.extra_dim = extra_dim
 
-        # base concat path
         self.base_fusion = ConcatFusion(
             input_dims={"text": hidden_dim, "meta": hidden_dim, "image": hidden_dim},
             hidden_dim=hidden_dim,
@@ -250,6 +236,7 @@ class PairwiseGatedFusion(BaseFusion):
                 layers.append(nn.LayerNorm(self.pair_hidden_dim))
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
+
             layers.extend([
                 nn.Linear(self.pair_hidden_dim, output_dim),
                 act_layer(),
@@ -258,15 +245,16 @@ class PairwiseGatedFusion(BaseFusion):
                 layers.append(nn.LayerNorm(output_dim))
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
+
             return nn.Sequential(*layers)
 
         self.tm_proj = build_pair_proj()
         self.ti_proj = build_pair_proj()
         self.mi_proj = build_pair_proj()
 
-        # sample-wise gate over three interaction branches
-        gate_input_dim = output_dim * 4  # base + tm + ti + mi
+        gate_input_dim = output_dim * 4
         gate_hidden_dim = max(output_dim // 2, 64)
+
         self.gate_mlp = nn.Sequential(
             nn.Linear(gate_input_dim, gate_hidden_dim),
             act_layer(),
@@ -274,15 +262,17 @@ class PairwiseGatedFusion(BaseFusion):
             nn.Linear(gate_hidden_dim, 3),
         )
 
-        # final fusion after gated residual interaction aggregation
+        final_input_dim = output_dim * 4 + extra_dim
+
         final_layers: List[nn.Module] = [
-            nn.Linear(output_dim * 4, hidden_dim),
+            nn.Linear(final_input_dim, hidden_dim),
             act_layer(),
         ]
         if use_layernorm:
             final_layers.append(nn.LayerNorm(hidden_dim))
         if dropout > 0:
             final_layers.append(nn.Dropout(dropout))
+
         final_layers.extend([
             nn.Linear(hidden_dim, output_dim),
             act_layer(),
@@ -293,7 +283,7 @@ class PairwiseGatedFusion(BaseFusion):
             final_layers.append(nn.Dropout(dropout))
 
         self.final_fusion = nn.Sequential(*final_layers)
-        self.final_skip = nn.Linear(output_dim * 4, output_dim)
+        self.final_skip = nn.Linear(final_input_dim, output_dim)
 
     def _validate_feature(self, feat: Optional[torch.Tensor], name: str) -> torch.Tensor:
         if feat is None:
@@ -330,13 +320,25 @@ class PairwiseGatedFusion(BaseFusion):
         mi_repr = self.mi_proj(self._build_pair_input(meta_feat, image_feat))
 
         gate_input = torch.cat([base, tm_repr, ti_repr, mi_repr], dim=-1)
-        gate_logits = self.gate_mlp(gate_input)          # [B, 3]
-        gate_weights = F.softmax(gate_logits, dim=-1)    # [B, 3]
+        gate_logits = self.gate_mlp(gate_input)
+        gate_weights = F.softmax(gate_logits, dim=-1)
 
         gated_tm = gate_weights[:, 0:1] * tm_repr
         gated_ti = gate_weights[:, 1:2] * ti_repr
         gated_mi = gate_weights[:, 2:3] * mi_repr
 
-        final_input = torch.cat([base, gated_tm, gated_ti, gated_mi], dim=-1)
+        final_parts = [base, gated_tm, gated_ti, gated_mi]
+
+        if self.extra_dim > 0:
+            extra_feat = features.get("clip_sim", None)
+            if extra_feat is None:
+                raise ValueError("PairwiseGatedFusion expected 'clip_sim' but got None.")
+            if extra_feat.ndim != 2 or extra_feat.size(1) != self.extra_dim:
+                raise ValueError(
+                    f"clip_sim dim mismatch: expected [B, {self.extra_dim}], got {tuple(extra_feat.shape)}"
+                )
+            final_parts.append(extra_feat)
+
+        final_input = torch.cat(final_parts, dim=-1)
         fused = self.final_fusion(final_input) + self.final_skip(final_input)
         return fused
