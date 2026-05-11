@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, asdict
+
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
-
+@dataclass
+class NumericStats:
+    median: float
+    mean: float
+    std: float
+    
 EPS = 1e-8
 
 

@@ -499,7 +499,7 @@ if __name__ == "__main__":
 # Example:
 # python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 0 --n_folds 5
 # python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 1 --n_folds 5
-# nohup python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 0 --n_folds 5 > sim_v1_lightcat.log 2>&1 &
+# nohup python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 0 --n_folds 5 > datasetv2.log 2>&1 &
 
 """
 === Modality Ablation Summary ===

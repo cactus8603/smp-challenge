@@ -85,7 +85,7 @@ class VectorCompressor(nn.Module):
         return self.net(x)
 
 
-
+class CategoricalEmbeddingEncoder(nn.Module):
     """
     Encode multiple categorical fields with separate embeddings.
 
