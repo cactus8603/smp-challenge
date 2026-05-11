@@ -119,6 +119,12 @@ def train_one_epoch(
         if glove_token_count is not None:
             glove_token_count = glove_token_count.to(device)
 
+        # user_description / location_description
+        user_desc     = batch["user_desc"].to(device)     if "user_desc"     in batch else None
+        loc_desc      = batch["loc_desc"].to(device)      if "loc_desc"      in batch else None
+        has_user_desc = batch["has_user_desc"].to(device) if "has_user_desc" in batch else None
+        has_loc_desc  = batch["has_loc_desc"].to(device)  if "has_loc_desc"  in batch else None
+
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -129,6 +135,10 @@ def train_one_epoch(
             glove_tokens=glove_tokens,
             glove_text=glove_text,
             glove_token_count=glove_token_count,
+            user_desc=user_desc,
+            loc_desc=loc_desc,
+            has_user_desc=has_user_desc,
+            has_loc_desc=has_loc_desc,
         )
 
         preds = outputs.squeeze(-1)

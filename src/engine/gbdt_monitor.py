@@ -51,32 +51,38 @@ def extract_deep_features(
             glove_tokens=glove_tokens,
             glove_text=glove_text,
             glove_token_count=glove_token_count,
+            user_desc=batch.get("user_desc", None) and batch["user_desc"].to(device),
+            loc_desc=batch.get("loc_desc", None) and batch["loc_desc"].to(device),
+            has_user_desc=batch.get("has_user_desc", None) and batch["has_user_desc"].to(device),
+            has_loc_desc=batch.get("has_loc_desc", None) and batch["has_loc_desc"].to(device),
             return_features=True,
         )
 
-        pred = out["output"].squeeze(-1).detach().cpu().numpy()
+        pred  = out["output"].squeeze(-1).detach().cpu().numpy()
         fused = out["fused"].detach().cpu().numpy()
 
-        df = pd.DataFrame({
-            "label": labels,
+        # ── build per-batch DataFrame with pd.concat (no fragmentation) ──
+        col_dict: dict = {
+            "label":     labels,
             "deep_pred": pred,
-        })
+        }
 
         for name in ["text", "meta", "image"]:
             feat = out["features"].get(name)
             if feat is None:
                 continue
-            arr = feat.detach().cpu().numpy()
+            arr = feat.detach().cpu().numpy()         # [B, D]
             for i in range(arr.shape[1]):
-                df[f"{name}_{i}"] = arr[:, i]
+                col_dict[f"{name}_{i}"] = arr[:, i]
 
         for i in range(fused.shape[1]):
-            df[f"fused_{i}"] = fused[:, i]
+            col_dict[f"fused_{i}"] = fused[:, i]
 
         clip_sim = out["features"].get("clip_sim")
         if clip_sim is not None:
-            df["clip_sim"] = clip_sim.squeeze(-1).detach().cpu().numpy()
+            col_dict["clip_sim"] = clip_sim.squeeze(-1).detach().cpu().numpy()
 
+        df = pd.DataFrame(col_dict)
         rows.append(df)
 
     return pd.concat(rows, axis=0, ignore_index=True)
