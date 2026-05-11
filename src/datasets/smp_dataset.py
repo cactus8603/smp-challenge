@@ -457,10 +457,50 @@ class SMPDataset(Dataset):
                 row[self.bin_cols].to_numpy(dtype="float32"),
                 dtype=torch.float32,
             )
+
+            # ── user_description / location_description vectors ──────
+            # preprocessor.transform() stores these as numpy arrays in
+            # user_desc_vec / loc_desc_vec, with has_* flags.
+            if "user_desc_vec" in self.df.columns:
+                ud = row["user_desc_vec"]
+                import numpy as _np
+                item["user_desc"] = torch.tensor(
+                    ud if isinstance(ud, _np.ndarray) else _np.array(ud, dtype=_np.float32),
+                    dtype=torch.float32,
+                )
+                item["has_user_desc"] = torch.tensor(
+                    float(row.get("has_user_desc", 0.0)), dtype=torch.float32
+                )
+            else:
+                item["user_desc"] = torch.zeros(
+                    self.preprocessor.user_desc_dim, dtype=torch.float32
+                )
+                item["has_user_desc"] = torch.tensor(0.0, dtype=torch.float32)
+
+            if "loc_desc_vec" in self.df.columns:
+                ld = row["loc_desc_vec"]
+                import numpy as _np
+                item["loc_desc"] = torch.tensor(
+                    ld if isinstance(ld, _np.ndarray) else _np.array(ld, dtype=_np.float32),
+                    dtype=torch.float32,
+                )
+                item["has_loc_desc"] = torch.tensor(
+                    float(row.get("has_loc_desc", 0.0)), dtype=torch.float32
+                )
+            else:
+                item["loc_desc"] = torch.zeros(
+                    self.preprocessor.loc_desc_dim, dtype=torch.float32
+                )
+                item["has_loc_desc"] = torch.tensor(0.0, dtype=torch.float32)
+
         else:
             item["meta_num"] = torch.zeros(self.meta_num_dim, dtype=torch.float32)
             item["meta_cat"] = torch.zeros(self.meta_cat_dim, dtype=torch.long)
             item["meta_bin"] = torch.zeros(self.meta_bin_dim, dtype=torch.float32)
+            item["user_desc"]     = torch.zeros(self.preprocessor.user_desc_dim, dtype=torch.float32)
+            item["loc_desc"]      = torch.zeros(self.preprocessor.loc_desc_dim,  dtype=torch.float32)
+            item["has_user_desc"] = torch.tensor(0.0, dtype=torch.float32)
+            item["has_loc_desc"]  = torch.tensor(0.0, dtype=torch.float32)
 
         # -------------------------
         # image
@@ -539,6 +579,10 @@ def smp_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     output["meta_num"] = torch.stack([x["meta_num"] for x in batch], dim=0)
     output["meta_cat"] = torch.stack([x["meta_cat"] for x in batch], dim=0)
     output["meta_bin"] = torch.stack([x["meta_bin"] for x in batch], dim=0)
+    output["user_desc"]     = torch.stack([x["user_desc"]     for x in batch], dim=0)
+    output["loc_desc"]      = torch.stack([x["loc_desc"]      for x in batch], dim=0)
+    output["has_user_desc"] = torch.stack([x["has_user_desc"].unsqueeze(0) for x in batch], dim=0)
+    output["has_loc_desc"]  = torch.stack([x["has_loc_desc"].unsqueeze(0)  for x in batch], dim=0)
 
     # -------------------------
     # image

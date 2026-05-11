@@ -53,3 +53,9 @@ preprocess:
   cat_cols: null
   bin_cols: null
   log1p_cols: null
+
+monitor:
+  gbdt: true
+  gbdt_interval: 1
+  gbdt_max_train_batches: 80
+  gbdt_max_val_batches: null

@@ -7,17 +7,17 @@
 # Usage:
 #   ./run_smp_uid_text_by_category.sh
 #
-# Override any variable via env:
+# Override via env:
 #   MAX_USERS_PER_CATEGORY=200 MAX_ITEMS_PER_UID=10 ./run_smp_uid_text_by_category.sh
 #
-# Dry run (no download, small scale):
+# Dry run:
 #   MAX_USERS_PER_CATEGORY=5 MAX_ITEMS_PER_UID=2 DOWNLOAD_IMAGES=0 ./run_smp_uid_text_by_category.sh
 
 set -euo pipefail
 
-# -------------------------------------------------------
+# ──────────────────────────────────────────────────────
 # Config
-# -------------------------------------------------------
+# ──────────────────────────────────────────────────────
 export PYTHON_BIN="${PYTHON_BIN:-python3}"
 export CRAWLER_SCRIPT="${CRAWLER_SCRIPT:-./crawl_flickr_to_smp_by_uid_text.py}"
 export TRAIN_USER_JSON="${TRAIN_USER_JSON:-/local/smp/data/train_allmetadata_json/train_user_data.json}"
@@ -31,33 +31,27 @@ export SLEEP_MAX="${SLEEP_MAX:-2.0}"
 export FLUSH_EVERY="${FLUSH_EVERY:-100}"
 export PER_PAGE="${PER_PAGE:-100}"
 export SORT="${SORT:-date-posted-desc}"
-export DOWNLOAD_IMAGES="${DOWNLOAD_IMAGES:-1}"   # 1 = download, 0 = skip
+export DOWNLOAD_IMAGES="${DOWNLOAD_IMAGES:-1}"
 
 ORCHESTRATOR="${ORCHESTRATOR:-./run_uid_text_crawl.py}"
 
-# -------------------------------------------------------
-# Pre-flight checks
-# -------------------------------------------------------
-if [ ! -f "$ORCHESTRATOR" ]; then
-    echo "[ERROR] Orchestrator not found: $ORCHESTRATOR"
+# ──────────────────────────────────────────────────────
+# Pre-flight
+# ──────────────────────────────────────────────────────
+if [ -z "${FLICKR_API_KEY:-}" ]; then
+    echo "[ERROR] FLICKR_API_KEY is not set."
     exit 1
 fi
-if [ ! -f "$CRAWLER_SCRIPT" ]; then
-    echo "[ERROR] Crawler script not found: $CRAWLER_SCRIPT"
-    exit 1
-fi
-if [ ! -f "$TRAIN_USER_JSON" ]; then
-    echo "[ERROR] Train user JSON not found: $TRAIN_USER_JSON"
-    exit 1
-fi
-if [ ! -f "$TRAIN_CATEGORY_JSON" ]; then
-    echo "[ERROR] Train category JSON not found: $TRAIN_CATEGORY_JSON"
-    exit 1
-fi
+for f in "$ORCHESTRATOR" "$CRAWLER_SCRIPT" "$TRAIN_USER_JSON" "$TRAIN_CATEGORY_JSON"; do
+    if [ ! -f "$f" ]; then
+        echo "[ERROR] Required file not found: $f"
+        exit 1
+    fi
+done
 
-# -------------------------------------------------------
+# ──────────────────────────────────────────────────────
 # Print config
-# -------------------------------------------------------
+# ──────────────────────────────────────────────────────
 echo "========================================"
 echo "PYTHON_BIN             : $PYTHON_BIN"
 echo "CRAWLER_SCRIPT         : $CRAWLER_SCRIPT"
@@ -74,9 +68,9 @@ echo ""
 
 mkdir -p "$BASE_OUTPUT_DIR"
 
-# -------------------------------------------------------
+# ──────────────────────────────────────────────────────
 # Run
-# -------------------------------------------------------
+# ──────────────────────────────────────────────────────
 "$PYTHON_BIN" "$ORCHESTRATOR"
 
 echo ""

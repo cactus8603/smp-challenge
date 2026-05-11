@@ -12,6 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from src.engine.evaluator import validate, validate_modality_ablation
+from src.engine.gbdt_monitor import run_gbdt_monitor
 
 
 def save_json(data: Dict, path: Path) -> None:
@@ -203,6 +204,10 @@ class Trainer:
         train_loader: DataLoader,
         val_loader: DataLoader,
         epochs: int,
+        monitor_gbdt: bool = False,
+        gbdt_interval: int = 1,
+        gbdt_max_train_batches: Optional[int] = None,
+        gbdt_max_val_batches: Optional[int] = None,
     ) -> Dict:
         for epoch in range(1, epochs + 1):
             epoch_start = time.time()
@@ -226,6 +231,43 @@ class Trainer:
                 criterion=self.criterion,
                 device=self.device,
             )
+
+            gbdt_scores = {}
+
+            if monitor_gbdt and epoch % gbdt_interval == 0:
+                gbdt_scores = run_gbdt_monitor(
+                    model=self.model,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    device=self.device,
+                    run_lightgbm=True,
+                    run_catboost=True,
+                    max_train_batches=gbdt_max_train_batches,
+                    max_val_batches=gbdt_max_val_batches,
+                )
+
+                self.logger.info(
+                    "[GBDT Monitor] "
+                    f"deep={gbdt_scores.get('deep_spearman', float('nan')):.4f} | "
+                    f"lightgbm={gbdt_scores.get('lightgbm_spearman', float('nan')):.4f} | "
+                    f"catboost={gbdt_scores.get('catboost_spearman', float('nan')):.4f}"
+                )
+
+                self.writer.add_scalar(
+                    "metric_gbdt/deep_spearman",
+                    gbdt_scores.get("deep_spearman", float("nan")),
+                    epoch,
+                )
+                self.writer.add_scalar(
+                    "metric_gbdt/lightgbm_spearman",
+                    gbdt_scores.get("lightgbm_spearman", float("nan")),
+                    epoch,
+                )
+                self.writer.add_scalar(
+                    "metric_gbdt/catboost_spearman",
+                    gbdt_scores.get("catboost_spearman", float("nan")),
+                    epoch,
+                )
 
             results = validate_modality_ablation(
                 model=self.model,

@@ -480,10 +480,16 @@ def main() -> None:
         grad_clip_norm=train_cfg.get("grad_clip_norm"),
     )
 
+    monitor_cfg = cfg.get("monitor", {})
+
     trainer.fit(
         train_loader=train_loader,
         val_loader=val_loader,
         epochs=int(train_cfg["epochs"]),
+        monitor_gbdt=bool(monitor_cfg.get("gbdt", False)),
+        gbdt_interval=int(monitor_cfg.get("gbdt_interval", 1)),
+        gbdt_max_train_batches=monitor_cfg.get("gbdt_max_train_batches", None),
+        gbdt_max_val_batches=monitor_cfg.get("gbdt_max_val_batches", None),
     )
 
 
@@ -493,7 +499,7 @@ if __name__ == "__main__":
 # Example:
 # python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 0 --n_folds 5
 # python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 1 --n_folds 5
-# nohup python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 0 --n_folds 5 > ModalityAwareMoEHead.log 2>&1 &
+# nohup python3 scripts/train.py --config configs/text_meta_image_v2.yaml --fold 0 --n_folds 5 > sim_v1_lightcat.log 2>&1 &
 
 """
 === Modality Ablation Summary ===

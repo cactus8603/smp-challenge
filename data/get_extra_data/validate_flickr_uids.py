@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 validate_flickr_uids.py
 
@@ -6,16 +7,17 @@ Pre-validate Flickr user IDs from train_user_data.json before crawling.
 Filters out deleted/suspended accounts to avoid wasting API quota.
 
 Usage:
-    python3 validate_flickr_uids.py \
-        --train_user_json /local/smp/data/train_allmetadata_json/train_user_data.json \
-        --output /local/smp/extra_data_by_uid/valid_uids.json \
-        --sleep_min 0.3 \
+    python3 validate_flickr_uids.py \\
+        --train_user_json /local/smp/data/train_allmetadata_json/train_user_data.json \\
+        --output /local/smp/extra_data_by_uid/valid_uids.json \\
+        --sleep_min 0.3 \\
         --sleep_max 0.8
 
 Output:
-    valid_uids.json: {"uid1": true, "uid2": false, ...}
-    valid_uids.txt:  one valid uid per line (for easy reuse)
+    valid_uids.json   — {"uid1": true, "uid2": false, ...}
+    valid_uids.txt    — one valid uid per line (for easy reuse)
 """
+
 from __future__ import annotations
 
 import argparse
@@ -95,7 +97,6 @@ def extract_uids(records: list) -> list[str]:
 
 
 def load_existing_results(path: Path) -> Dict[str, bool]:
-    """Load previously validated results to support resume."""
     if not path.exists():
         return {}
     try:
@@ -112,15 +113,11 @@ class FlickrClient:
         self.session.headers.update({"User-Agent": USER_AGENT})
 
     def get_people_info(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Returns person dict if user exists, None if unknown/deleted/suspended.
-        Raises on unexpected errors.
-        """
         payload = {
-            "method": "flickr.people.getInfo",
-            "api_key": self.api_key,
-            "user_id": user_id,
-            "format": "json",
+            "method":        "flickr.people.getInfo",
+            "api_key":       self.api_key,
+            "user_id":       user_id,
+            "format":        "json",
             "nojsoncallback": 1,
         }
         try:
@@ -133,13 +130,10 @@ class FlickrClient:
         if data.get("stat") == "ok":
             return data.get("person", {})
 
-        # Known invalid user errors
-        code = data.get("code")
+        code    = data.get("code")
         message = data.get("message", "")
-        if code in (1, 2) or "unknown user" in message.lower() or "user not found" in message.lower():
+        if code in (1, 2) or "unknown user" in message.lower():
             return None
-
-        # Unexpected error → raise so caller can decide
         raise RuntimeError(f"Flickr API error code={code} message={message}")
 
 
@@ -155,50 +149,42 @@ def validate_uids(
     results = dict(existing)
     to_check = [uid for uid in uids if uid not in results]
 
-    total = len(uids)
-    already_done = len(existing)
-    remaining = len(to_check)
-
-    logging.info("Total UIDs       : %d", total)
-    logging.info("Already validated: %d", already_done)
-    logging.info("To check now     : %d", remaining)
-
+    total       = len(uids)
+    already     = len(existing)
     valid_count = sum(1 for v in results.values() if v)
     invalid_count = sum(1 for v in results.values() if not v)
 
+    logging.info("Total UIDs       : %d", total)
+    logging.info("Already validated: %d", already)
+    logging.info("To check now     : %d", len(to_check))
+
     for i, uid in enumerate(to_check, start=1):
         try:
-            person = client.get_people_info(uid)
+            person   = client.get_people_info(uid)
             is_valid = person is not None
         except RuntimeError as e:
-            logging.warning("Unexpected error for uid=%s: %s — treating as invalid", uid, e)
+            logging.warning("Unexpected error uid=%s: %s — treating as invalid", uid, e)
             is_valid = False
 
         results[uid] = is_valid
-
         if is_valid:
             valid_count += 1
-            logging.debug("[%d/%d] uid=%-25s VALID", already_done + i, total, uid)
         else:
             invalid_count += 1
-            logging.info("[%d/%d] uid=%-25s INVALID (deleted/suspended)", already_done + i, total, uid)
+            logging.info("[%d/%d] uid=%-25s INVALID", already + i, total, uid)
 
-        # Progress log every 100
         if i % 100 == 0:
             logging.info(
                 "Progress: %d/%d checked | valid=%d invalid=%d (%.1f%% valid)",
-                already_done + i, total, valid_count, invalid_count,
-                100 * valid_count / max(already_done + i, 1),
+                already + i, total, valid_count, invalid_count,
+                100 * valid_count / max(already + i, 1),
             )
 
-        # Save checkpoint
         if i % save_every == 0:
             _save_results(results, output_path)
-            logging.info("Checkpoint saved (%d entries)", len(results))
 
         random_sleep(sleep_min, sleep_max)
 
-    # Final save
     _save_results(results, output_path)
     return results
 
@@ -215,19 +201,15 @@ def save_valid_uid_list(results: Dict[str, bool], txt_path: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Pre-validate Flickr UIDs before crawling.")
-    parser.add_argument("--train_user_json", type=str,
-                        default="/local/smp/data/train_allmetadata_json/train_user_data.json")
-    parser.add_argument("--output", type=str,
-                        default="/local/smp/extra_data_by_uid/valid_uids.json",
-                        help="Output JSON: {uid: true/false}")
-    parser.add_argument("--sleep_min", type=float, default=0.3)
-    parser.add_argument("--sleep_max", type=float, default=0.8)
-    parser.add_argument("--save_every", type=int, default=500,
-                        help="Save checkpoint every N validations.")
-    parser.add_argument("--api_key", type=str, default=os.getenv("FLICKR_API_KEY"))
-    parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Pre-validate Flickr UIDs before crawling.")
+    p.add_argument("--train_user_json", default="/local/smp/data/train_allmetadata_json/train_user_data.json")
+    p.add_argument("--output",          default="/local/smp/extra_data_by_uid/valid_uids.json")
+    p.add_argument("--sleep_min",  type=float, default=0.3)
+    p.add_argument("--sleep_max",  type=float, default=0.8)
+    p.add_argument("--save_every", type=int,   default=500)
+    p.add_argument("--api_key",    default=os.getenv("FLICKR_API_KEY"))
+    p.add_argument("--verbose",    action="store_true")
+    return p.parse_args()
 
 
 def main() -> int:
@@ -235,42 +217,33 @@ def main() -> int:
     setup_logging(args.verbose)
 
     if not args.api_key:
-        logging.error("Missing FLICKR_API_KEY. Set env var or pass --api_key.")
+        logging.error("Missing FLICKR_API_KEY.")
         return 1
 
     output_path = Path(args.output)
-    txt_path = output_path.with_suffix(".txt")
+    txt_path    = output_path.with_suffix(".txt")
 
-    logging.info("Loading train_user_data from %s", args.train_user_json)
     records = load_json_or_jsonl(Path(args.train_user_json))
-    uids = extract_uids(records)
+    uids    = extract_uids(records)
     logging.info("Extracted %d unique UIDs", len(uids))
 
-    # Resume support
     existing = load_existing_results(output_path)
     if existing:
-        logging.info("Resuming from existing results (%d already validated)", len(existing))
+        logging.info("Resuming from %d already validated", len(existing))
 
-    client = FlickrClient(api_key=args.api_key)
-
+    client  = FlickrClient(api_key=args.api_key)
     results = validate_uids(
-        uids=uids,
-        client=client,
-        existing=existing,
+        uids=uids, client=client, existing=existing,
         output_path=output_path,
-        sleep_min=args.sleep_min,
-        sleep_max=args.sleep_max,
+        sleep_min=args.sleep_min, sleep_max=args.sleep_max,
         save_every=args.save_every,
     )
 
-    valid = sum(1 for v in results.values() if v)
+    valid   = sum(1 for v in results.values() if v)
     invalid = sum(1 for v in results.values() if not v)
-    logging.info("Validation complete: %d valid, %d invalid (%.1f%% valid)",
+    logging.info("Done: %d valid, %d invalid (%.1f%% valid)",
                  valid, invalid, 100 * valid / max(len(results), 1))
-
     save_valid_uid_list(results, txt_path)
-    logging.info("Results saved to %s", output_path)
-
     return 0
 
 

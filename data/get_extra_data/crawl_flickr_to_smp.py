@@ -1,137 +1,262 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 crawl_flickr_to_smp.py
 
-Use Flickr public API to collect licensed public data and export it into
-SMP-like files.
+Crawl Flickr photos by text query and output files in the exact SMP-Image
+dataset format consumed by build_dataset_v1.py.
 
-Features
---------
-- Randomized sleep between requests to reduce request burst.
-- Keep missing/unavailable fields in output instead of dropping them.
-- Explicitly mark fields that are SMP-only annotations and cannot be
-  directly obtained from Flickr API.
-- Export files with names and structures aligned to SMP challenge style.
+Output files (all in --output_dir):
+  extra_text.jsonl                       — Uid, Pid, Title, Mediatype, Alltags
+  extra_temporalspatial_information.jsonl — Uid, Pid, Postdate, Latitude, Longitude, Geoaccuracy
+  extra_user_data.jsonl                  — per-user profile (one row per unique Uid)
+  extra_additional_information.jsonl     — Uid, Pid, Pathalias, Ispublic, Mediastatus
+  extra_category.jsonl                   — Uid, Pid, Category, Subcategory, Concept
+  extra_pseudo_label.jsonl               — Uid, Pid, PseudoLogViewScore, is_mature
+  extra_img_filepath.txt                 — extra/Uid/Pid.jpg  (one path per line)
+  crawl_manifest.jsonl                   — per-photo crawl metadata
+  images/Uid/Pid.jpg                     — downloaded images (optional)
 
-Notes
------
-1. This script uses Flickr's public API, not HTML scraping.
-2. You must provide your own Flickr API key.
-3. "Exactly identical" to SMP is not always possible because some SMP
-   fields are dataset-specific annotations. Those fields are preserved as
-   null and marked with metadata.
-4. This script only fetches public content and can optionally filter by
-   license IDs.
+Usage:
+  python3 crawl_flickr_to_smp.py \\
+      --output_dir /local/smp/extra_data/extra_data_Travel \\
+      --text travel \\
+      --max_items 25000 \\
+      --licenses 4,5,7,8,9,10 \\
+      --download_images \\
+      --resume \\
+      --dedupe_on_image_path
+
+Required env:
+  FLICKR_API_KEY   — your Flickr API key
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import logging
 import math
 import os
 import random
-import sys
 import time
-from dataclasses import dataclass
+import calendar
+import datetime as dt
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
-
 from dotenv import load_dotenv
-import os
 
 load_dotenv()
 
-API_KEY = os.getenv("FLICKR_API_KEY")
+# ──────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────
+FLICKR_REST = "https://api.flickr.com/services/rest"
+USER_AGENT  = "smp-flickr-crawler/2.0"
+IMG_EXTS    = {".jpg", ".jpeg", ".png", ".webp"}
 
-"""
-python crawl_flickr_to_smp.py --output_dir ./external_smp_data --text "street photography" --licenses "4,5,7,8,9,10" --max_items 400 --download_images --sleep_min 0.8 --sleep_max 2.0 --flush_every 200 --resume --dedupe_on_image_path
-python crawl_flickr_to_smp.py --output_dir ./external_smp_data --text "street photography" --licenses "4,5,7,8,9,10" --max_items 200 --download_images --flush_every 100 --resume --dedupe_on_image_path --write_pretty_json
-"""
+# SMP Category taxonomy (Category → {Subcategory: [Concept, ...]})
+# Used to assign category/subcategory/concept from Flickr tags when the
+# API doesn't return them directly.
+SMP_CATEGORY_MAP: Dict[str, Dict[str, List[str]]] = {
+    "Travel&Active&Sports": {
+        "Tourism":   ["landmark", "cityscape", "monument", "tourism", "travel"],
+        "Outdoors":  ["hiking", "camping", "mountain", "nature", "forest"],
+        "Sports":    ["soccer", "football", "basketball", "tennis", "running"],
+        "Adventure": ["surfing", "skiing", "climbing", "cycling", "kayaking"],
+    },
+    "Holiday&Celebrations": {
+        "Festival":    ["christmas", "halloween", "new year", "carnival", "parade"],
+        "Celebration": ["birthday", "wedding", "anniversary", "graduation", "party"],
+    },
+    "Animal": {
+        "Pet":      ["cat", "dog", "rabbit", "hamster", "bird"],
+        "Wildlife": ["lion", "tiger", "elephant", "bear", "deer"],
+        "Marine":   ["fish", "dolphin", "whale", "shark", "jellyfish"],
+    },
+    "Entertainment": {
+        "Music":    ["concert", "band", "guitar", "piano", "drum"],
+        "Theater":  ["performance", "stage", "dance", "ballet", "opera"],
+        "Festival": ["film", "movie", "cinema", "comedy", "show"],
+    },
+    "Fashion": {
+        "Clothing":   ["dress", "suit", "jacket", "coat", "shirt"],
+        "Accessory":  ["bag", "shoes", "hat", "sunglasses", "jewelry"],
+        "Runway":     ["model", "fashion week", "designer", "collection", "lookbook"],
+    },
+    "Whether&Season": {
+        "Winter": ["snow", "ice", "frost", "blizzard", "frozen"],
+        "Summer": ["beach", "sun", "heat", "summer", "sunshine"],
+        "Rain":   ["rain", "umbrella", "storm", "puddle", "wet"],
+        "Autumn": ["autumn", "fall", "leaves", "maple", "harvest"],
+        "Spring": ["spring", "flower", "blossom", "bloom", "garden"],
+    },
+    "Social&People": {
+        "Portrait": ["portrait", "face", "smile", "selfie", "people"],
+        "Family":   ["family", "children", "baby", "mother", "father"],
+        "Friends":  ["friends", "group", "together", "social", "gathering"],
+    },
+    "Urban": {
+        "Architecture": ["building", "skyscraper", "bridge", "church", "tower"],
+        "Street":       ["street", "road", "city", "urban", "traffic"],
+        "Night":        ["night", "neon", "lights", "city lights", "nightlife"],
+    },
+    "Food": {
+        "Dish":     ["meal", "plate", "dinner", "lunch", "breakfast"],
+        "Drink":    ["coffee", "tea", "wine", "beer", "juice"],
+        "Dessert":  ["cake", "ice cream", "chocolate", "pastry", "cookie"],
+        "Cooking":  ["kitchen", "chef", "cooking", "recipe", "baking"],
+    },
+    "Electronics": {
+        "Device":   ["phone", "laptop", "tablet", "camera", "headphones"],
+        "Gaming":   ["game", "console", "pc", "gaming", "controller"],
+        "Gadget":   ["drone", "robot", "smartwatch", "vr", "speaker"],
+    },
+    "Family": {
+        "Baby":     ["baby", "newborn", "infant", "toddler", "nursery"],
+        "Home":     ["home", "house", "interior", "room", "living"],
+        "Reunion":  ["reunion", "together", "holiday", "family", "gathering"],
+    },
+}
+
+# query keyword → SMP Category  (used when --seed_category is not provided)
+QUERY_TO_CATEGORY: Dict[str, str] = {
+    "travel":      "Travel&Active&Sports",
+    "sports":      "Travel&Active&Sports",
+    "hiking":      "Travel&Active&Sports",
+    "holiday":     "Holiday&Celebrations",
+    "christmas":   "Holiday&Celebrations",
+    "festival":    "Holiday&Celebrations",
+    "animal":      "Animal",
+    "cat":         "Animal",
+    "dog":         "Animal",
+    "concert":     "Entertainment",
+    "music":       "Entertainment",
+    "fashion":     "Fashion",
+    "style":       "Fashion",
+    "winter":      "Whether&Season",
+    "snow":        "Whether&Season",
+    "rain":        "Whether&Season",
+    "people":      "Social&People",
+    "portrait":    "Social&People",
+    "city":        "Urban",
+    "urban":       "Urban",
+    "architecture":"Urban",
+    "food":        "Food",
+    "meal":        "Food",
+    "electronics": "Electronics",
+    "tech":        "Electronics",
+    "family":      "Family",
+    "baby":        "Family",
+}
 
 
-FLICKR_REST_URL = "https://api.flickr.com/services/rest"
-DEFAULT_TIMEOUT = 30
-USER_AGENT = "smp-like-flickr-crawler/1.0"
-
-
-# -----------------------------
-# Utilities
-# -----------------------------
+# ──────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────
 def setup_logging(verbose: bool = False) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
-        level=level,
+        level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
 
-def ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+log = logging.getLogger(__name__)
 
 
-def random_sleep(min_seconds: float, max_seconds: float) -> None:
-    duration = random.uniform(min_seconds, max_seconds)
-    logging.debug("Sleeping for %.3f seconds", duration)
-    time.sleep(duration)
+# ──────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────
+def random_sleep(min_s: float, max_s: float) -> None:
+    time.sleep(random.uniform(min_s, max_s))
 
 
-def safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
-    try:
-        if value is None or value == "":
-            return default
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
-    try:
-        if value is None or value == "":
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def log1p_or_none(value: Any) -> Optional[float]:
-    v = safe_float(value)
+def empty_to_none(v: Any) -> Any:
     if v is None:
         return None
-    if v < 0:
+    if isinstance(v, str) and v.strip() == "":
         return None
-    return math.log1p(v)
+    return v
 
 
-def dump_json_lines(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+def safe_float(v: Any) -> Optional[float]:
+    try:
+        f = float(v)
+        return None if math.isnan(f) else f
+    except Exception:
+        return None
 
 
-def append_jsonl_record(handle, row: Dict[str, Any], flush: bool = False) -> None:
-    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-    if flush:
-        handle.flush()
+def safe_int(v: Any) -> Optional[int]:
+    f = safe_float(v)
+    return None if f is None else int(f)
 
 
-def append_text_line(handle, value: str, flush: bool = False) -> None:
-    handle.write(f"{value}\n")
-    if flush:
-        handle.flush()
+def infer_category_from_tags(
+    tags: List[str],
+    seed_category: Optional[str],
+) -> Tuple[str, str, str]:
+    """Return (Category, Subcategory, Concept) from tag list."""
+    if seed_category and seed_category in SMP_CATEGORY_MAP:
+        category = seed_category
+    else:
+        category = "Travel&Active&Sports"   # default
+
+    tags_lower = {t.lower() for t in tags}
+    best_sub = next(iter(SMP_CATEGORY_MAP[category]))
+    best_concept = ""
+    best_score = -1
+
+    for sub, concepts in SMP_CATEGORY_MAP[category].items():
+        for concept in concepts:
+            if concept.lower() in tags_lower:
+                score = len(concept)
+                if score > best_score:
+                    best_score = score
+                    best_sub = sub
+                    best_concept = concept
+
+    if not best_concept and tags:
+        best_concept = tags[0]
+
+    return category, best_sub, best_concept
 
 
-def load_existing_pids_from_jsonl(path: Path, key: str = "Pid") -> set[str]:
-    existing: set[str] = set()
+def pseudo_log_view_score(views: Optional[int], favorites: Optional[int]) -> Optional[float]:
+    """
+    Approximate SMP label (log-views) from Flickr view count.
+    SMP label = log(views+1).  We replicate that exactly when views is known.
+    Favorites act as a small smoothing signal when views are 0.
+    """
+    v = views if views is not None else 0
+    f = favorites if favorites is not None else 0
+    if v == 0 and f == 0:
+        return None
+    score = math.log1p(v + 0.1 * f)
+    return round(score, 6)
+
+
+# ──────────────────────────────────────────────
+# JSONL helpers
+# ──────────────────────────────────────────────
+def append_jsonl(path: Path, record: Dict) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def append_txt(path: Path, line: str) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def load_seen_pids(path: Path) -> Set[str]:
+    """Load already-crawled Pids from extra_text.jsonl for resume support."""
+    seen: Set[str] = set()
     if not path.exists():
-        return existing
-
+        return seen
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -139,844 +264,1213 @@ def load_existing_pids_from_jsonl(path: Path, key: str = "Pid") -> set[str]:
                 continue
             try:
                 obj = json.loads(line)
+                pid = obj.get("Pid")
+                if pid is not None:
+                    seen.add(str(pid))
             except json.JSONDecodeError:
-                continue
-            value = obj.get(key)
-            if value is not None:
-                existing.add(str(value))
-    return existing
+                pass
+    return seen
 
 
-def dump_json_pretty(path: Path, obj: Any) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+def load_seen_image_paths(path: Path) -> Set[str]:
+    seen: Set[str] = set()
+    if not path.exists():
+        return seen
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                seen.add(line)
+    return seen
 
 
-def write_txt_lines(path: Path, lines: Iterable[str]) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        for line in lines:
-            f.write(f"{line}\n")
+def count_jsonl_lines(path: Path) -> int:
+    if not path.exists():
+        return 0
+    c = 0
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                c += 1
+    return c
 
 
-def sanitize_text(text: Any) -> str:
-    if text is None:
-        return ""
-    return str(text).replace("\r", " ").replace("\n", " ").strip()
-
-
-# -----------------------------
-# Flickr client
-# -----------------------------
-@dataclass
+# ──────────────────────────────────────────────
+# Flickr API client
+# ──────────────────────────────────────────────
 class FlickrClient:
-    api_key: str
-    sleep_min: float = 0.5
-    sleep_max: float = 1.5
-    timeout: int = DEFAULT_TIMEOUT
-    session: Optional[requests.Session] = None
+    def __init__(self, api_key: str, timeout: int = 20) -> None:
+        self.api_key = api_key
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": USER_AGENT})
 
-    def __post_init__(self) -> None:
-        if self.session is None:
-            self.session = requests.Session()
-            self.session.headers.update({"User-Agent": USER_AGENT})
-
-    def call(self, method: str, **params: Any) -> Dict[str, Any]:
-        payload = {
-            "method": method,
-            "api_key": self.api_key,
-            "format": "json",
+    def _get(self, method: str, extra: Dict) -> Dict:
+        params = {
+            "method":       method,
+            "api_key":      self.api_key,
+            "format":       "json",
             "nojsoncallback": 1,
-            **params,
+            **extra,
         }
-        resp = self.session.get(FLICKR_REST_URL, params=payload, timeout=self.timeout)
-        random_sleep(self.sleep_min, self.sleep_max)
+        resp = self.session.get(FLICKR_REST, params=params, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
         if data.get("stat") != "ok":
-            raise RuntimeError(
-                f"Flickr API error for method={method}: {data.get('message', 'unknown error')}"
-            )
+            raise RuntimeError(f"Flickr error: {data.get('message')} (code={data.get('code')})")
         return data
 
-    def search_photos(
+    def search(
         self,
-        text: Optional[str],
-        tags: Optional[str],
-        licenses: Optional[str],
-        sort: str,
-        per_page: int,
+        text: str,
         page: int,
-        min_upload_date: Optional[str] = None,
-        max_upload_date: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        extras = ",".join(
-            [
-                "license",
-                "date_upload",
-                "date_taken",
-                "owner_name",
-                "icon_server",
-                "original_format",
-                "last_update",
-                "geo",
-                "tags",
-                "machine_tags",
-                "o_dims",
-                "views",
-                "media",
-                "path_alias",
-                "url_sq",
-                "url_t",
-                "url_s",
-                "url_q",
-                "url_m",
-                "url_n",
-                "url_z",
-                "url_c",
-                "url_l",
-                "url_o",
-                "description",
-            ]
-        )
-
+        per_page: int,
+        licenses: str,
+        sort: str,
+        user_id: Optional[str] = None,
+        min_upload_date: Optional[int] = None,
+        max_upload_date: Optional[int] = None,
+        extras: str = (
+            "url_sq,url_m,url_l,url_o,"
+            "date_upload,date_taken,"
+            "geo,tags,machine_tags,"
+            "views,count_faves,count_comments,"
+            "description,media,license,"
+            "original_format,owner_name,path_alias,"
+            "isfavorite,ispublic,isfriend,isfamily"
+        ),
+    ) -> Dict:
         params: Dict[str, Any] = {
-            "text": text,
-            "tags": tags,
-            "tag_mode": "all",
-            "license": licenses,
-            "sort": sort,
+            "text":     text,
+            "page":     page,
             "per_page": per_page,
-            "page": page,
-            "content_type": 1,        # photos only
-            "media": "photos",
+            "license":  licenses,
+            "sort":     sort,
+            "extras":   extras,
             "safe_search": 1,
-            "privacy_filter": 1,      # public
-            "has_geo": 0,             # allow all
-            "extras": extras,
+            "content_type": 1,  # photos only
         }
-
-        if min_upload_date:
+        if user_id:
+            params["user_id"] = user_id
+        if min_upload_date is not None:
             params["min_upload_date"] = min_upload_date
-        if max_upload_date:
+        if max_upload_date is not None:
             params["max_upload_date"] = max_upload_date
+        return self._get("flickr.photos.search", params)
 
-        params = {k: v for k, v in params.items() if v not in (None, "")}
-        return self.call("flickr.photos.search", **params)
+    def get_info(self, photo_id: str) -> Dict:
+        return self._get("flickr.photos.getInfo", {"photo_id": photo_id})
 
-    def get_photo_info(self, photo_id: str, secret: Optional[str] = None) -> Dict[str, Any]:
-        params: Dict[str, Any] = {"photo_id": photo_id}
-        if secret:
-            params["secret"] = secret
-        return self.call("flickr.photos.getInfo", **params)
+    def get_people_info(self, user_id: str) -> Optional[Dict]:
+        try:
+            data = self._get("flickr.people.getInfo", {"user_id": user_id})
+            return data.get("person", {})
+        except RuntimeError as e:
+            if "User not found" in str(e) or "code=1" in str(e):
+                return None
+            raise
 
-    def get_people_info(self, user_id: str) -> Dict[str, Any]:
-        return self.call("flickr.people.getInfo", user_id=user_id)
+    def get_public_photos(
+        self,
+        user_id: str,
+        page: int = 1,
+        per_page: int = 500,
+        extras: str = (
+            "url_sq,url_m,url_l,url_o,"
+            "date_upload,date_taken,"
+            "geo,tags,machine_tags,"
+            "views,count_faves,count_comments,"
+            "description,media,license,"
+            "original_format,owner_name,path_alias,"
+            "ispublic"
+        ),
+    ) -> Dict:
+        """flickr.people.getPublicPhotos — all public photos of a specific user."""
+        return self._get("flickr.people.getPublicPhotos", {
+            "user_id":  user_id,
+            "page":     page,
+            "per_page": per_page,
+            "extras":   extras,
+        })
 
-    def get_licenses(self) -> Dict[str, str]:
-        data = self.call("flickr.photos.licenses.getInfo")
-        licenses = {}
-        for item in data.get("licenses", {}).get("license", []):
-            licenses[str(item.get("id"))] = item.get("name", "")
-        return licenses
+    def enrich_photo_with_getinfo(self, photo: Dict) -> Dict:
+        """
+        Call flickr.photos.getInfo and merge extra fields into photo dict.
+        Adds: _location (city/state/country), count_comments (from getInfo),
+              notes_count, has_people, taken_granularity.
+        Returns enriched photo dict (modifies in place and returns).
+        """
+        pid = str(photo.get("id", ""))
+        if not pid:
+            return photo
+        try:
+            info = self._get("flickr.photos.getInfo", {"photo_id": pid})
+            p = info.get("photo", {})
+
+            # location — city / state / country
+            loc = p.get("location", {})
+            if isinstance(loc, dict):
+                def _loc(key: str) -> Optional[str]:
+                    v = loc.get(key, {})
+                    if isinstance(v, dict):
+                        return empty_to_none(v.get("_content"))
+                    return empty_to_none(v)
+                photo["_location"] = {
+                    "city":    _loc("locality") or _loc("city"),
+                    "state":   _loc("region")   or _loc("state"),
+                    "country": _loc("country"),
+                }
+            else:
+                photo["_location"] = {}
+
+            # comments count (getInfo is more reliable than search extras)
+            comments = p.get("comments", {})
+            if isinstance(comments, dict):
+                photo["count_comments"] = safe_int(comments.get("_content"))
+            elif comments is not None:
+                photo["count_comments"] = safe_int(comments)
+
+            # notes
+            notes = p.get("notes", {})
+            if isinstance(notes, dict):
+                photo["notes_count"] = len(notes.get("note", []))
+
+            # has_people (people tag in photo)
+            people = p.get("people", {})
+            if isinstance(people, dict):
+                photo["has_people"] = safe_int(people.get("haspeople", 0))
+
+            # date taken granularity (0=exact, 4=year only, etc.)
+            dates = p.get("dates", {})
+            if isinstance(dates, dict):
+                photo["taken_granularity"] = safe_int(dates.get("takengranularity", 0))
+
+        except Exception as e:
+            log.debug("enrich_photo_with_getinfo failed pid=%s: %s", pid, e)
+        return photo
 
 
-# -----------------------------
-# SMP alignment helpers
-# -----------------------------
-SMP_ONLY_FIELDS = {
-    "Category": "SMP-specific annotation. Flickr API does not provide official SMP category labels.",
-    "Subcategory": "SMP-specific annotation. Flickr API does not provide official SMP subcategory labels.",
-    "Concept": "SMP-specific annotation. Flickr API does not provide official SMP concept labels.",
-    "user_description_vector": "Potentially preprocessed/embedded field in SMP; not directly available from Flickr API.",
-    "location_description_vector": "Potentially preprocessed/embedded field in SMP; not directly available from Flickr API.",
-}
-
-FIELD_PROVENANCE = {
-    # Text
-    "Uid": "from Flickr API",
-    "Pid": "from Flickr API",
-    "Title": "from Flickr API",
-    "Tile": "kept for compatibility; populated from Title because SMP page appears to use 'Tile' in one schema block",
-    "Mediatype": "from Flickr API",
-    "Alltags": "from Flickr API",
-    # Time / geo
-    "Postdate": "from Flickr API",
-    "Latitude": "from Flickr API",
-    "Longitude": "from Flickr API",
-    "Geoaccuracy": "from Flickr API",
-    # User
-    "photo_firstdate": "from Flickr API if available",
-    "photo_count": "from Flickr API if available",
-    "ispro": "from Flickr API if available",
-    "canbuypro": "not directly exposed in standard public people.getInfo response; preserved as null if unavailable",
-    "timezone_offset": "from Flickr API if available",
-    "photo_firstdatetaken": "not directly exposed in standard Flickr API; preserved as null",
-    "timezone_id": "from Flickr API if available",
-    "user_description": "from Flickr API if available",
-    "location_description": "from Flickr API if available",
-    "user_description_vector": SMP_ONLY_FIELDS["user_description_vector"],
-    "location_description_vector": SMP_ONLY_FIELDS["location_description_vector"],
-    # Additional
-    "Pathalias": "from Flickr API",
-    "Ispublic": "inferred from public-only search",
-    "Mediastatus": "not directly exposed in equivalent SMP form; preserved as null",
-    "license_id": "from Flickr API",
-    "license_name": "from Flickr API via flickr.photos.licenses.getInfo",
-    # Category
-    "Category": SMP_ONLY_FIELDS["Category"],
-    "Subcategory": SMP_ONLY_FIELDS["Subcategory"],
-    "Concept": SMP_ONLY_FIELDS["Concept"],
-    # Pseudo label
-    "PseudoPopularityScore": "derived from Flickr engagement fields; not official SMP label",
-    "views": "from Flickr API",
-    "faves": "from Flickr API via getInfo",
-    "comments": "from Flickr API via getInfo",
-}
+# ──────────────────────────────────────────────
+# Record builders  →  SMP format
+# ──────────────────────────────────────────────
+def _extract_tags(photo: Dict) -> List[str]:
+    """Return clean tag list from photo dict (handles both str and dict forms)."""
+    raw = photo.get("tags", "")
+    if isinstance(raw, dict):
+        # getInfo returns {"tag": [...]} structure
+        items = raw.get("tag", [])
+        return [t.get("raw", t.get("_content", "")) for t in items if isinstance(t, dict)]
+    if isinstance(raw, str):
+        return [t.strip().strip('"') for t in raw.split() if t.strip()]
+    return []
 
 
-def build_image_url(photo: Dict[str, Any]) -> Optional[str]:
+def _extract_machine_tags(photo: Dict) -> List[str]:
+    raw = photo.get("machine_tags", "")
+    if isinstance(raw, str):
+        return [t.strip() for t in raw.split() if t.strip()]
+    return []
+
+
+def build_text_record(photo: Dict, uid: str) -> Dict:
+    tags_list = _extract_tags(photo)
+    # SMP format: "tag1" "tag2" ...
+    alltags = " ".join(f'"{t}"' for t in tags_list) if tags_list else None
+    desc_raw = photo.get("description", "")
+    description = desc_raw.get("_content", "") if isinstance(desc_raw, dict) else str(desc_raw or "")
+    return {
+        "Uid":         uid,
+        "Pid":         str(photo["id"]),
+        "Title":       empty_to_none(photo.get("title")),
+        "Mediatype":   photo.get("media", "photo"),
+        "Alltags":     alltags,
+        # extra text fields (stored for downstream feature engineering)
+        "description": empty_to_none(description),
+        "machine_tags": " ".join(_extract_machine_tags(photo)) or None,
+        "tag_count":   len(tags_list),
+    }
+
+
+def build_temporal_record(photo: Dict, uid: str) -> Dict:
+    lat = safe_float(photo.get("latitude"))
+    lon = safe_float(photo.get("longitude"))
+    acc = safe_int(photo.get("accuracy"))
+    if lat == 0.0 and lon == 0.0:
+        lat = lon = None
+    postdate    = safe_int(photo.get("dateupload"))
+    date_taken  = empty_to_none(photo.get("datetaken"))   # "YYYY-MM-DD HH:MM:SS"
+    return {
+        "Uid":         uid,
+        "Pid":         str(photo["id"]),
+        "Postdate":    postdate,
+        "Latitude":    str(lat) if lat is not None else None,
+        "Longitude":   str(lon) if lon is not None else None,
+        "Geoaccuracy": str(acc) if acc is not None else "16",
+        # extra temporal (for cyclical encoding, taken vs posted gap, etc.)
+        "date_taken":  date_taken,
+    }
+
+
+def build_additional_record(photo: Dict, uid: str) -> Dict:
+    # City/State/Country come from getInfo, stored in photo if pre-fetched
+    location = photo.get("_location", {}) or {}
+    return {
+        "Uid":           uid,
+        "Pid":           str(photo["id"]),
+        "Pathalias":     empty_to_none(photo.get("pathalias")) or empty_to_none(photo.get("ownername")),
+        "Ispublic":      str(photo.get("ispublic", 1)),
+        "Mediastatus":   "ready",
+        # extra fields (GitHub repo uses City/State/Country)
+        "license_id":    safe_int(photo.get("license")),
+        "original_format": empty_to_none(photo.get("originalformat")),
+        "city":          empty_to_none(location.get("city")),
+        "state":         empty_to_none(location.get("state")),
+        "country":       empty_to_none(location.get("country")),
+    }
+
+
+def build_category_record(
+    photo: Dict,
+    uid: str,
+    seed_category: Optional[str],
+) -> Dict:
+    tags_list = _extract_tags(photo)
+    category, subcategory, concept = infer_category_from_tags(tags_list, seed_category)
+    return {
+        "Uid":         uid,
+        "Pid":         str(photo["id"]),
+        "Category":    category,
+        "Subcategory": subcategory,
+        "Concept":     concept,
+    }
+
+
+def build_pseudo_label_record(photo: Dict, uid: str) -> Dict:
+    views    = safe_int(photo.get("views"))
+    faves    = safe_int(photo.get("count_faves"))
+    comments = safe_int(photo.get("count_comments"))
+    is_mature = int(bool(photo.get("isfamily", 0)) or bool(photo.get("isfriend", 0)))
+    score = pseudo_log_view_score(views, faves)
+    return {
+        "Uid":                uid,
+        "Pid":                str(photo["id"]),
+        "PseudoLogViewScore": score,
+        "is_mature":          bool(is_mature),
+        # raw engagement signals (all used in feature engineering)
+        "raw_views":          views,
+        "raw_faves":          faves,
+        "raw_comments":       comments,
+        # engagement ratios (pre-compute here to avoid None division later)
+        "fave_per_view":      safe_float(faves) / (views + 1) if views is not None and faves is not None else None,
+        "comment_per_view":   safe_float(comments) / (views + 1) if views is not None and comments is not None else None,
+    }
+
+
+def _get_count(d: Any, key: str) -> Optional[int]:
+    """Safely extract count from Flickr person dict (handles int and {'_content': N} forms)."""
+    if not isinstance(d, dict):
+        return None
+    val = d.get(key)
+    if val is None:
+        return None
+    if isinstance(val, dict):
+        val = val.get("_content")
+    return safe_int(val)
+
+
+def build_user_record(person: Dict, uid: str) -> Dict:
     """
-    Prefer a direct URL returned by extras; otherwise try a conservative fallback.
+    Build user record aligned with:
+    - SMP official User Profile fields
+    - GitHub repo extra fields (totalImages, totalGeotagged, totalInGroup, totalTags, totalFaves, follower, following, totalViews)
+    - build_dataset_v1.py standardize_user_table() alias map
     """
-    for key in ("url_o", "url_l", "url_c", "url_z", "url_n", "url_m", "url_q", "url_s", "url_t", "url_sq"):
-        if photo.get(key):
-            return str(photo[key])
+    photos   = person.get("photos", {}) if isinstance(person.get("photos"), dict) else {}
+    counts   = person.get("counts",  {}) if isinstance(person.get("counts"),  dict) else {}
+    tz       = person.get("timezone", {}) if isinstance(person.get("timezone"), dict) else {}
 
-    server = photo.get("server")
-    photo_id = photo.get("id")
-    secret = photo.get("secret")
-    if server and photo_id and secret:
-        # Conservative fallback for medium size "_z.jpg"
-        return f"https://live.staticflickr.com/{server}/{photo_id}_{secret}_z.jpg"
+    # ── SMP official ──────────────────────────────────
+    photo_firstdate      = empty_to_none(photos.get("firstdate"))
+    photo_firstdatetaken = empty_to_none(photos.get("firstdatetaken"))
+    photo_count          = _get_count(photos, "count")
+    ispro                = safe_int(person.get("ispro", 0))
+    canbuypro            = safe_int(person.get("canbuypro", 0))
+    tz_offset            = empty_to_none(tz.get("offset"))
+    tz_id                = empty_to_none(tz.get("id"))
+
+    # user_description / location_description: SMP uses pre-computed embedding vectors.
+    # We cannot reproduce them from Flickr API, so store None.
+    # build_dataset_v1 will handle None as zero-vector.
+    user_description     = None
+    location_description = None
+
+    # ── GitHub repo extra fields ──────────────────────
+    # flickr.people.getInfo returns these under photos.* and counts.*
+    total_views     = _get_count(photos, "views")
+    total_favorites = None   # not directly in getInfo; Flickr doesn't expose total faves per user
+    follower_count  = _get_count(counts, "followers")
+    following_count = _get_count(counts, "contacts")   # 'contacts' = following in Flickr API
+
+    # totalImages = same as photo_count
+    # totalGeotagged — available as photos.geo
+    total_geotagged = _get_count(photos, "geo") if "geo" in photos else None
+
+    # Flickr doesn't expose totalInGroup, totalTags, totalFaves per-user without extra calls.
+    # Store what we have; downstream can impute or drop.
+    total_in_group  = None
+    total_tags      = None
+
+    # Location text (city-level, not the embedding vector)
+    location_raw    = person.get("location", {})
+    location_text   = location_raw.get("_content", "") if isinstance(location_raw, dict) else str(location_raw or "")
+
+    return {
+        # ── SMP official ──
+        "Uid":                  uid,
+        "photo_firstdate":      photo_firstdate,
+        "photo_count":          photo_count,
+        "ispro":                ispro,
+        "canbuypro":            canbuypro,
+        "timezone_offset":      tz_offset,
+        "photo_firstdatetaken": photo_firstdatetaken,
+        "timezone_id":          tz_id,
+        "user_description":     user_description,        # None → zero-vector in build_dataset
+        "location_description": location_description,    # None → zero-vector in build_dataset
+        # ── GitHub repo / build_dataset alias map ──
+        "follower_count":       follower_count,
+        "following_count":      following_count,
+        "total_views":          total_views,
+        "total_favorites":      total_favorites,
+        "total_geotagged":      total_geotagged,
+        "total_in_group":       total_in_group,
+        "total_tags":           total_tags,
+        "mean_views":           None,   # cannot compute without all-photo stats
+        "mean_favorites":       None,
+        "mean_tags":            None,
+        # ── extra for feature engineering ──
+        "location_text":        empty_to_none(location_text),  # raw city/country string
+        "is_deleted":           int(person.get("isdeleted", 0)),
+    }
+
+
+# ──────────────────────────────────────────────
+# Image download
+# ──────────────────────────────────────────────
+def best_photo_url(photo: Dict) -> Optional[str]:
+    for key in ("url_l", "url_m", "url_o"):
+        url = photo.get(key)
+        if url:
+            return url
     return None
 
 
-def build_rel_image_path(owner: str, photo_id: str, ext: str = ".jpg") -> str:
-    owner_sanitized = owner.replace("/", "_").replace("@", "_")
-    return f"external_flickr/{owner_sanitized}/{photo_id}{ext}"
-
-
-def maybe_download_image(
-    session: requests.Session,
-    url: str,
-    out_path: Path,
-    sleep_min: float,
-    sleep_max: float,
-    timeout: int,
-) -> bool:
+def download_image(url: str, dest: Path, session: requests.Session) -> bool:
     try:
-        ensure_dir(out_path.parent)
-        resp = session.get(url, stream=True, timeout=timeout, headers={"User-Agent": USER_AGENT})
-        random_sleep(sleep_min, sleep_max)
+        resp = session.get(url, stream=True, timeout=30)
         resp.raise_for_status()
-        with out_path.open("wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("wb") as f:
+            for chunk in resp.iter_content(8192):
+                f.write(chunk)
         return True
     except Exception as e:
-        logging.warning("Failed to download image %s -> %s: %s", url, out_path, e)
+        log.debug("Image download failed %s: %s", url, e)
         return False
 
 
-def extract_text_record(photo: Dict[str, Any]) -> Dict[str, Any]:
-    title = sanitize_text(photo.get("title"))
-    tags = sanitize_text(photo.get("tags"))
-    media = sanitize_text(photo.get("media") or "photo")
+# ──────────────────────────────────────────────
+# Flush / rotate buffers
+# ──────────────────────────────────────────────
+def flush_buffers(
+    buffers: Dict[str, List],
+    paths: Dict[str, Path],
+    img_path_buf: List[str],
+    img_filepath_path: Path,
+) -> None:
+    for key, records in buffers.items():
+        if not records:
+            continue
+        p = paths[key]
+        with p.open("a", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        records.clear()
 
-    return {
-        "Uid": photo.get("owner"),
-        "Pid": photo.get("id"),
-        "Title": title,
-        "Tile": title,  # compatibility placeholder
-        "Mediatype": media,
-        "Alltags": tags,
-    }
-
-
-def extract_temporal_spatial_record(photo: Dict[str, Any], info_photo: Dict[str, Any]) -> Dict[str, Any]:
-    dates = info_photo.get("dates", {}) if info_photo else {}
-    location = info_photo.get("location", {}) if info_photo else {}
-
-    postdate = (
-        dates.get("posted")
-        or photo.get("dateupload")
-        or None
-    )
-
-    latitude = location.get("latitude")
-    longitude = location.get("longitude")
-    accuracy = location.get("accuracy")
-
-    if latitude in (None, "", 0, "0"):
-        latitude = photo.get("latitude")
-    if longitude in (None, "", 0, "0"):
-        longitude = photo.get("longitude")
-    if accuracy in (None, "", 0, "0"):
-        accuracy = photo.get("accuracy")
-
-    return {
-        "Uid": photo.get("owner"),
-        "Pid": photo.get("id"),
-        "Postdate": postdate,
-        "Latitude": safe_float(latitude),
-        "Longitude": safe_float(longitude),
-        "Geoaccuracy": safe_int(accuracy),
-    }
+    if img_path_buf:
+        with img_filepath_path.open("a", encoding="utf-8") as f:
+            for line in img_path_buf:
+                f.write(line + "\n")
+        img_path_buf.clear()
 
 
-def extract_user_record(photo: Dict[str, Any], people_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    user_root = {}
-    person = {}
-    if people_info:
-        person = people_info.get("person", {})
-        user_root = person
+# ──────────────────────────────────────────────
+# Time-window slicing  (bypass 100-page limit)
+# ──────────────────────────────────────────────
+# Flickr's hard cap: 100 pages × 500 per_page = 50,000 results per query.
+# But each (query + time window) is an independent result set.
+# Strategy: slice [date_start, date_end] into windows; if a window still
+# has too many results (> WINDOW_OVERFLOW_THRESHOLD), halve it recursively.
 
-    photos_count = None
-    firstdate = None
-    photos = user_root.get("photos", {})
-    if isinstance(photos, dict):
-        photos_count = safe_int((photos.get("count") or {}).get("_content") if isinstance(photos.get("count"), dict) else photos.get("count"))
-        firstdate = (photos.get("firstdate") or {}).get("_content") if isinstance(photos.get("firstdate"), dict) else photos.get("firstdate")
-
-    timezone = user_root.get("timezone", {})
-    description = user_root.get("description", {})
-    location = user_root.get("location", {})
-    ispro = user_root.get("ispro")
-
-    # follower / following / total_views：論文 Table 2 top features
-    followers = user_root.get("followers", {})
-    contacts = user_root.get("contacts", {})
-    total_views_info = photos.get("views", {}) if isinstance(photos, dict) else {}
-    faves_info = user_root.get("photos", {})
-
-    follower_count = safe_int(
-        followers.get("_content") if isinstance(followers, dict) else followers
-    )
-    following_count = safe_int(
-        contacts.get("_content") if isinstance(contacts, dict) else contacts
-    )
-    total_views = safe_int(
-        total_views_info.get("_content") if isinstance(total_views_info, dict) else total_views_info
-    )
-
-    return {
-        "Uid": photo.get("owner"),
-        "photo_firstdate": firstdate,
-        "photo_count": photos_count,
-        "ispro": safe_int(ispro),
-        "canbuypro": None,  # unavailable in standard public response
-        "timezone_offset": safe_int(timezone.get("offset")) if isinstance(timezone, dict) else None,
-        "photo_firstdatetaken": None,  # unavailable directly
-        "timezone_id": timezone.get("label") if isinstance(timezone, dict) else None,
-        "user_description": sanitize_text(description.get("_content") if isinstance(description, dict) else description),
-        "location_description": sanitize_text(location.get("_content") if isinstance(location, dict) else location),
-        "user_description_vector": None,
-        "location_description_vector": None,
-        "follower_count": follower_count,
-        "following_count": following_count,
-        "total_views": total_views,
-    }
+WINDOW_OVERFLOW_THRESHOLD = 40_000   # start splitting when total > this
+WINDOW_MIN_DAYS = 1                  # never split below 1-day windows
 
 
-def extract_additional_record(photo: Dict[str, Any], info_photo: Dict[str, Any], license_map: Dict[str, str]) -> Dict[str, Any]:
-    license_id = str(photo.get("license")) if photo.get("license") is not None else None
-    visibility = info_photo.get("visibility", {}) if info_photo else {}
-
-    ispublic = visibility.get("ispublic")
-    if ispublic is None:
-        ispublic = 1  # inferred from public search
-
-    return {
-        "Uid": photo.get("owner"),
-        "Pid": photo.get("id"),
-        "Pathalias": photo.get("pathalias"),
-        "Ispublic": safe_int(ispublic, default=1),
-        "Mediastatus": None,
-        "license_id": license_id,
-        "license_name": license_map.get(license_id, None) if license_id is not None else None,
-    }
-
-
-# SMP category keyword mapping（根據 SMP category 分布設計）
-_SMP_CATEGORY_KEYWORDS: Dict[str, List[str]] = {
-    "Travel": ["travel", "trip", "vacation", "journey", "tourism", "tourist", "abroad", "explore"],
-    "Animals": ["animal", "dog", "cat", "bird", "wildlife", "pet", "horse", "fish", "zoo", "insect", "butterfly"],
-    "Food": ["food", "restaurant", "cooking", "recipe", "meal", "dinner", "lunch", "breakfast", "cafe", "coffee", "eat"],
-    "People": ["portrait", "people", "person", "street", "human", "face", "family", "children", "kid", "baby", "wedding"],
-    "Nature": ["nature", "landscape", "mountain", "forest", "river", "lake", "sea", "ocean", "sky", "sunset", "sunrise", "flower", "tree", "plant", "garden"],
-    "Urban": ["city", "urban", "street", "building", "architecture", "downtown", "skyline", "bridge", "night"],
-    "Sports": ["sport", "sports", "running", "football", "soccer", "basketball", "baseball", "cycling", "swimming", "tennis", "gym", "fitness"],
-    "Art": ["art", "museum", "gallery", "painting", "sculpture", "exhibition", "graffiti", "design"],
-    "Technology": ["technology", "tech", "computer", "phone", "gadget", "robot", "science"],
-    "Events": ["concert", "festival", "event", "show", "parade", "party", "celebration", "christmas", "halloween"],
-}
-
-
-def infer_category_from_tags(tags: str) -> Optional[str]:
+def generate_time_windows(
+    date_start: str,
+    date_end:   str,
+    initial_days: int = 180,
+) -> List[Tuple[int, int]]:
     """
-    Infer SMP-like category from Flickr tags using keyword matching.
-    Returns the first matching category, or None if no match.
+    Split [date_start, date_end] into non-overlapping (ts_min, ts_max) pairs.
+    Returns list of (unix_ts_start, unix_ts_end).
     """
-    if not tags:
-        return None
-    tags_lower = tags.lower()
-    for category, keywords in _SMP_CATEGORY_KEYWORDS.items():
-        if any(kw in tags_lower for kw in keywords):
-            return category
-    return None
+    start = dt.date.fromisoformat(date_start)
+    end   = dt.date.fromisoformat(date_end)
+    windows: List[Tuple[int, int]] = []
+    cur = start
+    delta = dt.timedelta(days=initial_days)
+    while cur < end:
+        nxt = min(cur + delta, end)
+        ts_s = int(calendar.timegm(cur.timetuple()))
+        ts_e = int(calendar.timegm(nxt.timetuple()))
+        windows.append((ts_s, ts_e))
+        cur = nxt
+    return windows
 
 
-def extract_category_record(photo: Dict[str, Any]) -> Dict[str, Any]:
-    tags = sanitize_text(photo.get("tags", ""))
-    inferred_category = infer_category_from_tags(tags)
+def estimate_window_total(
+    client: FlickrClient,
+    text: str,
+    licenses: str,
+    ts_min: int,
+    ts_max: int,
+    user_id: Optional[str],
+) -> int:
+    """One cheap API call (per_page=1) to get total result count for a window."""
+    try:
+        result = client.search(
+            text=text, page=1, per_page=1,
+            licenses=licenses, sort="date-posted-desc",
+            user_id=user_id,
+            min_upload_date=ts_min, max_upload_date=ts_max,
+        )
+        return int(result.get("photos", {}).get("total", 0))
+    except Exception:
+        return 0
 
-    return {
-        "Uid": photo.get("owner"),
-        "Pid": photo.get("id"),
-        "Category": inferred_category,   # 從 tags 推斷，None 代表無法對應
-        "Subcategory": None,              # SMP-specific，無法從 Flickr API 取得
-        "Concept": None,                  # SMP-specific，無法從 Flickr API 取得
-        "_note": "Category is inferred from tags via keyword matching. Subcategory/Concept are SMP-specific annotations unavailable from Flickr API.",
-    }
+
+def split_window(ts_min: int, ts_max: int) -> List[Tuple[int, int]]:
+    """Split a window in half."""
+    mid = (ts_min + ts_max) // 2
+    if mid <= ts_min:          # already 1-second window, can't split
+        return [(ts_min, ts_max)]
+    return [(ts_min, mid), (mid, ts_max)]
 
 
+def adaptive_windows(
+    client: FlickrClient,
+    text: str,
+    licenses: str,
+    date_start: str,
+    date_end: str,
+    initial_days: int,
+    user_id: Optional[str],
+    sleep_min: float,
+    sleep_max: float,
+) -> List[Tuple[int, int]]:
+    """
+    Build a list of time windows sized so each has <= WINDOW_OVERFLOW_THRESHOLD results.
+    Uses a queue; windows that are too large get split in half and re-checked.
+    """
+    raw = generate_time_windows(date_start, date_end, initial_days)
+    queue = list(raw)
+    final: List[Tuple[int, int]] = []
+    min_secs = WINDOW_MIN_DAYS * 86400
+
+    log.info("Adaptive windowing: %d initial windows (%d-day chunks)", len(raw), initial_days)
+
+    while queue:
+        ts_min, ts_max = queue.pop(0)
+        span_days = (ts_max - ts_min) / 86400
+
+        if span_days < WINDOW_MIN_DAYS:
+            final.append((ts_min, ts_max))
+            continue
+
+        total = estimate_window_total(client, text, licenses, ts_min, ts_max, user_id)
+        log.debug("Window %s→%s  total=%d  days=%.0f",
+                  ts_min, ts_max, total, span_days)
+
+        if total > WINDOW_OVERFLOW_THRESHOLD and (ts_max - ts_min) > min_secs:
+            halves = split_window(ts_min, ts_max)
+            log.debug("Splitting window (total=%d > %d)", total, WINDOW_OVERFLOW_THRESHOLD)
+            queue = halves + queue   # depth-first: handle smaller slices first
+        else:
+            final.append((ts_min, ts_max))
+
+        random_sleep(sleep_min * 0.3, sleep_max * 0.3)
+
+    log.info("Adaptive windowing done: %d final windows", len(final))
+    return final
 
 
-MIN_POST_AGE_DAYS = 30  # 至少發文 1 個月，確保 views 已穩定
+# ──────────────────────────────────────────────
+# Per-user photo count sampler
+# ──────────────────────────────────────────────
+def sample_photos_per_user(max_photos_per_user: int) -> int:
+    """
+    Randomly sample how many photos to fetch for a new uid.
+
+    This is intentionally long-tail shaped, but it must also be safe when
+    max_photos_per_user is small, e.g. 3 or 5. The previous version could call
+    random.randint(20, max_photos_per_user), which crashes when max < 20.
+
+    max_photos_per_user=0 means disabled (return 0).
+    """
+    if max_photos_per_user <= 0:
+        return 0
+    if max_photos_per_user == 1:
+        return 1
+
+    r = random.random()
+
+    # Small caps: keep it sparse and never sample an invalid range.
+    if max_photos_per_user <= 4:
+        if r < 0.60:
+            return 1
+        return random.randint(2, max_photos_per_user)
+
+    if max_photos_per_user <= 10:
+        if r < 0.50:
+            return 1
+        elif r < 0.80:
+            return random.randint(2, min(4, max_photos_per_user))
+        else:
+            return random.randint(5, max_photos_per_user)
+
+    # Larger caps: approximate the SMP long-tail user distribution.
+    if r < 0.50:
+        return 1
+    elif r < 0.78:
+        return random.randint(2, 4)
+    elif r < 0.95:
+        return random.randint(5, min(20, max_photos_per_user))
+    else:
+        low = min(21, max_photos_per_user)
+        return random.randint(low, max_photos_per_user)
 
 
-def extract_pseudo_label_record(photo: Dict[str, Any], info_photo: Dict[str, Any]) -> Dict[str, Any]:
-    views = safe_int(photo.get("views"))
+# ──────────────────────────────────────────────
+# Per-user deep crawl
+# ──────────────────────────────────────────────
+def crawl_user_photos(
+    client: FlickrClient,
+    uid: str,
+    seed_category: Optional[str],
+    licenses: str,
+    max_per_user: int,
+    fetch_photo_detail: bool,
+    download_images: bool,
+    images_dir: Path,
+    seen_pids: Set[str],
+    seen_paths: Set[str],
+    buffers: Dict[str, List],
+    img_path_buf: List[str],
+    sleep_min: float,
+    sleep_max: float,
+) -> int:
+    """
+    Fetch all public photos of `uid` via flickr.people.getPublicPhotos.
+    Appends records into shared buffers. Returns number of newly added photos.
+    """
+    gained = 0
+    page   = 1
+    allowed_licenses = {int(x) for x in licenses.split(",")}
 
-    dates = info_photo.get("dates", {}) if info_photo else {}
-    postdate_raw = dates.get("posted") or photo.get("dateupload")
-
-    posted_ts = None
-    post_age_days = None
-    crawl_ts = int(datetime.now(timezone.utc).timestamp())
-
-    if postdate_raw is not None:
+    while gained < max_per_user:
         try:
-            posted_ts = int(postdate_raw)
-            post_age_days = max(0, (crawl_ts - posted_ts) // 86400)
-        except (TypeError, ValueError):
+            result = client.get_public_photos(uid, page=page, per_page=500)
+        except Exception as e:
+            log.debug("get_public_photos failed uid=%s page=%d: %s", uid, page, e)
+            break
+
+        photos_data = result.get("photos", {})
+        photos      = photos_data.get("photo", [])
+        total_pages = int(photos_data.get("pages", 1))
+
+        if not photos:
+            break
+
+        for photo in photos:
+            if gained >= max_per_user:
+                break
+
+            pid = str(photo["id"])
+            if pid in seen_pids:
+                continue
+
+            license_id = safe_int(photo.get("license", 0)) or 0
+            if license_id not in allowed_licenses:
+                continue
+
+            img_rel_path = f"extra/{uid}/{pid}.jpg"
+            if img_rel_path in seen_paths:
+                continue
+
+            # optional per-photo enrichment
+            if fetch_photo_detail:
+                photo = client.enrich_photo_with_getinfo(photo)
+                random_sleep(sleep_min * 0.3, sleep_max * 0.3)
+
+            buffers["text"].append(build_text_record(photo, uid))
+            buffers["temporal"].append(build_temporal_record(photo, uid))
+            buffers["additional"].append(build_additional_record(photo, uid))
+            buffers["category"].append(build_category_record(photo, uid, seed_category))
+            buffers["pseudo"].append(build_pseudo_label_record(photo, uid))
+            buffers["manifest"].append({
+                "Uid":        uid,
+                "Pid":        pid,
+                "crawl_mode": "by_uid_deepcrawl",
+                "query":      f"uid:{uid}",
+                "page":       page,
+                "img_path":   img_rel_path,
+                "crawled_at": int(time.time()),
+                "has_detail": fetch_photo_detail,
+            })
+
+            img_path_buf.append(img_rel_path)
+            seen_paths.add(img_rel_path)
+            seen_pids.add(pid)
+            gained += 1
+
+            if download_images:
+                url = best_photo_url(photo)
+                if url:
+                    dest = images_dir / uid / f"{pid}.jpg"
+                    if not dest.exists():
+                        download_image(url, dest, client.session)
+
+        if page >= total_pages:
+            break
+        page += 1
+        random_sleep(sleep_min * 0.5, sleep_max * 0.5)
+
+    return gained
+
+
+# ──────────────────────────────────────────────
+# Core crawl loop
+# ──────────────────────────────────────────────
+def crawl(
+    client: FlickrClient,
+    output_dir: Path,
+    text: str,
+    max_items: int,
+    licenses: str,
+    sort: str,
+    per_page: int,
+    max_no_new_pages: int,
+    sleep_min: float,
+    sleep_max: float,
+    flush_every: int,
+    download_images: bool,
+    resume: bool,
+    dedupe_on_image_path: bool,
+    seed_category: Optional[str],
+    user_id: Optional[str],
+    crawl_mode: str,
+    # time-window slicing (optional — if both None, no date filter applied)
+    min_upload_date: Optional[int] = None,
+    max_upload_date: Optional[int] = None,
+    # per-photo getInfo enrichment (City/State/Country/comments/notes/has_people)
+    fetch_photo_detail: bool = False,
+    # per-user deep crawl
+    max_photos_per_user: int = 0,
+) -> int:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    paths = {
+        "text":       output_dir / "extra_text.jsonl",
+        "temporal":   output_dir / "extra_temporalspatial_information.jsonl",
+        "user":       output_dir / "extra_user_data.jsonl",
+        "additional": output_dir / "extra_additional_information.jsonl",
+        "category":   output_dir / "extra_category.jsonl",
+        "pseudo":     output_dir / "extra_pseudo_label.jsonl",
+        "manifest":   output_dir / "crawl_manifest.jsonl",
+    }
+    img_filepath_path = output_dir / "extra_img_filepath.txt"
+    images_dir        = output_dir / "images"
+
+    # Resume: load already-seen Pids
+    seen_pids: Set[str] = load_seen_pids(paths["text"]) if resume else set()
+    seen_paths: Set[str] = load_seen_image_paths(img_filepath_path) if (resume and dedupe_on_image_path) else set()
+    already_done = len(seen_pids)
+    log.info("Resume: %d already crawled", already_done)
+
+    # Per-user cache to avoid duplicate user API calls
+    seen_uids: Set[str] = set()
+
+    # In-memory buffers
+    buffers: Dict[str, List] = {k: [] for k in paths}
+    img_path_buf: List[str] = []
+
+    # Flickr caps results at page 100 × per_page regardless of total_pages.
+    # When one sort order is exhausted we rotate through alternates before giving up.
+    SORT_ROTATION = [
+        sort,
+        "interestingness-desc",
+        "relevance",
+        "date-taken-desc",
+        "date-posted-asc",
+    ]
+    # De-duplicate so the user-supplied sort appears only once
+    seen_sorts: list[str] = []
+    for s in SORT_ROTATION:
+        if s not in seen_sorts:
+            seen_sorts.append(s)
+    SORT_ROTATION = seen_sorts
+
+    MAX_API_RETRIES = 5   # max consecutive network errors before aborting
+
+    total_saved  = already_done
+    no_new_pages = 0
+    page         = 1
+    sort_idx     = 0
+    current_sort = SORT_ROTATION[sort_idx]
+    api_errors   = 0
+
+    while total_saved < max_items:
+        need = max_items - total_saved
+        this_per_page = min(per_page, 500, need + 20)   # slight over-fetch
+
+        log.info("Page %d | sort=%s | saved=%d/%d", page, current_sort, total_saved, max_items)
+
+        try:
+            result = client.search(
+                text=text,
+                page=page,
+                per_page=this_per_page,
+                licenses=licenses,
+                sort=current_sort,
+                user_id=user_id,
+                min_upload_date=min_upload_date,
+                max_upload_date=max_upload_date,
+            )
+            api_errors = 0   # reset on success
+        except Exception as e:
+            api_errors += 1
+            wait = min(5 * api_errors, 60)
+            log.warning("Search failed page=%d (attempt %d/%d): %s — waiting %ds",
+                        page, api_errors, MAX_API_RETRIES, e, wait)
+            if api_errors >= MAX_API_RETRIES:
+                log.error("Too many consecutive API errors — stopping crawl early.")
+                break
+            time.sleep(wait)
+            continue
+
+        photos_data = result.get("photos", {})
+        photos      = photos_data.get("photo", [])
+        total_pages = int(photos_data.get("pages", 1))
+
+        # ── Flickr hard-caps at page 100 ──────────────────────────────────
+        max_reachable_page = min(total_pages, 100)
+
+        if not photos:
+            log.info("No photos returned on page %d (sort=%s)", page, current_sort)
+            # Try next sort order
+            sort_idx += 1
+            if sort_idx >= len(SORT_ROTATION):
+                log.info("All sort orders exhausted. Stopping with %d/%d items.",
+                         total_saved, max_items)
+                break
+            current_sort = SORT_ROTATION[sort_idx]
+            page = 1
+            no_new_pages = 0
+            log.info("Switching sort → %s", current_sort)
+            continue
+
+        new_this_page = 0
+        for photo in photos:
+            pid = str(photo["id"])
+            uid = photo.get("owner", "unknown")
+
+            if pid in seen_pids:
+                continue
+
+            # Build image path (SMP format: extra/Uid/Pid.jpg)
+            img_rel_path = f"extra/{uid}/{pid}.jpg"
+            if dedupe_on_image_path and img_rel_path in seen_paths:
+                continue
+
+            # ── optional getInfo enrichment (City/State/Country/comments/notes/has_people) ──
+            if fetch_photo_detail:
+                photo = client.enrich_photo_with_getinfo(photo)
+                random_sleep(sleep_min * 0.3, sleep_max * 0.3)
+
+            # ── text ──
+            buffers["text"].append(build_text_record(photo, uid))
+
+            # ── temporal ──
+            buffers["temporal"].append(build_temporal_record(photo, uid))
+
+            # ── additional ──
+            buffers["additional"].append(build_additional_record(photo, uid))
+
+            # ── category ──
+            buffers["category"].append(build_category_record(photo, uid, seed_category))
+
+            # ── pseudo label ──
+            buffers["pseudo"].append(build_pseudo_label_record(photo, uid))
+
+            # ── manifest ──
+            buffers["manifest"].append({
+                "Uid":        uid,
+                "Pid":        pid,
+                "crawl_mode": crawl_mode,
+                "query":      text,
+                "page":       page,
+                "img_path":   img_rel_path,
+                "crawled_at": int(time.time()),
+                "has_detail": fetch_photo_detail,
+            })
+
+            # ── img filepath ──
+            img_path_buf.append(img_rel_path)
+            seen_paths.add(img_rel_path)
+            seen_pids.add(pid)
+
+            # ── user (once per uid) ──
+            if uid not in seen_uids:
+                try:
+                    person = client.get_people_info(uid)
+                    if person:
+                        buffers["user"].append(build_user_record(person, uid))
+                        seen_uids.add(uid)
+                    random_sleep(sleep_min * 0.5, sleep_max * 0.5)
+                except Exception as e:
+                    log.debug("get_people_info failed uid=%s: %s", uid, e)
+
+                # ── deep crawl: fetch photos of this new user ──
+                if max_photos_per_user > 0 and total_saved < max_items:
+                    this_user_limit = sample_photos_per_user(max_photos_per_user)
+                    gained = crawl_user_photos(
+                        client=client,
+                        uid=uid,
+                        seed_category=seed_category,
+                        licenses=licenses,
+                        max_per_user=this_user_limit,
+                        fetch_photo_detail=fetch_photo_detail,
+                        download_images=download_images,
+                        images_dir=images_dir,
+                        seen_pids=seen_pids,
+                        seen_paths=seen_paths,
+                        buffers=buffers,
+                        img_path_buf=img_path_buf,
+                        sleep_min=sleep_min,
+                        sleep_max=sleep_max,
+                    )
+                    total_saved += gained
+                    new_this_page += gained
+                    if gained > 0:
+                        log.info("Deep crawl uid=%s: +%d photos (total=%d/%d)",
+                                 uid, gained, total_saved, max_items)
+                    if total_saved % flush_every < gained:
+                        flush_buffers(buffers, paths, img_path_buf, img_filepath_path)
+
+            # ── image download ──
+            if download_images:
+                url = best_photo_url(photo)
+                if url:
+                    dest = images_dir / uid / f"{pid}.jpg"
+                    if not dest.exists():
+                        ok = download_image(url, dest, client.session)
+                        if ok:
+                            log.debug("Downloaded %s", dest)
+
+            total_saved += 1
+            new_this_page += 1
+
+            # flush
+            if total_saved % flush_every == 0:
+                flush_buffers(buffers, paths, img_path_buf, img_filepath_path)
+                log.info("Flushed at %d items", total_saved)
+
+            if total_saved >= max_items:
+                break
+
+        if new_this_page == 0:
+            no_new_pages += 1
+            log.info("No new items on page %d/%d (%d consecutive, sort=%s)",
+                     page, max_reachable_page, no_new_pages, current_sort)
+        else:
+            no_new_pages = 0
+
+        # Decide whether to advance page or rotate sort
+        exhausted_pages = (page >= max_reachable_page)
+        exhausted_dedup = (no_new_pages >= max_no_new_pages)
+
+        if exhausted_pages or exhausted_dedup:
+            reason = "last page reached" if exhausted_pages else f"{no_new_pages} consecutive empty pages"
+            log.info("Sort '%s' exhausted (%s). Total so far: %d/%d",
+                     current_sort, reason, total_saved, max_items)
+            sort_idx += 1
+            if sort_idx >= len(SORT_ROTATION):
+                log.info("All sort orders exhausted. Stopping with %d/%d items.",
+                         total_saved, max_items)
+                break
+            current_sort = SORT_ROTATION[sort_idx]
+            page = 1
+            no_new_pages = 0
+            log.info("Switching sort → %s", current_sort)
+        else:
+            page += 1
+
+        random_sleep(sleep_min, sleep_max)
+
+    # Final flush
+    flush_buffers(buffers, paths, img_path_buf, img_filepath_path)
+    log.info("Crawl complete. Total saved: %d", total_saved)
+    return total_saved
+
+
+# ──────────────────────────────────────────────
+# Time-sliced crawl  (high-volume entry point)
+# ──────────────────────────────────────────────
+def crawl_with_time_slicing(
+    client: FlickrClient,
+    output_dir: Path,
+    text: str,
+    max_items: int,
+    licenses: str,
+    sort: str,
+    per_page: int,
+    max_no_new_pages: int,
+    sleep_min: float,
+    sleep_max: float,
+    flush_every: int,
+    download_images: bool,
+    resume: bool,
+    dedupe_on_image_path: bool,
+    seed_category: Optional[str],
+    user_id: Optional[str],
+    crawl_mode: str,
+    date_start: str = "2004-01-01",
+    date_end:   str = "2024-12-31",
+    initial_window_days: int = 180,
+    fetch_photo_detail: bool = False,
+    max_photos_per_user: int = 0,
+) -> int:
+    """
+    Crawl by splitting the date range into adaptive time windows,
+    each yielding up to ~50,000 unique results from the Flickr API.
+
+    With date_start=2004, date_end=2024, initial_window_days=180 you get
+    ~40 initial windows. If each yields ~40k unique photos, that's ~1.6M
+    potential results before deduplication — far beyond the 50k page cap.
+
+    Progress is tracked via seen_pids so --resume works across windows.
+    """
+    # Build shared state (resume-aware, shared across all windows)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "text":       output_dir / "extra_text.jsonl",
+        "temporal":   output_dir / "extra_temporalspatial_information.jsonl",
+        "user":       output_dir / "extra_user_data.jsonl",
+        "additional": output_dir / "extra_additional_information.jsonl",
+        "category":   output_dir / "extra_category.jsonl",
+        "pseudo":     output_dir / "extra_pseudo_label.jsonl",
+        "manifest":   output_dir / "crawl_manifest.jsonl",
+    }
+    img_filepath_path = output_dir / "extra_img_filepath.txt"
+
+    seen_pids  = load_seen_pids(paths["text"]) if resume else set()
+    already    = len(seen_pids)
+    total_saved = already
+    log.info("Time-sliced crawl | already=%d / target=%d", already, max_items)
+
+    if total_saved >= max_items:
+        log.info("Already at target, nothing to do.")
+        return total_saved
+
+    # Save progress file so we can resume between windows
+    progress_path = output_dir / "crawl_window_progress.json"
+    completed_windows: set = set()
+    if resume and progress_path.exists():
+        try:
+            completed_windows = set(
+                tuple(w) for w in json.loads(progress_path.read_text())
+            )
+            log.info("Resuming: %d windows already completed", len(completed_windows))
+        except Exception:
             pass
 
-    # 只有發文夠久且 views > 0 才給 label，跟 SMP 的 log(views) 一致
-    is_mature = post_age_days is not None and post_age_days >= MIN_POST_AGE_DAYS
-    pseudo_view = None
-    if is_mature and views is not None and views > 0:
-        pseudo_view = math.log(views)  # log(views)，與 SMP label 定義一致
+    # Build adaptive windows (cheap: only 1 API call per initial window)
+    windows = adaptive_windows(
+        client=client, text=text, licenses=licenses,
+        date_start=date_start, date_end=date_end,
+        initial_days=initial_window_days,
+        user_id=user_id,
+        sleep_min=sleep_min, sleep_max=sleep_max,
+    )
 
-    return {
-        "Pid": photo.get("id"),
-        "PseudoLogViewScore": pseudo_view,
-        "views": views,
-        "posted_ts": posted_ts,
-        "crawl_ts": crawl_ts,
-        "post_age_days": post_age_days,
-        "is_mature": is_mature,
-        "_note": "PseudoLogViewScore = log(views), aligned with SMP label definition. Only set when is_mature=True and views>0.",
-    }
+    log.info("Starting crawl across %d time windows", len(windows))
 
-# -----------------------------
-# Main crawl/export
-# -----------------------------
+    for i, (ts_min, ts_max) in enumerate(windows):
+        if total_saved >= max_items:
+            log.info("Reached target %d, stopping.", max_items)
+            break
+
+        win_key = (ts_min, ts_max)
+        if win_key in completed_windows:
+            log.info("[%d/%d] Window already done, skipping", i + 1, len(windows))
+            continue
+
+        window_target = max_items - total_saved
+        log.info("[%d/%d] Window %s→%s | need=%d",
+                 i + 1, len(windows), ts_min, ts_max, window_target)
+
+        saved = crawl(
+            client=client,
+            output_dir=output_dir,
+            text=text,
+            max_items=total_saved + window_target,
+            licenses=licenses,
+            sort=sort,
+            per_page=per_page,
+            max_no_new_pages=max_no_new_pages,
+            sleep_min=sleep_min,
+            sleep_max=sleep_max,
+            flush_every=flush_every,
+            download_images=download_images,
+            resume=True,              # always resume within shared output_dir
+            dedupe_on_image_path=dedupe_on_image_path,
+            seed_category=seed_category,
+            user_id=user_id,
+            crawl_mode=crawl_mode,
+            min_upload_date=ts_min,
+            max_upload_date=ts_max,
+            fetch_photo_detail=fetch_photo_detail,
+            max_photos_per_user=max_photos_per_user,
+        )
+
+        gained = saved - total_saved
+        total_saved = saved
+        log.info("[%d/%d] Window done | gained=%d | total=%d/%d",
+                 i + 1, len(windows), gained, total_saved, max_items)
+
+        # Mark window as done
+        completed_windows.add(win_key)
+        progress_path.write_text(
+            json.dumps([list(w) for w in completed_windows]), encoding="utf-8"
+        )
+
+    log.info("Time-sliced crawl finished. Total: %d/%d", total_saved, max_items)
+    return total_saved
+
+
+# ──────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Crawl licensed Flickr data and export SMP-like files.")
-    parser.add_argument("--api_key", type=str, default=os.getenv("FLICKR_API_KEY"), help="Flickr API key.")
-    parser.add_argument("--output_dir", type=str, required=True, help="Output directory.")
-    parser.add_argument("--download_images", action="store_true", help="Download images locally.")
-    parser.add_argument("--max_items", type=int, default=100, help="Maximum number of photos to collect.")
-    parser.add_argument("--per_page", type=int, default=100, help="Flickr search page size.")
-    parser.add_argument("--text", type=str, default=None, help="Search text.")
-    parser.add_argument("--tags", type=str, default=None, help="Comma-separated tags.")
-    parser.add_argument(
-        "--licenses",
-        type=str,
-        default=None,
-        help="Comma-separated Flickr license IDs to keep. Example: 4,5,7,8,9,10",
-    )
-    parser.add_argument(
-        "--sort",
-        type=str,
-        default="date-posted-desc",  # 時間排序確保自然分布，避免 relevance 造成 selection bias
-        choices=[
-            "date-posted-asc",
-            "date-posted-desc",
-            "date-taken-asc",
-            "date-taken-desc",
-            "interestingness-desc",
-            "interestingness-asc",
-            "relevance",
-        ],
-        help="Sort order for flickr.photos.search.",
-    )
-    parser.add_argument("--min_upload_date", type=str, default=None, help="Minimum upload date (unix ts or MySQL datetime).")
-    parser.add_argument("--max_upload_date", type=str, default=None, help="Maximum upload date (unix ts or MySQL datetime).")
-    parser.add_argument("--sleep_min", type=float, default=0.8, help="Minimum random sleep seconds.")
-    parser.add_argument("--sleep_max", type=float, default=2.0, help="Maximum random sleep seconds.")
-    parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds.")
-    parser.add_argument("--max_owner_cache", type=int, default=5000, help="Maximum cached user profiles in memory.")
-    parser.add_argument("--flush_every", type=int, default=100, help="Flush file handles every N newly written records.")
-    parser.add_argument("--resume", action="store_true", help="Resume from existing JSONL/TXT outputs and skip already written Pids.")
-    parser.add_argument("--skip_duplicate_owners", action="store_true", help="Optional: skip duplicate owners after first kept photo.")
-    parser.add_argument("--manifest_json", action="store_true", help="Also emit crawl_manifest.json array at the end. Default keeps only JSONL for scale.")
-    parser.add_argument("--write_pretty_json", action="store_true", help="Also emit array-style .json files at the end. Not recommended for very large crawls.")
-    parser.add_argument("--dedupe_on_image_path", action="store_true", help="Also skip items with duplicate relative image paths.")
-    parser.add_argument("--max_duplicate_log", type=int, default=20, help="How many duplicate skip messages to log before silencing repetitive logs.")
-    parser.add_argument(
-        "--max_no_new_pages",
-        type=int,
-        default=20,
-        help="Stop early if this many consecutive pages produce no new items.",
-    )
-    parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Crawl Flickr → SMP format.")
+    p.add_argument("--output_dir",           required=True)
+    p.add_argument("--text",                 required=True,  help="Flickr search query text")
+    p.add_argument("--max_items",            type=int, default=10000)
+    p.add_argument("--licenses",             default="4,5,7,8,9,10")
+    p.add_argument("--sort",                 default="date-posted-desc")
+    p.add_argument("--per_page",             type=int, default=500)
+    p.add_argument("--max_no_new_pages",     type=int, default=20)
+    p.add_argument("--sleep_min",            type=float, default=0.8)
+    p.add_argument("--sleep_max",            type=float, default=2.0)
+    p.add_argument("--flush_every",          type=int, default=200)
+    p.add_argument("--download_images",      action="store_true")
+    p.add_argument("--resume",               action="store_true")
+    p.add_argument("--dedupe_on_image_path", action="store_true")
+    p.add_argument("--seed_category",        default=None,   help="Override SMP Category label")
+    p.add_argument("--user_id",              default=None,   help="Restrict search to this Flickr user")
+    p.add_argument("--crawl_mode",           default="by_text")
+    p.add_argument("--api_key",              default=os.getenv("FLICKR_API_KEY"))
+    p.add_argument("--verbose",              action="store_true")
+    # ── time-slicing ──────────────────────────────────────────────────────
+    p.add_argument("--time_slice",           action="store_true",
+                   help="Enable time-window slicing to bypass 50k API limit")
+    p.add_argument("--date_start",           default="2004-01-01",
+                   help="Earliest upload date (YYYY-MM-DD). Used with --time_slice")
+    p.add_argument("--date_end",             default="2024-12-31",
+                   help="Latest upload date (YYYY-MM-DD). Used with --time_slice")
+    p.add_argument("--initial_window_days",  type=int, default=180,
+                   help="Initial time window size in days (halved automatically if too large)")
+    # ── per-photo detail ──────────────────────────────────────────────────
+    p.add_argument("--fetch_photo_detail",   action="store_true",
+                   help="Call getInfo per photo: City/State/Country/comments/notes/has_people. "
+                        "Doubles API calls — disable for speed, enable for richer features.")
+    # ── per-user deep crawl ───────────────────────────────────────────────
+    p.add_argument("--max_photos_per_user",  type=int, default=30,
+                   help="After finding a new uid, fetch up to N of their public photos. 0=disabled.")
+    # ── multi-keyword ─────────────────────────────────────────────────────
+    p.add_argument("--extra_texts",          type=str, default="",
+                   help="Comma-separated extra search queries to rotate after --text.")
+    return p.parse_args()
 
 
-def main() -> int:
+def main() -> None:
     args = parse_args()
     setup_logging(args.verbose)
 
     if not args.api_key:
-        logging.error("Missing Flickr API key. Pass --api_key or set FLICKR_API_KEY.")
-        return 1
+        raise SystemExit("ERROR: FLICKR_API_KEY not set. Use --api_key or export FLICKR_API_KEY=...")
 
-    if args.sleep_min < 0 or args.sleep_max < 0 or args.sleep_min > args.sleep_max:
-        logging.error("Invalid sleep range: sleep_min must be <= sleep_max and both >= 0.")
-        return 1
+    # Build query list (primary + extras, deduplicated)
+    queries = [args.text]
+    if args.extra_texts:
+        for t in args.extra_texts.split(","):
+            t = t.strip()
+            if t and t not in queries:
+                queries.append(t)
 
-    # Default crawl window:
-    # from 3 years ago to 30 days ago
-    now_ts = int(datetime.now(timezone.utc).timestamp())
+    client = FlickrClient(api_key=args.api_key)
 
-    if not args.max_upload_date:
-        max_cutoff_ts = now_ts - MIN_POST_AGE_DAYS * 86400
-        args.max_upload_date = str(max_cutoff_ts)
-        logging.info(
-            "Auto-set max_upload_date to %s (%d days ago).",
-            datetime.fromtimestamp(max_cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d"),
-            MIN_POST_AGE_DAYS,
+    for qi, query in enumerate(queries):
+        seed_cat = args.seed_category or QUERY_TO_CATEGORY.get(query.lower())
+        log.info("Query [%d/%d]: '%s'  seed_category=%s", qi + 1, len(queries), query, seed_cat)
+
+        common = dict(
+            client=client,
+            output_dir=Path(args.output_dir),
+            text=query,
+            max_items=args.max_items,
+            licenses=args.licenses,
+            sort=args.sort,
+            per_page=args.per_page,
+            max_no_new_pages=args.max_no_new_pages,
+            sleep_min=args.sleep_min,
+            sleep_max=args.sleep_max,
+            flush_every=args.flush_every,
+            download_images=args.download_images,
+            resume=True,
+            dedupe_on_image_path=args.dedupe_on_image_path,
+            seed_category=seed_cat,
+            user_id=args.user_id,
+            crawl_mode="by_text",
+            fetch_photo_detail=args.fetch_photo_detail,
+            max_photos_per_user=args.max_photos_per_user,
         )
 
-    if not args.min_upload_date:
-        min_cutoff_ts = now_ts - 365 * 3 * 86400
-        args.min_upload_date = str(min_cutoff_ts)
-        logging.info(
-            "Auto-set min_upload_date to %s (3 years ago).",
-            datetime.fromtimestamp(min_cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d"),
-        )
+        if args.time_slice:
+            total = crawl_with_time_slicing(
+                **common,
+                date_start=args.date_start,
+                date_end=args.date_end,
+                initial_window_days=args.initial_window_days,
+            )
+        else:
+            total = crawl(**common)
 
-    output_dir = Path(args.output_dir)
-    ensure_dir(output_dir)
-
-    image_dir = output_dir / "images"
-    if args.download_images:
-        ensure_dir(image_dir)
-
-    client = FlickrClient(
-        api_key=args.api_key,
-        sleep_min=args.sleep_min,
-        sleep_max=args.sleep_max,
-        timeout=args.timeout,
-    )
-
-    try:
-        license_map = client.get_licenses()
-        logging.info("Fetched %d Flickr license definitions", len(license_map))
-    except Exception as e:
-        logging.warning("Failed to fetch license definitions: %s", e)
-        license_map = {}
-
-    owner_cache: Dict[str, Optional[Dict[str, Any]]] = {}
-
-    text_jsonl_path = output_dir / "extra_text.jsonl"
-    temporal_jsonl_path = output_dir / "extra_temporalspatial_information.jsonl"
-    user_jsonl_path = output_dir / "extra_user_data.jsonl"
-    additional_jsonl_path = output_dir / "extra_additional_information.jsonl"
-    category_jsonl_path = output_dir / "extra_category.jsonl"
-    pseudo_jsonl_path = output_dir / "extra_pseudo_label.jsonl"
-    img_txt_path = output_dir / "extra_img_filepath.txt"
-    manifest_jsonl_path = output_dir / "crawl_manifest.jsonl"
-
-    if args.resume:
-        existing_pids = set()
-        existing_pids |= load_existing_pids_from_jsonl(text_jsonl_path, key="Pid")
-        existing_pids |= load_existing_pids_from_jsonl(temporal_jsonl_path, key="Pid")
-        existing_pids |= load_existing_pids_from_jsonl(additional_jsonl_path, key="Pid")
-        existing_pids |= load_existing_pids_from_jsonl(category_jsonl_path, key="Pid")
-        existing_pids |= load_existing_pids_from_jsonl(pseudo_jsonl_path, key="Pid")
-        logging.info("Resume mode: loaded %d existing Pids from output files", len(existing_pids))
-    else:
-        existing_pids = set()
-
-    existing_rel_paths: set[str] = set()
-    if args.resume and args.dedupe_on_image_path and img_txt_path.exists():
-        with img_txt_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    existing_rel_paths.add(line)
-        logging.info("Resume mode: loaded %d existing image paths", len(existing_rel_paths))
-
-    seen_pids_this_run: set[str] = set()
-    seen_rel_paths_this_run: set[str] = set()
-    seen_owners_this_run: set[str] = set()
-
-    collected = 0
-    kept = 0
-    skipped_duplicates = 0
-    duplicate_log_count = 0
-    page = 1
-    consecutive_no_new_pages = 0
-    max_no_new_pages = max(1, args.max_no_new_pages)
-
-    with text_jsonl_path.open("a", encoding="utf-8") as f_text,          temporal_jsonl_path.open("a", encoding="utf-8") as f_temporal,          user_jsonl_path.open("a", encoding="utf-8") as f_user,          additional_jsonl_path.open("a", encoding="utf-8") as f_additional,          category_jsonl_path.open("a", encoding="utf-8") as f_category,          pseudo_jsonl_path.open("a", encoding="utf-8") as f_pseudo,          img_txt_path.open("a", encoding="utf-8") as f_img,          manifest_jsonl_path.open("a", encoding="utf-8") as f_manifest:
-
-        while kept < args.max_items:
-            logging.info("Searching page %d...", page)
-            page_kept_before = kept
-            try:
-                search_data = client.search_photos(
-                    text=args.text,
-                    tags=args.tags,
-                    licenses=args.licenses,
-                    sort=args.sort,
-                    per_page=min(args.per_page, max(1, args.max_items - kept)),
-                    page=page,
-                    min_upload_date=args.min_upload_date,
-                    max_upload_date=args.max_upload_date,
-                )
-            except Exception as e:
-                logging.error("Search failed on page %d: %s", page, e)
-                break
-
-            photo_block = search_data.get("photos", {})
-            photos = photo_block.get("photo", [])
-            pages_total = safe_int(photo_block.get("pages"), default=1) or 1
-
-            if not photos:
-                logging.info("No more photos returned.")
-                break
-
-            for photo in photos:
-                if kept >= args.max_items:
-                    break
-
-                collected += 1
-                pid = str(photo.get("id"))
-                uid = str(photo.get("owner"))
-                rel_preview_path = build_rel_image_path(uid, pid, ext=".jpg")
-
-                duplicate_reason = None
-                if pid in existing_pids:
-                    duplicate_reason = "already exists in previous outputs"
-                elif pid in seen_pids_this_run:
-                    duplicate_reason = "duplicate pid within current run"
-                elif args.skip_duplicate_owners and uid in seen_owners_this_run:
-                    duplicate_reason = "duplicate owner within current run"
-                elif args.dedupe_on_image_path and (rel_preview_path in existing_rel_paths or rel_preview_path in seen_rel_paths_this_run):
-                    duplicate_reason = "duplicate relative image path"
-
-                if duplicate_reason:
-                    skipped_duplicates += 1
-                    if duplicate_log_count < args.max_duplicate_log:
-                        logging.info("Skipping duplicate photo_id=%s owner=%s (%s)", pid, uid, duplicate_reason)
-                        duplicate_log_count += 1
-                        if duplicate_log_count == args.max_duplicate_log:
-                            logging.info("Further duplicate skip logs will be suppressed.")
-                    continue
-
-                secret = photo.get("secret")
-                logging.info("Keeping item %d/%d | photo_id=%s | owner=%s", kept + 1, args.max_items, pid, uid)
-
-                info_photo: Dict[str, Any] = {}
-                try:
-                    info_data = client.get_photo_info(pid, secret=secret)
-                    info_photo = info_data.get("photo", {})
-                except Exception as e:
-                    logging.warning("getInfo failed for %s: %s", pid, e)
-
-                if uid not in owner_cache:
-                    if len(owner_cache) >= args.max_owner_cache:
-                        evict_key = next(iter(owner_cache.keys()))
-                        owner_cache.pop(evict_key, None)
-                    try:
-                        people_data = client.get_people_info(uid)
-                        owner_cache[uid] = people_data
-                    except Exception as e:
-                        logging.warning("people.getInfo failed for %s: %s", uid, e)
-                        owner_cache[uid] = None
-
-                people_info = owner_cache.get(uid)
-
-                text_row = extract_text_record(photo)
-                temporal_row = extract_temporal_spatial_record(photo, info_photo)
-                user_row = extract_user_record(photo, people_info)
-                additional_row = extract_additional_record(photo, info_photo, license_map)
-                category_row = extract_category_record(photo)
-                pseudo_label_row = extract_pseudo_label_record(photo, info_photo)
-
-                image_url = build_image_url(photo)
-                ext = ".jpg"
-                if image_url:
-                    lower_url = image_url.lower()
-                    if lower_url.endswith(".png"):
-                        ext = ".png"
-                    elif lower_url.endswith(".webp"):
-                        ext = ".webp"
-                    elif lower_url.endswith(".jpeg"):
-                        ext = ".jpeg"
-
-                rel_path = build_rel_image_path(uid, pid, ext=ext)
-
-                if args.dedupe_on_image_path and (rel_path in existing_rel_paths or rel_path in seen_rel_paths_this_run):
-                    skipped_duplicates += 1
-                    if duplicate_log_count < args.max_duplicate_log:
-                        logging.info("Skipping duplicate image path for photo_id=%s owner=%s", pid, uid)
-                        duplicate_log_count += 1
-                        if duplicate_log_count == args.max_duplicate_log:
-                            logging.info("Further duplicate skip logs will be suppressed.")
-                    continue
-
-                local_image_path = image_dir / rel_path if args.download_images else None
-                image_downloaded = False
-                if args.download_images and image_url and local_image_path is not None:
-                    image_downloaded = maybe_download_image(
-                        session=client.session,
-                        url=image_url,
-                        out_path=local_image_path,
-                        sleep_min=args.sleep_min,
-                        sleep_max=args.sleep_max,
-                        timeout=args.timeout,
-                    )
-
-                manifest_row = {
-                    "Uid": uid,
-                    "Pid": pid,
-                    "image_url": image_url,
-                    "relative_image_path": rel_path,
-                    "downloaded": image_downloaded,
-                    "license_id": str(photo.get("license")) if photo.get("license") is not None else None,
-                    "search_text": args.text,
-                    "search_tags": args.tags,
-                }
-
-                should_flush = (kept + 1) % max(1, args.flush_every) == 0
-
-                append_jsonl_record(f_text, text_row, flush=should_flush)
-                append_jsonl_record(f_temporal, temporal_row, flush=should_flush)
-                append_jsonl_record(f_user, user_row, flush=should_flush)
-                append_jsonl_record(f_additional, additional_row, flush=should_flush)
-                append_jsonl_record(f_category, category_row, flush=should_flush)
-                append_jsonl_record(f_pseudo, pseudo_label_row, flush=should_flush)
-                append_text_line(f_img, rel_path, flush=should_flush)
-                append_jsonl_record(f_manifest, manifest_row, flush=should_flush)
-
-                existing_pids.add(pid)
-                seen_pids_this_run.add(pid)
-                seen_owners_this_run.add(uid)
-                existing_rel_paths.add(rel_path)
-                seen_rel_paths_this_run.add(rel_path)
-                kept += 1
-
-            page_new_items = kept - page_kept_before
-
-            if page_new_items == 0:
-                consecutive_no_new_pages += 1
-                logging.info(
-                    "Page %d produced no new items. consecutive_no_new_pages=%d/%d",
-                    page,
-                    consecutive_no_new_pages,
-                    max_no_new_pages,
-                )
-            else:
-                consecutive_no_new_pages = 0
-                logging.info("Page %d added %d new items.", page, page_new_items)
-
-            if consecutive_no_new_pages >= max_no_new_pages:
-                logging.info(
-                    "Stopping early: %d consecutive pages produced no new items.",
-                    consecutive_no_new_pages,
-                )
-                break
-
-            if page >= pages_total:
-                break
-            page += 1
-
-    # Export metadata/reference files
-    dump_json_pretty(output_dir / "field_provenance.json", FIELD_PROVENANCE)
-    dump_json_pretty(output_dir / "smp_only_fields.json", SMP_ONLY_FIELDS)
-
-    if args.write_pretty_json:
-        logging.info("Generating array-style .json files from streamed JSONL outputs...")
-        mapping = [
-            ("extra_text.jsonl", "extra_text.json"),
-            ("extra_temporalspatial_information.jsonl", "extra_temporalspatial_information.json"),
-            ("extra_user_data.jsonl", "extra_user_data.json"),
-            ("extra_additional_information.jsonl", "extra_additional_information.json"),
-            ("extra_category.jsonl", "extra_category.json"),
-            ("extra_pseudo_label.jsonl", "extra_pseudo_label.json"),
-        ]
-        for src_name, dst_name in mapping:
-            src = output_dir / src_name
-            rows = []
-            if src.exists():
-                with src.open("r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            rows.append(json.loads(line))
-            dump_json_pretty(output_dir / dst_name, rows)
-
-    if args.manifest_json:
-        rows = []
-        if manifest_jsonl_path.exists():
-            with manifest_jsonl_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        rows.append(json.loads(line))
-        dump_json_pretty(output_dir / "crawl_manifest.json", rows)
-
-    # Human-readable README
-    readme_lines = [
-        "# External Flickr SMP-like Export",
-        "",
-        "This folder was generated by `crawl_flickr_to_smp.py`.",
-        "",
-        "## Streaming output files",
-        "- `extra_img_filepath.txt`: image path list aligned by row",
-        "- `extra_text.jsonl`: SMP-like text records (streaming append-friendly)",
-        "- `extra_temporalspatial_information.jsonl`: time and geo records",
-        "- `extra_user_data.jsonl`: user/profile records",
-        "- `extra_additional_information.jsonl`: extra metadata records",
-        "- `extra_category.jsonl`: category placeholders kept for SMP compatibility",
-        "- `extra_pseudo_label.jsonl`: derived pseudo popularity labels",
-        "- `crawl_manifest.jsonl`: per-sample crawl trace",
-        "",
-        "## Metadata files",
-        "- `field_provenance.json`: explains source of each field",
-        "- `smp_only_fields.json`: fields that are SMP-specific and not directly available from Flickr",
-        "",
-        "## Duplicate handling",
-        "- Resume mode can skip Pids already written in prior outputs",
-        "- Current run also skips duplicate Pids",
-        "- Optional flags can skip duplicate owners or duplicate image paths",
-        "",
-        "## Official-vs-derived distinction",
-        "- Official SMP target label is not available from Flickr API.",
-        "- `PseudoPopularityScore` is derived and should be treated as an auxiliary/pretraining signal.",
-    ]
-    write_txt_lines(output_dir / "README_EXTERNAL_SMP.txt", readme_lines)
-
-    logging.info("Done. Seen %d search results, kept %d items, skipped %d duplicates.", collected, kept, skipped_duplicates)
-    logging.info("Output directory: %s", output_dir)
-    return 0
+        log.info("Query '%s' done. Total in output_dir: %d", query, total)
+        if total >= args.max_items:
+            log.info("Reached max_items=%d, stopping.", args.max_items)
+            break
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

@@ -1,0 +1,306 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, Dict, List
+
+import numpy as np
+import pandas as pd
+import torch
+import yaml
+from sklearn.model_selection import GroupKFold
+from torch.utils.data import DataLoader
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
+
+from src.datasets.metadata_preprocessor import MetadataPreprocessor
+from src.datasets.smp_dataset import SMPDataset, smp_collate_fn
+from src.models.fusion_model import SMPFusionModel
+
+
+def load_yaml(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged = deepcopy(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = deep_merge_dict(merged[k], v)
+        else:
+            merged[k] = deepcopy(v)
+    return merged
+
+
+def load_config_with_base(config_path: Path) -> Dict[str, Any]:
+    cfg = load_yaml(config_path)
+    base_key = cfg.pop("base", None)
+    if base_key is None:
+        return cfg
+    base_path = Path(base_key)
+    if not base_path.is_absolute():
+        base_path = (config_path.parent / base_key).resolve()
+    return deep_merge_dict(load_config_with_base(base_path), cfg)
+
+
+def load_dataframe(path: str) -> pd.DataFrame:
+    p = Path(path)
+    if p.suffix == ".parquet":
+        return pd.read_parquet(p)
+    if p.suffix == ".csv":
+        return pd.read_csv(p)
+    if p.suffix == ".jsonl":
+        return pd.read_json(p, lines=True)
+    raise ValueError(f"Unsupported format: {p.suffix}")
+
+
+def make_fold_split(df: pd.DataFrame, fold: int, n_folds: int, group_col: str = "Uid"):
+    groups = df[group_col].fillna("UNK_GROUP").astype(str).to_numpy()
+    gkf = GroupKFold(n_splits=n_folds)
+    splits = list(gkf.split(df, groups=groups))
+    tr_idx, va_idx = splits[fold]
+    train_df = df.iloc[tr_idx].reset_index(drop=True).copy()
+    val_df = df.iloc[va_idx].reset_index(drop=True).copy()
+    train_df["split"] = "train"
+    val_df["split"] = "val"
+    return train_df, val_df
+
+
+def _safe_nunique(series: pd.Series) -> int:
+    return int(series.dropna().nunique())
+
+
+def add_user_aggregate_features_fold(train_df: pd.DataFrame, target_df: pd.DataFrame) -> pd.DataFrame:
+    if train_df.empty or "Uid" not in train_df.columns or "Uid" not in target_df.columns:
+        return target_df
+
+    work = train_df.copy()
+    work["label"] = pd.to_numeric(work["label"], errors="coerce")
+    work["hour"] = pd.to_numeric(work["hour"] if "hour" in work.columns else None, errors="coerce")
+
+    agg = (
+        work.groupby("Uid", dropna=True)
+        .agg(
+            user_prev_post_count=("post_id", "count"),
+            user_mean_label=("label", "mean"),
+            user_median_label=("label", "median"),
+            user_std_label=("label", "std"),
+            user_category_nunique=("category", _safe_nunique),
+            user_active_hour_mean=("hour", "mean"),
+        )
+        .reset_index()
+    )
+    return target_df.merge(agg, on="Uid", how="left")
+
+
+def ensure_user_aggregate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in [
+        "user_prev_post_count",
+        "user_mean_label",
+        "user_median_label",
+        "user_std_label",
+        "user_category_nunique",
+        "user_active_hour_mean",
+    ]:
+        if c not in out.columns:
+            out[c] = None
+    return out
+
+
+def build_model(cfg, preprocessor, device):
+    model_cfg = cfg["model"]
+    text_cfg = cfg["text"]
+    image_cfg = cfg["image"]
+    meta_cfg = cfg["meta"]
+    fusion_cfg = cfg["fusion"]
+
+    cat_cardinalities = [
+        int(preprocessor.cat_cardinalities[col])
+        for col in preprocessor.cat_cols
+    ]
+
+    model = SMPFusionModel(
+        text_model_name=text_cfg["model_name"],
+        meta_num_dim=len(preprocessor.transformed_num_cols),
+        meta_cat_cardinalities=cat_cardinalities,
+        meta_bin_dim=len(preprocessor.transformed_bin_cols),
+        hidden_dim=int(model_cfg["hidden_dim"]),
+        dropout=float(model_cfg["dropout"]),
+        use_text=bool(model_cfg["use_text"]),
+        use_meta=bool(model_cfg["use_meta"]),
+        use_image=bool(model_cfg["use_image"]),
+        image_model_name=image_cfg["model_name"],
+        text_pooling=text_cfg["pooling"],
+        text_trainable=bool(text_cfg["trainable"]),
+        image_pretrained=bool(image_cfg.get("pretrained", True)),
+        image_trainable=bool(image_cfg["trainable"]),
+        fusion_type=fusion_cfg["type"],
+        meta_branch_dim=int(meta_cfg["branch_dim"]),
+        use_clip_similarity=bool(fusion_cfg.get("use_clip_similarity", False)),
+    ).to(device)
+
+    return model
+
+
+@torch.no_grad()
+def export_loader(model, loader, device, label_mean, label_std) -> pd.DataFrame:
+    model.eval()
+    rows: List[pd.DataFrame] = []
+
+    for batch in loader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        meta_num = batch["meta_num"].to(device)
+        meta_cat = batch["meta_cat"].to(device)
+        meta_bin = batch["meta_bin"].to(device)
+
+        image_tensor = batch.get("image_tensor", None)
+        if image_tensor is not None and image_tensor.numel() > 0:
+            image_tensor = image_tensor.to(device)
+        else:
+            image_tensor = None
+
+        glove_token_count = batch.get("glove_token_count", None)
+        if glove_token_count is not None:
+            glove_token_count = glove_token_count.to(device)
+
+        out = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            meta_num=meta_num,
+            meta_cat=meta_cat,
+            meta_bin=meta_bin,
+            image_tensor=image_tensor,
+            glove_tokens=batch.get("glove_tokens", None),
+            glove_text=batch.get("glove_text", None),
+            glove_token_count=glove_token_count,
+            return_features=True,
+        )
+
+        pred_norm = out["output"].squeeze(-1).detach().cpu().numpy()
+        pred_raw = pred_norm * label_std + label_mean
+
+        fused = out["fused"].detach().cpu().numpy()
+        text = out["features"]["text"].detach().cpu().numpy()
+        meta = out["features"]["meta"].detach().cpu().numpy()
+        image = out["features"]["image"].detach().cpu().numpy()
+
+        data = {
+            "post_id": batch["post_id"],
+            "Uid": batch["Uid"],
+            "Pid": batch["Pid"],
+            "label": batch["labels"].detach().cpu().numpy() * label_std + label_mean,
+            "deep_pred": pred_raw,
+            "deep_pred_norm": pred_norm,
+        }
+
+        clip_sim = out["features"].get("clip_sim")
+        if clip_sim is not None:
+            data["clip_sim"] = clip_sim.squeeze(-1).detach().cpu().numpy()
+
+        df = pd.DataFrame(data)
+
+        for i in range(fused.shape[1]):
+            df[f"fused_{i}"] = fused[:, i]
+        for i in range(text.shape[1]):
+            df[f"text_{i}"] = text[:, i]
+        for i in range(meta.shape[1]):
+            df[f"meta_{i}"] = meta[:, i]
+        for i in range(image.shape[1]):
+            df[f"image_{i}"] = image[:, i]
+
+        rows.append(df)
+
+    return pd.concat(rows, axis=0, ignore_index=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--fold", type=int, required=True)
+    parser.add_argument("--n_folds", type=int, default=5)
+    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--output_csv", type=str, required=True)
+    args = parser.parse_args()
+
+    cfg = load_config_with_base(Path(args.config).resolve())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    data_cfg = cfg["data"]
+    text_cfg = cfg["text"]
+    image_cfg = cfg["image"]
+    train_cfg = cfg["train"]
+    model_cfg = cfg["model"]
+
+    df = load_dataframe(data_cfg["official_train_path"])
+    df = ensure_user_aggregate_columns(df)
+
+    train_df, val_df = make_fold_split(
+        df,
+        fold=args.fold,
+        n_folds=args.n_folds,
+        group_col="Uid",
+    )
+
+    train_df = add_user_aggregate_features_fold(train_df, train_df)
+    val_df = add_user_aggregate_features_fold(train_df, val_df)
+
+    label_mean = train_df["label"].mean()
+    label_std = train_df["label"].std()
+
+    exp_name = str(cfg["exp_name"])
+    exp_dir = Path(cfg["output"]["root_dir"]) / exp_name / f"fold_{args.fold}"
+    preprocessor = MetadataPreprocessor.load(exp_dir / "metadata_preprocessor.json")
+
+    val_df = preprocessor.transform(val_df)
+
+    dataset = SMPDataset(
+        df=val_df,
+        preprocessor=preprocessor,
+        text_model_name=text_cfg["model_name"],
+        image_model_name=image_cfg["model_name"],
+        normalize_label=True,
+        label_mean=label_mean,
+        label_std=label_std,
+        max_length=int(text_cfg["max_length"]),
+        use_text=bool(model_cfg["use_text"]),
+        use_meta=bool(model_cfg["use_meta"]),
+        use_image=bool(model_cfg["use_image"]),
+        image_path_col=image_cfg.get("path_col", "image_path"),
+        image_root_dir=image_cfg.get("root_dir", None),
+        is_train=False,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=int(train_cfg["batch_size"]),
+        shuffle=False,
+        num_workers=int(train_cfg["num_workers"]),
+        pin_memory=bool(train_cfg.get("pin_memory", True)),
+        collate_fn=smp_collate_fn,
+        drop_last=False,
+    )
+
+    model = build_model(cfg, preprocessor, device)
+
+    ckpt = torch.load(args.ckpt, map_location=device)
+    state = ckpt.get("model_state_dict", ckpt)
+    model.load_state_dict(state, strict=True)
+
+    out_df = export_loader(model, loader, device, label_mean, label_std)
+
+    output_csv = Path(args.output_csv)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(output_csv, index=False)
+    print(f"[SAVED] {output_csv} shape={out_df.shape}")
+
+
+if __name__ == "__main__":
+    main()

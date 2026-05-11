@@ -45,6 +45,12 @@ class SMPFusionModel(nn.Module):
         fusion_type: str = "pairwise_gated",
         meta_branch_dim: int = 128,
         use_clip_similarity: bool = False,
+        # ── user/location description vector branches ──
+        use_user_desc: bool = True,
+        use_loc_desc: bool = True,
+        user_desc_dim: int = 400,
+        loc_desc_dim: int = 400,
+        desc_bottleneck_dim: int = 64,
     ) -> None:
         super().__init__()
 
@@ -136,6 +142,11 @@ class SMPFusionModel(nn.Module):
                 dropout=dropout,
                 activation="relu",
                 use_layernorm=True,
+                use_user_desc=use_user_desc,
+                use_loc_desc=use_loc_desc,
+                user_desc_dim=user_desc_dim,
+                loc_desc_dim=loc_desc_dim,
+                desc_bottleneck_dim=desc_bottleneck_dim,
             )
             fusion_input_dims["meta"] = hidden_dim
 
@@ -281,6 +292,10 @@ class SMPFusionModel(nn.Module):
         glove_tokens: Optional[Sequence[Sequence[str]]] = None,
         glove_text: Optional[Sequence[str]] = None,
         glove_token_count: Optional[torch.Tensor] = None,
+        user_desc: Optional[torch.Tensor] = None,
+        loc_desc: Optional[torch.Tensor] = None,
+        has_user_desc: Optional[torch.Tensor] = None,
+        has_loc_desc: Optional[torch.Tensor] = None,
     ) -> Dict[str, Optional[torch.Tensor]]:
         batch_size = self._infer_batch_size(
             input_ids=input_ids,
@@ -381,6 +396,10 @@ class SMPFusionModel(nn.Module):
                 meta_num=meta_num,
                 meta_cat=meta_cat,
                 meta_bin=meta_bin,
+                user_desc=user_desc,
+                loc_desc=loc_desc,
+                has_user_desc=has_user_desc,
+                has_loc_desc=has_loc_desc,
             )
 
         # -------------------------
@@ -416,9 +435,16 @@ class SMPFusionModel(nn.Module):
                     "use_clip_similarity=True requires raw CLIP text/image features."
                 )
 
+            # features["clip_sim"] = F.cosine_similarity(
+            #     raw_clip_text_feat,
+            #     raw_clip_image_feat,
+            #     dim=-1,
+            #     eps=1e-8,
+            # ).unsqueeze(-1)
+            
             features["clip_sim"] = F.cosine_similarity(
-                raw_clip_text_feat,
-                raw_clip_image_feat,
+                clip_text_feat,
+                features["image"],
                 dim=-1,
                 eps=1e-8,
             ).unsqueeze(-1)
@@ -436,6 +462,10 @@ class SMPFusionModel(nn.Module):
         glove_tokens: Optional[Sequence[Sequence[str]]] = None,
         glove_text: Optional[Sequence[str]] = None,
         glove_token_count: Optional[torch.Tensor] = None,
+        user_desc: Optional[torch.Tensor] = None,
+        loc_desc: Optional[torch.Tensor] = None,
+        has_user_desc: Optional[torch.Tensor] = None,
+        has_loc_desc: Optional[torch.Tensor] = None,
         return_features: bool = False,
         modality_mask: Optional[Dict[str, bool]] = None,
     ):
@@ -449,6 +479,10 @@ class SMPFusionModel(nn.Module):
             glove_tokens=glove_tokens,
             glove_text=glove_text,
             glove_token_count=glove_token_count,
+            user_desc=user_desc,
+            loc_desc=loc_desc,
+            has_user_desc=has_user_desc,
+            has_loc_desc=has_loc_desc,
         )
 
         if modality_mask is not None:

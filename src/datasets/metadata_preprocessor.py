@@ -52,8 +52,44 @@ def _safe_str(x: Any, default: str = "") -> str:
     return x if x else default
 
 
-@dataclass
-class NumericStats:
+def _parse_vector(x: Any, expected_dim: int) -> Optional[list]:
+    """
+    Parse a comma-separated vector string into a list of floats.
+    Returns None if parsing fails or value is missing.
+
+    Handles:
+        "0.123,0.456,..."    → [0.123, 0.456, ...]
+        [0.123, 0.456, ...]  → same (already a list)
+        None / NaN / ""      → None
+    """
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+    if isinstance(x, (list, np.ndarray)):
+        arr = [float(v) for v in x]
+        if len(arr) < expected_dim:
+            arr += [0.0] * (expected_dim - len(arr))
+        return arr[:expected_dim]
+    s = str(x).strip()
+    if not s or s.lower() in ("none", "nan", "null"):
+        return None
+    try:
+        parts = s.split(",")
+        arr = [float(p.strip()) for p in parts if p.strip()]
+        if not arr:
+            return None
+        if len(arr) < expected_dim:
+            arr += [0.0] * (expected_dim - len(arr))
+        return arr[:expected_dim]
+    except Exception:
+        return None
+
+
+
     median: float
     mean: float
     std: float
@@ -78,6 +114,8 @@ class MetadataPreprocessor:
         text_cols: Optional[List[str]] = None,
         log1p_cols: Optional[List[str]] = None,
         normalize_numeric: bool = True,
+        user_desc_dim: int = 400,
+        loc_desc_dim: int = 400,
     ) -> None:
         self.num_cols = num_cols or [
             "hour",
@@ -153,6 +191,8 @@ class MetadataPreprocessor:
         self.text_cols = text_cols or ["title", "alltags", "full_text"]
         self.log1p_cols = log1p_cols or []
         self.normalize_numeric = normalize_numeric
+        self.user_desc_dim = user_desc_dim
+        self.loc_desc_dim  = loc_desc_dim
 
         self.num_stats: Dict[str, NumericStats] = {}
         self.cat_vocab: Dict[str, Dict[str, int]] = {}
@@ -174,6 +214,9 @@ class MetadataPreprocessor:
     def _ensure_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
         for c in self.num_cols + self.cat_cols + self.bin_cols + self.text_cols:
+            if c not in out.columns:
+                out[c] = None
+        for c in ("user_description", "location_description"):
             if c not in out.columns:
                 out[c] = None
         if "label" not in out.columns:
@@ -255,6 +298,42 @@ class MetadataPreprocessor:
             out[col] = out[col].map(lambda x: _safe_str(x, ""))
 
         out["label"] = pd.to_numeric(out["label"], errors="coerce").fillna(0.0).astype(np.float32)
+
+        # ── user_description / location_description ──────────────────
+        # Parse vector strings → numpy arrays; also emit has_* flags.
+        # extra data will have None here → zeros + has_*=0.
+        zero_user = np.zeros(self.user_desc_dim, dtype=np.float32)
+        zero_loc  = np.zeros(self.loc_desc_dim,  dtype=np.float32)
+
+        user_desc_list = []
+        has_user_desc_list = []
+        for v in out["user_description"]:
+            parsed = _parse_vector(v, self.user_desc_dim)
+            if parsed is None:
+                user_desc_list.append(zero_user.copy())
+                has_user_desc_list.append(0)
+            else:
+                user_desc_list.append(np.array(parsed, dtype=np.float32))
+                has_user_desc_list.append(1)
+
+        loc_desc_list = []
+        has_loc_desc_list = []
+        for v in out["location_description"]:
+            parsed = _parse_vector(v, self.loc_desc_dim)
+            if parsed is None:
+                loc_desc_list.append(zero_loc.copy())
+                has_loc_desc_list.append(0)
+            else:
+                loc_desc_list.append(np.array(parsed, dtype=np.float32))
+                has_loc_desc_list.append(1)
+
+        # Store as object columns (each cell is a numpy array).
+        # The dataset __getitem__ will convert these to tensors.
+        out["user_desc_vec"]   = user_desc_list
+        out["loc_desc_vec"]    = loc_desc_list
+        out["has_user_desc"]   = np.array(has_user_desc_list, dtype=np.float32)
+        out["has_loc_desc"]    = np.array(has_loc_desc_list,  dtype=np.float32)
+
         return out
 
     def fit_transform(self, train_df: pd.DataFrame) -> pd.DataFrame:
@@ -285,6 +364,8 @@ class MetadataPreprocessor:
             "text_cols": self.text_cols,
             "log1p_cols": self.log1p_cols,
             "normalize_numeric": self.normalize_numeric,
+            "user_desc_dim": self.user_desc_dim,
+            "loc_desc_dim":  self.loc_desc_dim,
             "num_stats": {k: asdict(v) for k, v in self.num_stats.items()},
             "cat_vocab": self.cat_vocab,
             "cat_cardinalities": self.cat_cardinalities,
@@ -303,6 +384,8 @@ class MetadataPreprocessor:
             text_cols=payload.get("text_cols"),
             log1p_cols=payload.get("log1p_cols"),
             normalize_numeric=payload.get("normalize_numeric", True),
+            user_desc_dim=payload.get("user_desc_dim", 400),
+            loc_desc_dim=payload.get("loc_desc_dim", 400),
         )
         obj.num_stats = {k: NumericStats(**v) for k, v in payload["num_stats"].items()}
         obj.cat_vocab = {

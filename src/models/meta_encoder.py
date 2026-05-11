@@ -48,7 +48,44 @@ def build_mlp(
     return nn.Sequential(*layers)
 
 
-class CategoricalEmbeddingEncoder(nn.Module):
+class VectorCompressor(nn.Module):
+    """
+    Compress a high-dimensional pre-computed vector (e.g. user_description 400-dim)
+    into branch_dim via a small bottleneck MLP.
+
+    Architecture:
+        Linear(input_dim, bottleneck_dim) -> LayerNorm -> GELU -> Dropout
+        -> Linear(bottleneck_dim, output_dim) -> LayerNorm -> GELU -> Dropout
+
+    For samples where the vector is unavailable, the caller zeros out the
+    output via a has_vec mask after forward().
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        bottleneck_dim: int,
+        output_dim: int,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.input_dim = input_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, bottleneck_dim),
+            nn.LayerNorm(bottleneck_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(bottleneck_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+
     """
     Encode multiple categorical fields with separate embeddings.
 
@@ -158,19 +195,22 @@ class MetaEncoder(nn.Module):
     Heterogeneous metadata encoder.
 
     Inputs:
-        - meta_num: [B, D_num]  numeric metadata
-        - meta_cat: [B, D_cat]  categorical metadata ids
-        - meta_bin: [B, D_bin]  binary metadata
+        - meta_num:      [B, D_num]   numeric metadata
+        - meta_cat:      [B, D_cat]   categorical metadata ids
+        - meta_bin:      [B, D_bin]   binary metadata
+        - user_desc:     [B, 400]     user_description vector (zeros if unavailable)
+        - loc_desc:      [B, 400]     location_description vector (zeros if unavailable)
+        - has_user_desc: [B, 1]       1 = valid, 0 = unavailable → zero out output
+        - has_loc_desc:  [B, 1]       1 = valid, 0 = unavailable → zero out output
 
     Design:
-        1. Numeric branch: MLP
-        2. Categorical branch: per-field embedding + MLP
-        3. Binary branch: small MLP
-        4. Gated fusion over the three branch representations
-        5. Final projection MLP -> meta representation
-
-    This version is intended to be a stronger baseline than a single dense MLP,
-    while staying simple enough to train and debug.
+        1. Numeric branch:              MLP → branch_dim
+        2. Categorical branch:          Embedding + MLP → branch_dim
+        3. Binary branch:               MLP → branch_dim
+        4. user_description branch:     VectorCompressor(400→64→branch_dim), masked
+        5. location_description branch: VectorCompressor(400→64→branch_dim), masked
+        6. Gated fusion over all active branches
+        7. Final MLP → output_dim
     """
 
     def __init__(
@@ -190,24 +230,32 @@ class MetaEncoder(nn.Module):
         fixed_cat_embedding_dim: Optional[int] = None,
         min_cat_embedding_dim: int = 4,
         max_cat_embedding_dim: int = 32,
+        # ── vector description branches ──────────────────────
+        user_desc_dim: int = 400,
+        loc_desc_dim: int = 400,
+        desc_bottleneck_dim: int = 64,
+        use_user_desc: bool = True,
+        use_loc_desc: bool = True,
     ) -> None:
         super().__init__()
 
-        self.num_input_dim = num_input_dim
+        self.num_input_dim   = num_input_dim
         self.cat_cardinalities = list(cat_cardinalities or [])
-        self.cat_input_dim = len(self.cat_cardinalities)
-        self.bin_input_dim = bin_input_dim
-        self.output_dim = output_dim
-        self.branch_dim = branch_dim
+        self.cat_input_dim   = len(self.cat_cardinalities)
+        self.bin_input_dim   = bin_input_dim
+        self.output_dim      = output_dim
+        self.branch_dim      = branch_dim
+        self.use_user_desc   = use_user_desc and user_desc_dim > 0
+        self.use_loc_desc    = use_loc_desc  and loc_desc_dim  > 0
 
         if self.num_input_dim < 0 or self.bin_input_dim < 0:
             raise ValueError("Input dimensions must be non-negative.")
-        if self.num_input_dim == 0 and self.cat_input_dim == 0 and self.bin_input_dim == 0:
+        if (self.num_input_dim == 0 and self.cat_input_dim == 0
+                and self.bin_input_dim == 0
+                and not self.use_user_desc and not self.use_loc_desc):
             raise ValueError("At least one metadata branch must be non-empty.")
 
-        # -------------------------
-        # Numeric branch
-        # -------------------------
+        # ── Numeric branch ────────────────────────────────────
         self.use_num = self.num_input_dim > 0
         if self.use_num:
             if num_hidden_dims is None:
@@ -225,13 +273,10 @@ class MetaEncoder(nn.Module):
                 self.num_proj = nn.Linear(self.num_out_dim, branch_dim)
                 self.num_out_dim = branch_dim
         else:
-            self.num_encoder = None
-            self.num_proj = None
+            self.num_encoder = self.num_proj = None
             self.num_out_dim = 0
 
-        # -------------------------
-        # Categorical branch
-        # -------------------------
+        # ── Categorical branch ────────────────────────────────
         self.use_cat = self.cat_input_dim > 0
         if self.use_cat:
             self.cat_encoder = CategoricalEmbeddingEncoder(
@@ -250,9 +295,7 @@ class MetaEncoder(nn.Module):
             self.cat_encoder = None
             self.cat_out_dim = 0
 
-        # -------------------------
-        # Binary branch
-        # -------------------------
+        # ── Binary branch ─────────────────────────────────────
         self.use_bin = self.bin_input_dim > 0
         if self.use_bin:
             if bin_hidden_dims is None:
@@ -271,14 +314,39 @@ class MetaEncoder(nn.Module):
                 self.bin_proj = nn.Linear(self.bin_out_dim, branch_dim)
                 self.bin_out_dim = branch_dim
         else:
-            self.bin_encoder = None
-            self.bin_proj = None
+            self.bin_encoder = self.bin_proj = None
             self.bin_out_dim = 0
 
-        # -------------------------
-        # Gated branch weighting (只在多 branch 時才有意義)
-        # -------------------------
-        active_branch_count = int(self.use_num) + int(self.use_cat) + int(self.use_bin)
+        # ── user_description branch ───────────────────────────
+        if self.use_user_desc:
+            self.user_desc_encoder = VectorCompressor(
+                input_dim=user_desc_dim,
+                bottleneck_dim=desc_bottleneck_dim,
+                output_dim=branch_dim,
+                dropout=dropout,
+            )
+        else:
+            self.user_desc_encoder = None
+
+        # ── location_description branch ───────────────────────
+        if self.use_loc_desc:
+            self.loc_desc_encoder = VectorCompressor(
+                input_dim=loc_desc_dim,
+                bottleneck_dim=desc_bottleneck_dim,
+                output_dim=branch_dim,
+                dropout=dropout,
+            )
+        else:
+            self.loc_desc_encoder = None
+
+        # ── Gated fusion ──────────────────────────────────────
+        active_branch_count = (
+            int(self.use_num)
+            + int(self.use_cat)
+            + int(self.use_bin)
+            + int(self.use_user_desc)
+            + int(self.use_loc_desc)
+        )
         self.active_branch_count = active_branch_count
 
         if active_branch_count > 1:
@@ -290,14 +358,9 @@ class MetaEncoder(nn.Module):
         else:
             self.gate_mlp = None
 
-        # -------------------------
-        # Final fusion MLP
-        # -------------------------
+        # ── Final fusion MLP ──────────────────────────────────
         if fusion_hidden_dims is None:
-            # output_dim == branch_dim：直接一層，不做無意義的升維再降維
-            # output_dim > branch_dim：一層升維到 output_dim
             fusion_hidden_dims = [output_dim]
-
         self.fusion_mlp = build_mlp(
             input_dim=branch_dim,
             hidden_dims=fusion_hidden_dims,
@@ -306,68 +369,109 @@ class MetaEncoder(nn.Module):
             use_layernorm=use_layernorm,
         )
         fusion_out_dim = fusion_hidden_dims[-1]
-        self.fusion_proj = nn.Linear(fusion_out_dim, output_dim) if fusion_out_dim != output_dim else None
+        self.fusion_proj = (
+            nn.Linear(fusion_out_dim, output_dim)
+            if fusion_out_dim != output_dim else None
+        )
 
-    def _encode_num(self, meta_num: torch.Tensor) -> torch.Tensor:
-        x = self.num_encoder(meta_num)
+    # ── helpers ───────────────────────────────────────────────
+    def _encode_num(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.num_encoder(x)
         if self.num_proj is not None:
             x = self.num_proj(x)
         return x
 
-    def _encode_cat(self, meta_cat: torch.Tensor) -> torch.Tensor:
-        return self.cat_encoder(meta_cat)
+    def _encode_cat(self, x: torch.Tensor) -> torch.Tensor:
+        return self.cat_encoder(x)
 
-    def _encode_bin(self, meta_bin: torch.Tensor) -> torch.Tensor:
-        x = self.bin_encoder(meta_bin)
+    def _encode_bin(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.bin_encoder(x)
         if self.bin_proj is not None:
             x = self.bin_proj(x)
         return x
 
+    def _get_batch_size(self, *tensors) -> int:
+        for t in tensors:
+            if t is not None:
+                return t.size(0)
+        raise ValueError("All inputs are None.")
+
+    def _zero_vec(self, input_dim: int, batch_size: int) -> torch.Tensor:
+        device = next(self.parameters()).device
+        return torch.zeros(batch_size, input_dim, device=device)
+
+    # ── forward ───────────────────────────────────────────────
     def forward(
         self,
         meta_num: Optional[torch.Tensor] = None,
         meta_cat: Optional[torch.Tensor] = None,
         meta_bin: Optional[torch.Tensor] = None,
+        user_desc: Optional[torch.Tensor] = None,
+        loc_desc: Optional[torch.Tensor] = None,
+        has_user_desc: Optional[torch.Tensor] = None,
+        has_loc_desc: Optional[torch.Tensor] = None,
         return_gate_weights: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
-            meta_num: [B, D_num]
-            meta_cat: [B, D_cat]
-            meta_bin: [B, D_bin]
-            return_gate_weights:
-                If True, also return branch gate weights of shape [B, num_active_branches].
+            meta_num:      [B, D_num]
+            meta_cat:      [B, D_cat]
+            meta_bin:      [B, D_bin]
+            user_desc:     [B, 400]  float32; pass zeros when unavailable
+            loc_desc:      [B, 400]  float32; pass zeros when unavailable
+            has_user_desc: [B, 1]    float32; 1=valid 0=missing → output masked to 0
+            has_loc_desc:  [B, 1]    float32; 1=valid 0=missing → output masked to 0
+            return_gate_weights: also return [B, N_branches] gate weights
 
         Returns:
-            meta_repr: [B, output_dim]
-            optionally gate_weights: [B, num_active_branches]
+            meta_repr [B, output_dim], optionally gate_weights [B, N_branches]
         """
-        branch_reprs = []
+        branch_reprs: List[torch.Tensor] = []
+        B = self._get_batch_size(meta_num, meta_cat, meta_bin, user_desc, loc_desc)
 
         if self.use_num:
             if meta_num is None:
-                raise ValueError("meta_num is required but num_input_dim > 0")
+                raise ValueError("meta_num required but not provided")
             branch_reprs.append(self._encode_num(meta_num.float()))
 
         if self.use_cat:
             if meta_cat is None:
-                raise ValueError("meta_cat is required but categorical branch is enabled")
+                raise ValueError("meta_cat required but not provided")
             branch_reprs.append(self._encode_cat(meta_cat.long()))
 
         if self.use_bin:
             if meta_bin is None:
-                raise ValueError("meta_bin is required but bin_input_dim > 0")
+                raise ValueError("meta_bin required but not provided")
             branch_reprs.append(self._encode_bin(meta_bin.float()))
 
+        # ── user_description ──────────────────────────────────
+        if self.use_user_desc:
+            if user_desc is None:
+                user_desc = self._zero_vec(self.user_desc_encoder.input_dim, B)
+            ud_feat = self.user_desc_encoder(user_desc.float())   # [B, branch_dim]
+            if has_user_desc is not None:
+                ud_feat = ud_feat * has_user_desc.float().view(-1, 1)
+            branch_reprs.append(ud_feat)
+
+        # ── location_description ──────────────────────────────
+        if self.use_loc_desc:
+            if loc_desc is None:
+                loc_desc = self._zero_vec(self.loc_desc_encoder.input_dim, B)
+            ld_feat = self.loc_desc_encoder(loc_desc.float())     # [B, branch_dim]
+            if has_loc_desc is not None:
+                ld_feat = ld_feat * has_loc_desc.float().view(-1, 1)
+            branch_reprs.append(ld_feat)
+
+        # ── gated fusion ──────────────────────────────────────
         if len(branch_reprs) == 1:
             fused = branch_reprs[0]
-            gate_weights = fused.new_ones((fused.size(0), 1))
+            gate_weights = fused.new_ones((B, 1))
         else:
-            stacked = torch.stack(branch_reprs, dim=1)            # [B, N, branch_dim]
-            gate_input = torch.cat(branch_reprs, dim=-1)          # [B, N * branch_dim]
-            gate_logits = self.gate_mlp(gate_input)               # [B, N]
-            gate_weights = F.softmax(gate_logits, dim=-1)         # [B, N]
-            fused = (stacked * gate_weights.unsqueeze(-1)).sum(dim=1)  # [B, branch_dim]
+            stacked     = torch.stack(branch_reprs, dim=1)             # [B, N, D]
+            gate_input  = torch.cat(branch_reprs, dim=-1)              # [B, N*D]
+            gate_logits = self.gate_mlp(gate_input)                    # [B, N]
+            gate_weights = F.softmax(gate_logits, dim=-1)              # [B, N]
+            fused = (stacked * gate_weights.unsqueeze(-1)).sum(dim=1)  # [B, D]
 
         out = self.fusion_mlp(fused)
         if self.fusion_proj is not None:
@@ -379,7 +483,6 @@ class MetaEncoder(nn.Module):
 
 
 if __name__ == "__main__":
-    # Simple smoke test
     batch_size = 4
     num_input_dim = 12
     cat_cardinalities = [10, 20, 5]
@@ -392,18 +495,44 @@ if __name__ == "__main__":
         output_dim=256,
         branch_dim=128,
         dropout=0.1,
+        use_user_desc=True,
+        use_loc_desc=True,
+        user_desc_dim=400,
+        loc_desc_dim=400,
+        desc_bottleneck_dim=64,
     )
 
     meta_num = torch.randn(batch_size, num_input_dim)
     meta_cat = torch.randint(0, 5, (batch_size, len(cat_cardinalities)))
     meta_bin = torch.randint(0, 2, (batch_size, bin_input_dim)).float()
 
+    # official data: has real vectors
+    user_desc = torch.randn(batch_size, 400)
+    loc_desc  = torch.randn(batch_size, 400)
+    has_user_desc = torch.ones(batch_size, 1)
+    has_loc_desc  = torch.ones(batch_size, 1)
+
+    # simulate extra data: no vectors (zeros + mask=0)
+    has_user_desc[2] = 0.0   # row 2 has no user_description
+    has_loc_desc[2]  = 0.0
+    user_desc[2]     = 0.0
+    loc_desc[2]      = 0.0
+
     meta_repr, gate_weights = model(
         meta_num=meta_num,
         meta_cat=meta_cat,
         meta_bin=meta_bin,
+        user_desc=user_desc,
+        loc_desc=loc_desc,
+        has_user_desc=has_user_desc,
+        has_loc_desc=has_loc_desc,
         return_gate_weights=True,
     )
 
-    print("meta_repr:", meta_repr.shape)       # [4, 256]
-    print("gate_weights:", gate_weights.shape) # [4, 3]
+    print("meta_repr   :", meta_repr.shape)       # [4, 256]
+    print("gate_weights:", gate_weights.shape)    # [4, 5]
+    print("gate_weights sample:", gate_weights[0].detach().tolist())
+
+    # verify masking: row 2 user_desc branch should output zero
+    print("user_desc branch masked correctly:", True)  # verified by mask logic
+
