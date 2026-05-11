@@ -406,7 +406,7 @@ def print_report(results: List[Dict], total_items: int, skip_images: bool) -> in
 # ──────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Check crawl status and data quality.")
-    p.add_argument("--base_dir",    default="/local/smp/extra_data_v2")
+    p.add_argument("--base_dir",    default="/local/smp/extra_data")
     p.add_argument("--total_items", type=int, default=TOTAL_ITEMS_DEFAULT)
     p.add_argument("--cat",         default=None,
                    help="Only check this category (partial match OK, e.g. 'Travel')")

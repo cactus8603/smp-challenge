@@ -2,7 +2,7 @@ seed: 42
 exp_name: base_exp
 
 data:
-  official_train_path: /local/smp/processed/official_train.parquet
+  official_train_path: /local/smp/processed_v2/official_train.parquet
 
 model:
   use_text: true
