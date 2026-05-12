@@ -166,7 +166,6 @@ def train_one_epoch(
         progress.set_postfix(loss=f"{loss.item():.4f}")
 
         # Full epoch training: do not break early.
-        # break  # debug: run only one batch
 
     avg_loss = total_loss / max(step, 1)
     avg_reg_loss = total_reg_loss / max(len(loader), 1)

@@ -182,6 +182,8 @@ def build_model(cfg, preprocessor, device):
         use_loc_desc=bool(meta_cfg.get("use_loc_desc", False)),
         loc_desc_dim=int(meta_cfg.get("loc_desc_dim", 400)),
         desc_bottleneck_dim=int(meta_cfg.get("desc_bottleneck_dim", 64)),
+        user_desc_scale=float(meta_cfg.get("user_desc_scale", 0.10)),
+        loc_desc_scale=float(meta_cfg.get("loc_desc_scale", 0.05)),
     ).to(device)
 
     return model

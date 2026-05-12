@@ -511,6 +511,8 @@ def main():
         use_loc_desc=bool(meta_cfg.get("use_loc_desc", False)),
         loc_desc_dim=int(meta_cfg.get("loc_desc_dim", train_dataset.loc_desc_emb_dim or 400)),
         desc_bottleneck_dim=int(meta_cfg.get("desc_bottleneck_dim", 64)),
+        user_desc_scale=float(meta_cfg.get("user_desc_scale", 0.10)),
+        loc_desc_scale=float(meta_cfg.get("loc_desc_scale", 0.05)),
     ).to(device)
 
     # -------------------------

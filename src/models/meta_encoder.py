@@ -57,8 +57,7 @@ class VectorCompressor(nn.Module):
         Linear(input_dim, bottleneck_dim) -> LayerNorm -> GELU -> Dropout
         -> Linear(bottleneck_dim, output_dim) -> LayerNorm -> GELU -> Dropout
 
-    For samples where the vector is unavailable, the caller zeros out the
-    output via a has_vec mask after forward().
+    Missing vectors are represented as all-zero input vectors by the dataset.
     """
 
     def __init__(
@@ -200,17 +199,18 @@ class MetaEncoder(nn.Module):
         - meta_bin:      [B, D_bin]   binary metadata
         - user_desc:     [B, 400]     user_description vector (zeros if unavailable)
         - loc_desc:      [B, 400]     location_description vector (zeros if unavailable)
-        - has_user_desc: [B, 1]       1 = valid, 0 = unavailable → zero out output
-        - has_loc_desc:  [B, 1]       1 = valid, 0 = unavailable → zero out output
 
     Design:
         1. Numeric branch:              MLP → branch_dim
         2. Categorical branch:          Embedding + MLP → branch_dim
         3. Binary branch:               MLP → branch_dim
-        4. user_description branch:     VectorCompressor(400→64→branch_dim), masked
-        5. location_description branch: VectorCompressor(400→64→branch_dim), masked
-        6. Gated fusion over all active branches
-        7. Final MLP → output_dim
+        4. Gated fusion over structured metadata branches
+        5. Final MLP → output_dim
+
+    Note:
+        user_description/location_description are supported for backward compatibility,
+        but the current recommended architecture keeps them outside MetaEncoder as
+        auxiliary residual branches in SMPFusionModel.
     """
 
     def __init__(
@@ -234,7 +234,7 @@ class MetaEncoder(nn.Module):
         user_desc_dim: int = 768,       # sentence-transformers all-mpnet-base-v2 output dim
         loc_desc_dim: int = 400,
         desc_bottleneck_dim: int = 64,
-        use_user_desc: bool = True,
+        use_user_desc: bool = False,
         use_loc_desc: bool = False,     # 關閉：location_description 官方資料全是 None
     ) -> None:
         super().__init__()
@@ -497,17 +497,11 @@ if __name__ == "__main__":
     meta_cat = torch.randint(0, 5, (batch_size, len(cat_cardinalities)))
     meta_bin = torch.randint(0, 2, (batch_size, bin_input_dim)).float()
 
-    # official data: has real vectors
-    user_desc = torch.randn(batch_size, 400)
-    loc_desc  = torch.randn(batch_size, 400)
-    has_user_desc = torch.ones(batch_size, 1)
-    has_loc_desc  = torch.ones(batch_size, 1)
-
-    # simulate extra data: no vectors (zeros + mask=0)
-    has_user_desc[2] = 0.0   # row 2 has no user_description
-    has_loc_desc[2]  = 0.0
-    user_desc[2]     = 0.0
-    loc_desc[2]      = 0.0
+    # Real vectors; zero vector means unavailable.
+    user_desc = torch.randn(batch_size, 768)
+    loc_desc = torch.randn(batch_size, 400)
+    user_desc[2] = 0.0
+    loc_desc[2] = 0.0
 
     meta_repr, gate_weights = model(
         meta_num=meta_num,
@@ -522,6 +516,5 @@ if __name__ == "__main__":
     print("gate_weights:", gate_weights.shape)    # [4, 5]
     print("gate_weights sample:", gate_weights[0].detach().tolist())
 
-    # verify masking: row 2 user_desc branch should output zero
-    print("user_desc branch masked correctly:", True)  # verified by mask logic
+    print("forward ok")
 

@@ -79,9 +79,17 @@ class RegressionHead(BaseHead):
 
 class MetaWeightedMoEHead(BaseHead):
     """
-    MoE head with 5 experts weighted toward meta.
-    Gate receives runtime availability flags, currently
-    [user_desc_available, loc_desc_available, image_available].
+    LEGACY / experimental head.
+
+    This class is intentionally kept for ablation only, but fusion_model.py
+    does NOT use it in the current image_v2_sim_v1-style version.
+
+    Previous behavior:
+      - 5 experts: full / meta_A / meta_B / text / image
+      - gate also received runtime availability flags
+
+    It tended to make the model routing harder to interpret after adding
+    user_desc auxiliary features, so the active head is ModalityAwareMoEHead.
     """
 
     def __init__(
@@ -160,6 +168,19 @@ class MetaWeightedMoEHead(BaseHead):
 
 
 class ModalityAwareMoEHead(BaseHead):
+    """
+    Stable 4-expert MoE head, close to the image_v2_sim_v1-style setup.
+
+    Experts:
+      - full:  fused only
+      - meta:  fused + structured metadata feature
+      - text:  fused + post text feature
+      - image: fused + image feature (+ clip_sim if enabled)
+
+    This head does not receive user_desc/loc_desc availability flags.
+    If profile/location auxiliary vectors are enabled, fusion_model.py adds
+    them as small residuals to fused before this head.
+    """
     def __init__(
         self,
         input_dim: int,

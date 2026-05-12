@@ -7,10 +7,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.text_encoder import TextEncoder
-from src.models.meta_encoder import MetaEncoder
+from src.models.meta_encoder import MetaEncoder, VectorCompressor
 from src.models.image_encoder import build_image_encoder
 from src.models.fusion import ConcatFusion, CrossFeatureFusion, PairwiseGatedFusion
-from src.models.head import RegressionHead, ModalityAwareMoEHead, MetaWeightedMoEHead
+from src.models.head import RegressionHead, ModalityAwareMoEHead
+# Legacy head is intentionally not imported/used in this version:
+# from src.models.head import MetaWeightedMoEHead
 
 
 class SMPFusionModel(nn.Module):
@@ -51,6 +53,8 @@ class SMPFusionModel(nn.Module):
         user_desc_dim: int = 768,
         loc_desc_dim: int = 400,
         desc_bottleneck_dim: int = 64,
+        user_desc_scale: float = 0.10,
+        loc_desc_scale: float = 0.05,
     ) -> None:
         super().__init__()
 
@@ -142,8 +146,11 @@ class SMPFusionModel(nn.Module):
                 dropout=dropout,
                 activation="relu",
                 use_layernorm=True,
-                use_user_desc=use_user_desc,
-                use_loc_desc=use_loc_desc,
+                # IMPORTANT: keep structured metadata clean.
+                # user_desc / loc_desc are handled as auxiliary residual branches
+                # in SMPFusionModel, not mixed into MetaEncoder.
+                use_user_desc=False,
+                use_loc_desc=False,
                 user_desc_dim=user_desc_dim,
                 loc_desc_dim=loc_desc_dim,
                 desc_bottleneck_dim=desc_bottleneck_dim,
@@ -158,6 +165,33 @@ class SMPFusionModel(nn.Module):
             trainable=image_trainable,
             dropout=dropout,
             placeholder_when_disabled=True,
+        )
+
+        # Auxiliary profile/location text branches.
+        # These are intentionally NOT part of MetaEncoder, so structured metadata
+        # keeps its own capacity and is not diluted by text-like profile vectors.
+        self.use_user_desc_aux = bool(use_user_desc and user_desc_dim > 0)
+        self.use_loc_desc_aux = bool(use_loc_desc and loc_desc_dim > 0)
+        self.user_desc_aux_scale = float(user_desc_scale)
+        self.loc_desc_aux_scale = float(loc_desc_scale)
+
+        self.user_desc_aux_encoder: Optional[nn.Module] = (
+            VectorCompressor(
+                input_dim=user_desc_dim,
+                bottleneck_dim=desc_bottleneck_dim,
+                output_dim=hidden_dim,
+                dropout=dropout,
+            )
+            if self.use_user_desc_aux else None
+        )
+        self.loc_desc_aux_encoder: Optional[nn.Module] = (
+            VectorCompressor(
+                input_dim=loc_desc_dim,
+                bottleneck_dim=desc_bottleneck_dim,
+                output_dim=hidden_dim,
+                dropout=dropout,
+            )
+            if self.use_loc_desc_aux else None
         )
 
         if self.use_image:
@@ -232,16 +266,19 @@ class SMPFusionModel(nn.Module):
             use_clip_similarity=self.use_clip_similarity,
         )
 
-        # Main prediction head.  The gate receives runtime availability flags
-        # derived from actual tensors, not old presence-flag metadata columns.
-        self.MetaWeightedMoEHead = MetaWeightedMoEHead(
-            input_dim=hidden_dim,
-            hidden_dim=hidden_dim,
-            dropout=dropout,
-            activation="relu",
-            use_skip=True,
-            n_modality_flags=3,
-        )
+        # Legacy / current experimental head (disabled):
+        # It over-weighted meta/profile routing through runtime flags and made
+        # ablation harder to interpret.  Keep this block here as a reminder,
+        # but use the stable 4-expert ModalityAwareMoEHead below in forward().
+        #
+        # self.MetaWeightedMoEHead = MetaWeightedMoEHead(
+        #     input_dim=hidden_dim,
+        #     hidden_dim=hidden_dim,
+        #     dropout=dropout,
+        #     activation="relu",
+        #     use_skip=True,
+        #     n_modality_flags=3,
+        # )
 
     def _infer_batch_size(
         self,
@@ -331,6 +368,8 @@ class SMPFusionModel(nn.Module):
             "clip_text": None,
             "glove_text": None,
             "clip_sim": None,
+            "user_desc": None,
+            "loc_desc": None,
         }
 
         clip_text_feat: Optional[torch.Tensor] = None
@@ -405,8 +444,6 @@ class SMPFusionModel(nn.Module):
                 meta_num=meta_num,
                 meta_cat=meta_cat,
                 meta_bin=meta_bin,
-                user_desc=user_desc,
-                loc_desc=loc_desc,
             )
 
         # -------------------------
@@ -456,6 +493,33 @@ class SMPFusionModel(nn.Module):
                 eps=1e-8,
             ).unsqueeze(-1)
 
+        # -------------------------
+        # Auxiliary user/location description residual features
+        # -------------------------
+        if self.use_user_desc_aux:
+            if user_desc is None:
+                features["user_desc"] = torch.zeros(batch_size, self.hidden_dim, device=device)
+            else:
+                user_desc = user_desc.to(device).float()
+                has_user_desc = (user_desc.abs().sum(dim=-1, keepdim=True) > 0).float()
+                features["user_desc"] = (
+                    self.user_desc_aux_encoder(user_desc)
+                    * has_user_desc
+                    * self.user_desc_aux_scale
+                )
+
+        if self.use_loc_desc_aux:
+            if loc_desc is None:
+                features["loc_desc"] = torch.zeros(batch_size, self.hidden_dim, device=device)
+            else:
+                loc_desc = loc_desc.to(device).float()
+                has_loc_desc = (loc_desc.abs().sum(dim=-1, keepdim=True) > 0).float()
+                features["loc_desc"] = (
+                    self.loc_desc_aux_encoder(loc_desc)
+                    * has_loc_desc
+                    * self.loc_desc_aux_scale
+                )
+
         return features
 
     def forward(
@@ -489,54 +553,41 @@ class SMPFusionModel(nn.Module):
         )
 
         if modality_mask is not None:
-            for name in ["text", "meta", "image"]:
+            for name in ["text", "meta", "image", "user_desc", "loc_desc"]:
                 if modality_mask.get(name, False) and features.get(name) is not None:
                     features[name] = torch.zeros_like(features[name])
             if modality_mask.get("text", False) or modality_mask.get("image", False):
                 if features.get("clip_sim") is not None:
                     features["clip_sim"] = torch.zeros_like(features["clip_sim"])
 
-        fused = self.fusion(features)
+        fused_core = self.fusion(features)
+        fused = fused_core
+        if features.get("user_desc") is not None:
+            fused = fused + features["user_desc"]
+        if features.get("loc_desc") is not None:
+            fused = fused + features["loc_desc"]
 
         B = fused.size(0)
         device = fused.device
-
-        # Runtime availability flags for the MoE gate.
-        # Do NOT read old presence-flag metadata columns here.  A zero vector means
-        # the precomputed embedding is unavailable for that sample.
-        user_desc_available = (
-            (user_desc.to(device).abs().sum(dim=-1, keepdim=True) > 0).float()
-            if user_desc is not None
-            else torch.zeros(B, 1, device=device)
-        )
-        loc_desc_available = (
-            (loc_desc.to(device).abs().sum(dim=-1, keepdim=True) > 0).float()
-            if loc_desc is not None
-            else torch.zeros(B, 1, device=device)
-        )
-        image_available = (
-            torch.ones(B, 1, device=device)
-            if (image_tensor is not None)
-            else torch.zeros(B, 1, device=device)
-        )
-        modality_flags = torch.cat(
-            [user_desc_available, loc_desc_available, image_available],
-            dim=-1,
-        )
-
         zero = lambda: torch.zeros(B, self.hidden_dim, device=device)
-        output = self.MetaWeightedMoEHead(
+
+        # Stable image_v2_sim_v1-style head:
+        # 4 experts = full / meta / text / image, optionally conditioned on clip_sim.
+        # user_desc / loc_desc are already added as small residuals to fused above;
+        # they do NOT enter the head gate as separate availability flags.
+        output = self.ModalityAwareMoEHead(
             fused=fused,
             text_feat=features["text"] if features["text"] is not None else zero(),
             meta_feat=features["meta"] if features["meta"] is not None else zero(),
             image_feat=features["image"] if features["image"] is not None else zero(),
-            modality_flags=modality_flags,
+            clip_sim=features.get("clip_sim", None),
         )
 
         if return_features:
             return {
                 "output": output,
                 "fused": fused,
+                "fused_core": fused_core,
                 "features": features,
             }
 

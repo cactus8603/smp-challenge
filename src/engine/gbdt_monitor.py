@@ -66,7 +66,7 @@ def extract_deep_features(
             "deep_pred": pred,
         }
 
-        for name in ["text", "meta", "image"]:
+        for name in ["text", "meta", "image", "user_desc", "loc_desc"]:
             feat = out["features"].get(name)
             if feat is None:
                 continue
@@ -200,7 +200,7 @@ def run_gbdt_monitor(
 
             lgb_model = lgb.LGBMRegressor(
                 objective="regression",
-                n_estimators=500,
+                n_estimators=1000,
                 learning_rate=0.03,
                 num_leaves=64,
                 min_child_samples=30,
@@ -211,7 +211,6 @@ def run_gbdt_monitor(
                 random_state=seed,
                 n_jobs=-1,
                 verbose=-1,
-                # device_type="gpu",
             )
 
             lgb_model.fit(
@@ -256,7 +255,7 @@ def run_gbdt_monitor(
             cat_model = CatBoostRegressor(
                 loss_function="RMSE",
                 eval_metric="MAE",
-                iterations=500,
+                iterations=1000,
                 learning_rate=0.03,
                 depth=8,
                 l2_leaf_reg=8.0,
@@ -265,8 +264,6 @@ def run_gbdt_monitor(
                 od_wait=80,
                 verbose=False,
                 allow_writing_files=False,
-                task_type="GPU",
-                devices="0",
             )
 
             cat_model.fit(
