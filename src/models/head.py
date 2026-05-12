@@ -77,6 +77,88 @@ class RegressionHead(BaseHead):
         return out
 
 
+class MetaWeightedMoEHead(BaseHead):
+    """
+    MoE head with 5 experts weighted toward meta.
+    Gate receives runtime availability flags, currently
+    [user_desc_available, loc_desc_available, image_available].
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: Optional[int] = None,
+        dropout: float = 0.1,
+        activation: str = "relu",
+        use_skip: bool = True,
+        n_modality_flags: int = 3,
+    ) -> None:
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = input_dim
+        self.use_skip = use_skip
+        self.n_experts = 5
+
+        def act():
+            return _get_activation(activation)
+
+        def proj(in_dim: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(in_dim, hidden_dim), act(),
+                nn.LayerNorm(hidden_dim), nn.Dropout(dropout),
+            )
+
+        self.full_proj   = proj(input_dim)
+        self.meta_A_proj = proj(input_dim * 2)
+        self.meta_B_proj = proj(input_dim)
+        self.text_proj   = proj(input_dim * 2)
+        self.image_proj  = proj(input_dim * 2)
+
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim), act(),
+                nn.Dropout(dropout), nn.Linear(hidden_dim, 1),
+            )
+            for _ in range(self.n_experts)
+        ])
+
+        gate_input_dim = hidden_dim * self.n_experts + n_modality_flags
+        self.gate = nn.Sequential(
+            nn.Linear(gate_input_dim, max(hidden_dim // 2, 64)), act(),
+            nn.Dropout(dropout), nn.Linear(max(hidden_dim // 2, 64), self.n_experts),
+        )
+        self.skip = nn.Linear(input_dim, 1) if use_skip else None
+
+    def forward(
+        self,
+        fused: torch.Tensor,
+        text_feat: torch.Tensor,
+        meta_feat: torch.Tensor,
+        image_feat: torch.Tensor,
+        modality_flags: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        h_full   = self.full_proj(fused)
+        h_meta_A = self.meta_A_proj(torch.cat([fused, meta_feat], dim=-1))
+        h_meta_B = self.meta_B_proj(meta_feat)
+        h_text   = self.text_proj(torch.cat([fused, text_feat], dim=-1))
+        h_image  = self.image_proj(torch.cat([fused, image_feat], dim=-1))
+
+        expert_hiddens = [h_full, h_meta_A, h_meta_B, h_text, h_image]
+        expert_outputs = torch.stack(
+            [expert(h) for expert, h in zip(self.experts, expert_hiddens)], dim=1
+        )  # [B, 5, 1]
+
+        gate_parts = [torch.cat(expert_hiddens, dim=-1)]
+        if modality_flags is not None:
+            gate_parts.append(modality_flags.float())
+        gate_weights = torch.softmax(self.gate(torch.cat(gate_parts, dim=-1)), dim=-1)
+
+        out = (expert_outputs.squeeze(-1) * gate_weights).sum(dim=-1, keepdim=True)
+        if self.skip is not None:
+            out = out + self.skip(fused)
+        return out
+
+
 class ModalityAwareMoEHead(BaseHead):
     def __init__(
         self,

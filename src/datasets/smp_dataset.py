@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import re
 from typing import Any, Dict, List, Sequence
 
+import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
@@ -66,6 +68,11 @@ class SMPDataset(Dataset):
         image_path_col: str = "image_path",
         image_root_dir: str | None = None,
         is_train: bool = True,
+        # precomputed description embeddings
+        user_desc_emb_path: str | None = None,   # path to user_desc .npy file
+        user_desc_idx_path: str | None = None,   # path to user_desc uid_index .json
+        loc_desc_emb_path: str | None = None,    # optional path to location_desc .npy file
+        loc_desc_idx_path: str | None = None,    # optional path to location_desc key/index .json
     ) -> None:
         if not preprocessor.fitted:
             raise ValueError("preprocessor must be fitted before building SMPDataset.")
@@ -97,6 +104,44 @@ class SMPDataset(Dataset):
         self.meta_num_dim = len(self.num_cols)
         self.meta_cat_dim = len(self.cat_cols)
         self.meta_bin_dim = len(self.bin_cols)
+
+        # ── precomputed description embeddings ────────────────────────
+        self.user_desc_embeddings: np.ndarray | None = None
+        self.user_desc_uid_index: dict[str, int] | None = None
+        self.user_desc_emb_dim: int = 0
+
+        self.loc_desc_embeddings: np.ndarray | None = None
+        self.loc_desc_uid_index: dict[str, int] | None = None
+        self.loc_desc_emb_dim: int = 0
+
+        def _load_embedding_pair(
+            emb_path_value: str | None,
+            idx_path_value: str | None,
+            name: str,
+        ) -> tuple[np.ndarray | None, dict[str, int] | None, int]:
+            if emb_path_value is None or idx_path_value is None:
+                return None, None, 0
+            emb_path = Path(emb_path_value)
+            idx_path = Path(idx_path_value)
+            if not emb_path.exists() or not idx_path.exists():
+                print(f"[SMPDataset] WARNING: {name} embedding files not found; disabled.")
+                return None, None, 0
+            embeddings = np.load(str(emb_path)).astype(np.float32, copy=False)
+            index = {str(k): int(v) for k, v in json.loads(idx_path.read_text(encoding="utf-8")).items()}
+            dim = int(embeddings.shape[1])
+            coverage = sum(1 for uid in self.df["Uid"].astype(str) if uid in index)
+            print(
+                f"[SMPDataset] Loaded {name} embeddings: "
+                f"shape={embeddings.shape}, coverage={coverage}/{len(self.df)} rows"
+            )
+            return embeddings, index, dim
+
+        self.user_desc_embeddings, self.user_desc_uid_index, self.user_desc_emb_dim = _load_embedding_pair(
+            user_desc_emb_path, user_desc_idx_path, "user_desc"
+        )
+        self.loc_desc_embeddings, self.loc_desc_uid_index, self.loc_desc_emb_dim = _load_embedding_pair(
+            loc_desc_emb_path, loc_desc_idx_path, "loc_desc"
+        )
 
         required_cols = self.num_cols + self.cat_cols + self.bin_cols + [
             "title",
@@ -458,49 +503,48 @@ class SMPDataset(Dataset):
                 dtype=torch.float32,
             )
 
-            # ── user_description / location_description vectors ──────
-            # preprocessor.transform() stores these as numpy arrays in
-            # user_desc_vec / loc_desc_vec, with has_* flags.
-            if "user_desc_vec" in self.df.columns:
-                ud = row["user_desc_vec"]
-                import numpy as _np
-                item["user_desc"] = torch.tensor(
-                    ud if isinstance(ud, _np.ndarray) else _np.array(ud, dtype=_np.float32),
-                    dtype=torch.float32,
+            uid_str = safe_str(row.get("Uid", ""))
+
+            # user_description sentence embedding.  Missing index → zero vector.
+            if self.user_desc_embeddings is not None and self.user_desc_uid_index is not None:
+                emb_idx = self.user_desc_uid_index.get(uid_str, None)
+                vec = (
+                    self.user_desc_embeddings[emb_idx]
+                    if emb_idx is not None
+                    else np.zeros(self.user_desc_emb_dim, dtype=np.float32)
                 )
-                item["has_user_desc"] = torch.tensor(
-                    float(row.get("has_user_desc", 0.0)), dtype=torch.float32
-                )
+                item["user_desc"] = torch.tensor(vec, dtype=torch.float32)
             else:
                 item["user_desc"] = torch.zeros(
-                    self.preprocessor.user_desc_dim, dtype=torch.float32
-                )
-                item["has_user_desc"] = torch.tensor(0.0, dtype=torch.float32)
-
-            if "loc_desc_vec" in self.df.columns:
-                ld = row["loc_desc_vec"]
-                import numpy as _np
-                item["loc_desc"] = torch.tensor(
-                    ld if isinstance(ld, _np.ndarray) else _np.array(ld, dtype=_np.float32),
+                    self.user_desc_emb_dim or self.preprocessor.user_desc_dim,
                     dtype=torch.float32,
                 )
-                item["has_loc_desc"] = torch.tensor(
-                    float(row.get("has_loc_desc", 0.0)), dtype=torch.float32
+
+            # Optional location/profile embedding.  Same uid-based convention by default.
+            if self.loc_desc_embeddings is not None and self.loc_desc_uid_index is not None:
+                emb_idx = self.loc_desc_uid_index.get(uid_str, None)
+                vec = (
+                    self.loc_desc_embeddings[emb_idx]
+                    if emb_idx is not None
+                    else np.zeros(self.loc_desc_emb_dim, dtype=np.float32)
                 )
+                item["loc_desc"] = torch.tensor(vec, dtype=torch.float32)
             else:
                 item["loc_desc"] = torch.zeros(
-                    self.preprocessor.loc_desc_dim, dtype=torch.float32
+                    self.loc_desc_emb_dim or self.preprocessor.loc_desc_dim,
+                    dtype=torch.float32,
                 )
-                item["has_loc_desc"] = torch.tensor(0.0, dtype=torch.float32)
 
         else:
             item["meta_num"] = torch.zeros(self.meta_num_dim, dtype=torch.float32)
             item["meta_cat"] = torch.zeros(self.meta_cat_dim, dtype=torch.long)
             item["meta_bin"] = torch.zeros(self.meta_bin_dim, dtype=torch.float32)
-            item["user_desc"]     = torch.zeros(self.preprocessor.user_desc_dim, dtype=torch.float32)
-            item["loc_desc"]      = torch.zeros(self.preprocessor.loc_desc_dim,  dtype=torch.float32)
-            item["has_user_desc"] = torch.tensor(0.0, dtype=torch.float32)
-            item["has_loc_desc"]  = torch.tensor(0.0, dtype=torch.float32)
+            item["user_desc"] = torch.zeros(
+                self.user_desc_emb_dim or self.preprocessor.user_desc_dim, dtype=torch.float32
+            )
+            item["loc_desc"] = torch.zeros(
+                self.loc_desc_emb_dim or self.preprocessor.loc_desc_dim, dtype=torch.float32
+            )
 
         # -------------------------
         # image
@@ -579,10 +623,8 @@ def smp_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     output["meta_num"] = torch.stack([x["meta_num"] for x in batch], dim=0)
     output["meta_cat"] = torch.stack([x["meta_cat"] for x in batch], dim=0)
     output["meta_bin"] = torch.stack([x["meta_bin"] for x in batch], dim=0)
-    output["user_desc"]     = torch.stack([x["user_desc"]     for x in batch], dim=0)
-    output["loc_desc"]      = torch.stack([x["loc_desc"]      for x in batch], dim=0)
-    output["has_user_desc"] = torch.stack([x["has_user_desc"].unsqueeze(0) for x in batch], dim=0)
-    output["has_loc_desc"]  = torch.stack([x["has_loc_desc"].unsqueeze(0)  for x in batch], dim=0)
+    output["user_desc"] = torch.stack([x["user_desc"] for x in batch], dim=0)
+    output["loc_desc"]  = torch.stack([x["loc_desc"]  for x in batch], dim=0)
 
     # -------------------------
     # image

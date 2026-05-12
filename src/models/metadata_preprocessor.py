@@ -8,11 +8,6 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-@dataclass
-class NumericStats:
-    median: float
-    mean: float
-    std: float
 
 EPS = 1e-8
 
@@ -94,7 +89,11 @@ def _parse_vector(x: Any, expected_dim: int) -> Optional[list]:
         return None
 
 
+from dataclasses import dataclass
 
+
+@dataclass
+class NumericStats:
     median: float
     mean: float
     std: float
@@ -193,13 +192,15 @@ class MetadataPreprocessor:
             "city",
             "country",
         ]
-        # Binary metadata should contain only real binary metadata.
-        # Old presence-flag fields are removed because availability is now
-        # inferred directly from the runtime tensors (user_desc / loc_desc / image).
         self.bin_cols = bin_cols or [
             "is_weekend",
             "is_night",
             "is_workhour",
+            "has_geo",
+            "has_title",
+            "has_tags",
+            "has_user_description",
+            # has_location_description 移除（官方資料全是 None）
             "ispro",
             "canbuypro",
             "ispublic",
@@ -232,11 +233,9 @@ class MetadataPreprocessor:
         for c in self.num_cols + self.cat_cols + self.bin_cols + self.text_cols:
             if c not in out.columns:
                 out[c] = None
-        # Raw description text may still exist for upstream feature engineering,
-        # but this preprocessor no longer parses it into vectors or presence flags.
         for c in ("user_description", "location_description"):
             if c not in out.columns:
-                out[c] = ""
+                out[c] = None
         if "label" not in out.columns:
             out["label"] = 0.0
         if "post_id" not in out.columns:
@@ -317,8 +316,40 @@ class MetadataPreprocessor:
 
         out["label"] = pd.to_numeric(out["label"], errors="coerce").fillna(0.0).astype(np.float32)
 
-        # Description embeddings are loaded by SMPDataset from .npy/.json files.
-        # No user_desc_vec / loc_desc_vec / presence columns are emitted here.
+        # ── user_description / location_description ──────────────────
+        # Parse vector strings → numpy arrays; also emit has_* flags.
+        # extra data will have None here → zeros + has_*=0.
+        zero_user = np.zeros(self.user_desc_dim, dtype=np.float32)
+        zero_loc  = np.zeros(self.loc_desc_dim,  dtype=np.float32)
+
+        user_desc_list = []
+        has_user_desc_list = []
+        for v in out["user_description"]:
+            parsed = _parse_vector(v, self.user_desc_dim)
+            if parsed is None:
+                user_desc_list.append(zero_user.copy())
+                has_user_desc_list.append(0)
+            else:
+                user_desc_list.append(np.array(parsed, dtype=np.float32))
+                has_user_desc_list.append(1)
+
+        loc_desc_list = []
+        has_loc_desc_list = []
+        for v in out["location_description"]:
+            parsed = _parse_vector(v, self.loc_desc_dim)
+            if parsed is None:
+                loc_desc_list.append(zero_loc.copy())
+                has_loc_desc_list.append(0)
+            else:
+                loc_desc_list.append(np.array(parsed, dtype=np.float32))
+                has_loc_desc_list.append(1)
+
+        # Store as object columns (each cell is a numpy array).
+        # The dataset __getitem__ will convert these to tensors.
+        out["user_desc_vec"]   = user_desc_list
+        out["loc_desc_vec"]    = loc_desc_list
+        out["has_user_desc"]   = np.array(has_user_desc_list, dtype=np.float32)
+        out["has_loc_desc"]    = np.array(has_loc_desc_list,  dtype=np.float32)
 
         return out
 

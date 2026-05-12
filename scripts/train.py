@@ -240,7 +240,51 @@ def ensure_user_aggregate_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def main() -> None:
+def add_geo_encoding_features(
+    train_df: pd.DataFrame,
+    target_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Add geo-based target encoding and frequency features.
+    Computed from train_df only, applied to target_df to avoid leakage.
+
+    Features added:
+      - country_target_enc   : mean label per country (train)
+      - city_target_enc      : mean label per city (train)
+      - country_freq         : log1p count of country in train
+      - city_freq            : log1p count of city in train
+      - location_text_target_enc : mean label per location_text (train)
+    """
+    import numpy as np
+
+    out = target_df.copy()
+    train_label = pd.to_numeric(train_df["label"], errors="coerce")
+    global_mean = float(train_label.mean()) if train_label.notna().any() else 0.0
+
+    for col in ["country", "city", "location_text"]:
+        if col not in train_df.columns:
+            continue
+
+        # Target encoding: mean label per value (from train only)
+        enc_col = f"{col}_target_enc"
+        te = (
+            train_df[[col]]
+            .assign(_label=train_label)
+            .groupby(col, dropna=True)["_label"]
+            .mean()
+            .rename(enc_col)
+        )
+        out[enc_col] = out[col].map(te).fillna(global_mean).astype(np.float32)
+
+        # Frequency: log1p count in train
+        freq_col = f"{col}_freq"
+        freq = train_df[col].value_counts(dropna=True).rename(freq_col)
+        out[freq_col] = np.log1p(out[col].map(freq).fillna(0)).astype(np.float32)
+
+    return out
+
+
+def main():
     args = parse_args()
     cfg = load_config_with_base(Path(args.config).resolve())
 
@@ -284,6 +328,11 @@ def main() -> None:
     fusion_cfg = cfg["fusion"]
     loss_cfg = cfg["loss"]
     data_cfg = cfg["data"]
+    
+    user_desc_emb_path = data_cfg.get("user_desc_emb_path")
+    user_desc_idx_path = data_cfg.get("user_desc_idx_path")
+    loc_desc_emb_path = data_cfg.get("loc_desc_emb_path")
+    loc_desc_idx_path = data_cfg.get("loc_desc_idx_path")
 
     use_text = bool(model_cfg["use_text"])
     use_meta = bool(model_cfg["use_meta"])
@@ -330,6 +379,10 @@ def main() -> None:
     train_df = add_user_aggregate_features_fold(train_df, train_df)
     val_df = add_user_aggregate_features_fold(train_df, val_df)
 
+    # geo target encoding + frequency (computed from fold-train, applied to train/val)
+    train_df = add_geo_encoding_features(train_df, train_df)
+    val_df   = add_geo_encoding_features(train_df, val_df)
+
     print(f"[INFO] Fold {args.fold}/{args.n_folds}")
     print(f"[INFO] Train rows: {len(train_df)} | Val rows: {len(val_df)}")
     print(f"[INFO] Train users: {train_df['Uid'].nunique()} | Val users: {val_df['Uid'].nunique()}")
@@ -368,6 +421,10 @@ def main() -> None:
         preprocessor=preprocessor,
         text_model_name=text_model_name,
         image_model_name=image_model_name,
+        user_desc_emb_path=user_desc_emb_path,
+        user_desc_idx_path=user_desc_idx_path,
+        loc_desc_emb_path=loc_desc_emb_path,
+        loc_desc_idx_path=loc_desc_idx_path,
         normalize_label=True,
         label_mean=label_mean,
         label_std=label_std,
@@ -385,6 +442,10 @@ def main() -> None:
         preprocessor=preprocessor,
         text_model_name=text_model_name,
         image_model_name=image_model_name,
+        user_desc_emb_path=user_desc_emb_path,
+        user_desc_idx_path=user_desc_idx_path,
+        loc_desc_emb_path=loc_desc_emb_path,
+        loc_desc_idx_path=loc_desc_idx_path,
         normalize_label=True,
         label_mean=label_mean,
         label_std=label_std,
@@ -445,6 +506,11 @@ def main() -> None:
         fusion_type=fusion_cfg["type"],
         use_clip_similarity=bool(fusion_cfg.get("use_clip_similarity", True)),
         meta_branch_dim=int(meta_cfg["branch_dim"]),
+        use_user_desc=bool(meta_cfg.get("use_user_desc", True)),
+        user_desc_dim=int(meta_cfg.get("user_desc_dim", train_dataset.user_desc_emb_dim or 768)),
+        use_loc_desc=bool(meta_cfg.get("use_loc_desc", False)),
+        loc_desc_dim=int(meta_cfg.get("loc_desc_dim", train_dataset.loc_desc_emb_dim or 400)),
+        desc_bottleneck_dim=int(meta_cfg.get("desc_bottleneck_dim", 64)),
     ).to(device)
 
     # -------------------------

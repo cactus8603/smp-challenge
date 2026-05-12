@@ -23,8 +23,6 @@ def _run_model_with_mask(
     glove_token_count: Optional[torch.Tensor],
     user_desc: Optional[torch.Tensor] = None,
     loc_desc: Optional[torch.Tensor] = None,
-    has_user_desc: Optional[torch.Tensor] = None,
-    has_loc_desc: Optional[torch.Tensor] = None,
     modality_mask: Optional[Dict[str, bool]] = None,
 ):
     return model(
@@ -39,8 +37,6 @@ def _run_model_with_mask(
         glove_token_count=glove_token_count,
         user_desc=user_desc,
         loc_desc=loc_desc,
-        has_user_desc=has_user_desc,
-        has_loc_desc=has_loc_desc,
         modality_mask=modality_mask,
     )
 
@@ -116,10 +112,8 @@ def validate(
         if glove_token_count is not None:
             glove_token_count = glove_token_count.to(device)
 
-        user_desc     = batch["user_desc"].to(device)     if "user_desc"     in batch else None
-        loc_desc      = batch["loc_desc"].to(device)      if "loc_desc"      in batch else None
-        has_user_desc = batch["has_user_desc"].to(device) if "has_user_desc" in batch else None
-        has_loc_desc  = batch["has_loc_desc"].to(device)  if "has_loc_desc"  in batch else None
+        user_desc     = batch["user_desc"].to(device) if "user_desc" in batch else None
+        loc_desc      = batch["loc_desc"].to(device)  if "loc_desc"  in batch else None
 
         outputs = _run_model_with_mask(
             model=model,
@@ -134,8 +128,6 @@ def validate(
             glove_token_count=glove_token_count,
             user_desc=user_desc,
             loc_desc=loc_desc,
-            has_user_desc=has_user_desc,
-            has_loc_desc=has_loc_desc,
             modality_mask=modality_mask,
         )
 
@@ -167,6 +159,8 @@ def validate(
         all_labels_raw.extend(labels_raw.tolist())
 
         progress.set_postfix(loss=f"{loss.item():.4f}")
+
+        # break  # debug: run only one batch
 
     avg_loss = total_loss / max(len(loader), 1)
 

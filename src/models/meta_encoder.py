@@ -231,11 +231,11 @@ class MetaEncoder(nn.Module):
         min_cat_embedding_dim: int = 4,
         max_cat_embedding_dim: int = 32,
         # ── vector description branches ──────────────────────
-        user_desc_dim: int = 400,
+        user_desc_dim: int = 768,       # sentence-transformers all-mpnet-base-v2 output dim
         loc_desc_dim: int = 400,
         desc_bottleneck_dim: int = 64,
         use_user_desc: bool = True,
-        use_loc_desc: bool = True,
+        use_loc_desc: bool = False,     # 關閉：location_description 官方資料全是 None
     ) -> None:
         super().__init__()
 
@@ -408,19 +408,15 @@ class MetaEncoder(nn.Module):
         meta_bin: Optional[torch.Tensor] = None,
         user_desc: Optional[torch.Tensor] = None,
         loc_desc: Optional[torch.Tensor] = None,
-        has_user_desc: Optional[torch.Tensor] = None,
-        has_loc_desc: Optional[torch.Tensor] = None,
         return_gate_weights: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
-            meta_num:      [B, D_num]
-            meta_cat:      [B, D_cat]
-            meta_bin:      [B, D_bin]
-            user_desc:     [B, 400]  float32; pass zeros when unavailable
-            loc_desc:      [B, 400]  float32; pass zeros when unavailable
-            has_user_desc: [B, 1]    float32; 1=valid 0=missing → output masked to 0
-            has_loc_desc:  [B, 1]    float32; 1=valid 0=missing → output masked to 0
+            meta_num:  [B, D_num]
+            meta_cat:  [B, D_cat]
+            meta_bin:  [B, D_bin]
+            user_desc: [B, 768]  float32; zeros for users without description
+            loc_desc:  [B, D]    float32; zeros when unavailable
             return_gate_weights: also return [B, N_branches] gate weights
 
         Returns:
@@ -445,22 +441,17 @@ class MetaEncoder(nn.Module):
             branch_reprs.append(self._encode_bin(meta_bin.float()))
 
         # ── user_description ──────────────────────────────────
+        # Zero vector = no description; VectorCompressor handles it naturally
         if self.use_user_desc:
             if user_desc is None:
                 user_desc = self._zero_vec(self.user_desc_encoder.input_dim, B)
-            ud_feat = self.user_desc_encoder(user_desc.float())   # [B, branch_dim]
-            if has_user_desc is not None:
-                ud_feat = ud_feat * has_user_desc.float().view(-1, 1)
-            branch_reprs.append(ud_feat)
+            branch_reprs.append(self.user_desc_encoder(user_desc.float()))
 
         # ── location_description ──────────────────────────────
         if self.use_loc_desc:
             if loc_desc is None:
                 loc_desc = self._zero_vec(self.loc_desc_encoder.input_dim, B)
-            ld_feat = self.loc_desc_encoder(loc_desc.float())     # [B, branch_dim]
-            if has_loc_desc is not None:
-                ld_feat = ld_feat * has_loc_desc.float().view(-1, 1)
-            branch_reprs.append(ld_feat)
+            branch_reprs.append(self.loc_desc_encoder(loc_desc.float()))
 
         # ── gated fusion ──────────────────────────────────────
         if len(branch_reprs) == 1:
@@ -496,8 +487,8 @@ if __name__ == "__main__":
         branch_dim=128,
         dropout=0.1,
         use_user_desc=True,
-        use_loc_desc=True,
-        user_desc_dim=400,
+        use_loc_desc=False,
+        user_desc_dim=768,
         loc_desc_dim=400,
         desc_bottleneck_dim=64,
     )
@@ -524,8 +515,6 @@ if __name__ == "__main__":
         meta_bin=meta_bin,
         user_desc=user_desc,
         loc_desc=loc_desc,
-        has_user_desc=has_user_desc,
-        has_loc_desc=has_loc_desc,
         return_gate_weights=True,
     )
 

@@ -1,6 +1,6 @@
 base: base.yaml
 
-exp_name: smp_dim_256_ModalityAwareMoEHead_cat_light_baseline_debug
+exp_name: smp_v2_MetaWeightedMoE_user_desc_geo
 
 train:
   batch_size: 512

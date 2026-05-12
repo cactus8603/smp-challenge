@@ -120,10 +120,8 @@ def train_one_epoch(
             glove_token_count = glove_token_count.to(device)
 
         # user_description / location_description
-        user_desc     = batch["user_desc"].to(device)     if "user_desc"     in batch else None
-        loc_desc      = batch["loc_desc"].to(device)      if "loc_desc"      in batch else None
-        has_user_desc = batch["has_user_desc"].to(device) if "has_user_desc" in batch else None
-        has_loc_desc  = batch["has_loc_desc"].to(device)  if "has_loc_desc"  in batch else None
+        user_desc = batch["user_desc"].to(device) if "user_desc" in batch else None
+        loc_desc  = batch["loc_desc"].to(device)  if "loc_desc"  in batch else None
 
         outputs = model(
             input_ids=input_ids,
@@ -137,8 +135,6 @@ def train_one_epoch(
             glove_token_count=glove_token_count,
             user_desc=user_desc,
             loc_desc=loc_desc,
-            has_user_desc=has_user_desc,
-            has_loc_desc=has_loc_desc,
         )
 
         preds = outputs.squeeze(-1)
@@ -169,7 +165,10 @@ def train_one_epoch(
         step += 1
         progress.set_postfix(loss=f"{loss.item():.4f}")
 
-    avg_loss = total_loss / max(len(loader), 1)
+        # Full epoch training: do not break early.
+        # break  # debug: run only one batch
+
+    avg_loss = total_loss / max(step, 1)
     avg_reg_loss = total_reg_loss / max(len(loader), 1)
     avg_rank_loss = total_rank_loss / max(len(loader), 1)
 
@@ -207,6 +206,10 @@ class Trainer:
 
         self.best_spearman = -1.0
         self.best_epoch = -1
+        self.best_lightgbm_spearman = float("-inf")
+        self.best_catboost_spearman = float("-inf")
+        self.best_lightgbm_epoch = -1
+        self.best_catboost_epoch = -1
         self.history: List[Dict] = []
 
     def fit(
@@ -242,9 +245,24 @@ class Trainer:
                 device=self.device,
             )
 
+            # Run expensive LightGBM / CatBoost monitor only when the deep model
+            # reaches a new best validation Spearman. This keeps training fast and
+            # still evaluates GBDT on the checkpoints that matter.
             gbdt_scores = {}
+            is_new_best = val_spearman > self.best_spearman
+            should_run_gbdt = (
+                monitor_gbdt
+                and is_new_best
+                and (gbdt_interval <= 1 or epoch % gbdt_interval == 0)
+            )
 
-            if monitor_gbdt and epoch % gbdt_interval == 0:
+            if should_run_gbdt:
+                self.logger.info(
+                    "[GBDT Monitor] New best deep val_spearman "
+                    f"{val_spearman:.4f} > {self.best_spearman:.4f}; "
+                    "running LightGBM/CatBoost..."
+                )
+
                 gbdt_scores = run_gbdt_monitor(
                     model=self.model,
                     train_loader=train_loader,
@@ -254,6 +272,10 @@ class Trainer:
                     run_catboost=True,
                     max_train_batches=gbdt_max_train_batches,
                     max_val_batches=gbdt_max_val_batches,
+                    save_dir=self.ckpt_dir / "gbdt",
+                    best_lightgbm_spearman=self.best_lightgbm_spearman,
+                    best_catboost_spearman=self.best_catboost_spearman,
+                    epoch=epoch,
                 )
 
                 self.logger.info(
@@ -262,6 +284,29 @@ class Trainer:
                     f"lightgbm={gbdt_scores.get('lightgbm_spearman', float('nan')):.4f} | "
                     f"catboost={gbdt_scores.get('catboost_spearman', float('nan')):.4f}"
                 )
+
+                if "lightgbm_error" in gbdt_scores:
+                    self.logger.info(f"[GBDT Monitor][LightGBM ERROR] {gbdt_scores['lightgbm_error']}")
+                if "catboost_error" in gbdt_scores:
+                    self.logger.info(f"[GBDT Monitor][CatBoost ERROR] {gbdt_scores['catboost_error']}")
+
+                lgb_score = float(gbdt_scores.get("lightgbm_spearman", float("nan")))
+                if bool(gbdt_scores.get("lightgbm_saved", False)):
+                    self.best_lightgbm_spearman = lgb_score
+                    self.best_lightgbm_epoch = epoch
+                    self.logger.info(
+                        "[GBDT Monitor] Saved new best LightGBM "
+                        f"spearman={lgb_score:.4f} to {gbdt_scores.get('lightgbm_model_path')}"
+                    )
+
+                cat_score = float(gbdt_scores.get("catboost_spearman", float("nan")))
+                if bool(gbdt_scores.get("catboost_saved", False)):
+                    self.best_catboost_spearman = cat_score
+                    self.best_catboost_epoch = epoch
+                    self.logger.info(
+                        "[GBDT Monitor] Saved new best CatBoost "
+                        f"spearman={cat_score:.4f} to {gbdt_scores.get('catboost_model_path')}"
+                    )
 
                 self.writer.add_scalar(
                     "metric_gbdt/deep_spearman",
@@ -277,6 +322,13 @@ class Trainer:
                     "metric_gbdt/catboost_spearman",
                     gbdt_scores.get("catboost_spearman", float("nan")),
                     epoch,
+                )
+            elif monitor_gbdt:
+                reason = "not a new best" if not is_new_best else "gbdt_interval skip"
+                self.logger.info(
+                    "[GBDT Monitor] skipped "
+                    f"({reason}); val_spearman={val_spearman:.4f}, "
+                    f"best={self.best_spearman:.4f}"
                 )
 
             results = validate_modality_ablation(
@@ -312,6 +364,12 @@ class Trainer:
                     "val_mae": float(val_mae),
                     "val_spearman": float(val_spearman),
                     "epoch_time_sec": float(epoch_time),
+                    "gbdt_ran": bool(should_run_gbdt),
+                    "gbdt_scores": {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in gbdt_scores.items()},
+                    "best_lightgbm_spearman": float(self.best_lightgbm_spearman),
+                    "best_lightgbm_epoch": int(self.best_lightgbm_epoch),
+                    "best_catboost_spearman": float(self.best_catboost_spearman),
+                    "best_catboost_epoch": int(self.best_catboost_epoch),
                 }
             )
 
@@ -344,11 +402,25 @@ class Trainer:
             "exp_name": self.exp_name,
             "best_epoch": self.best_epoch,
             "best_val_spearman": float(self.best_spearman),
+            "best_lightgbm_epoch": self.best_lightgbm_epoch,
+            "best_lightgbm_spearman": float(self.best_lightgbm_spearman),
+            "best_catboost_epoch": self.best_catboost_epoch,
+            "best_catboost_spearman": float(self.best_catboost_spearman),
+            "best_lightgbm_path": str(self.ckpt_dir / "gbdt" / "best_lightgbm.txt"),
+            "best_catboost_path": str(self.ckpt_dir / "gbdt" / "best_catboost.cbm"),
         }
         save_json(summary, self.exp_dir / "summary.json")
 
         self.logger.info("Training finished.")
         self.logger.info(f"Best epoch: {self.best_epoch}")
         self.logger.info(f"Best val spearman: {self.best_spearman:.4f}")
+        self.logger.info(
+            f"Best LightGBM spearman: {self.best_lightgbm_spearman:.4f} "
+            f"at epoch {self.best_lightgbm_epoch}"
+        )
+        self.logger.info(
+            f"Best CatBoost spearman: {self.best_catboost_spearman:.4f} "
+            f"at epoch {self.best_catboost_epoch}"
+        )
 
         return summary

@@ -10,7 +10,7 @@ from src.models.text_encoder import TextEncoder
 from src.models.meta_encoder import MetaEncoder
 from src.models.image_encoder import build_image_encoder
 from src.models.fusion import ConcatFusion, CrossFeatureFusion, PairwiseGatedFusion
-from src.models.head import RegressionHead, ModalityAwareMoEHead
+from src.models.head import RegressionHead, ModalityAwareMoEHead, MetaWeightedMoEHead
 
 
 class SMPFusionModel(nn.Module):
@@ -47,8 +47,8 @@ class SMPFusionModel(nn.Module):
         use_clip_similarity: bool = False,
         # ── user/location description vector branches ──
         use_user_desc: bool = True,
-        use_loc_desc: bool = True,
-        user_desc_dim: int = 400,
+        use_loc_desc: bool = False,
+        user_desc_dim: int = 768,
         loc_desc_dim: int = 400,
         desc_bottleneck_dim: int = 64,
     ) -> None:
@@ -232,6 +232,17 @@ class SMPFusionModel(nn.Module):
             use_clip_similarity=self.use_clip_similarity,
         )
 
+        # Main prediction head.  The gate receives runtime availability flags
+        # derived from actual tensors, not old presence-flag metadata columns.
+        self.MetaWeightedMoEHead = MetaWeightedMoEHead(
+            input_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            activation="relu",
+            use_skip=True,
+            n_modality_flags=3,
+        )
+
     def _infer_batch_size(
         self,
         input_ids: Optional[torch.Tensor],
@@ -294,8 +305,6 @@ class SMPFusionModel(nn.Module):
         glove_token_count: Optional[torch.Tensor] = None,
         user_desc: Optional[torch.Tensor] = None,
         loc_desc: Optional[torch.Tensor] = None,
-        has_user_desc: Optional[torch.Tensor] = None,
-        has_loc_desc: Optional[torch.Tensor] = None,
     ) -> Dict[str, Optional[torch.Tensor]]:
         batch_size = self._infer_batch_size(
             input_ids=input_ids,
@@ -398,8 +407,6 @@ class SMPFusionModel(nn.Module):
                 meta_bin=meta_bin,
                 user_desc=user_desc,
                 loc_desc=loc_desc,
-                has_user_desc=has_user_desc,
-                has_loc_desc=has_loc_desc,
             )
 
         # -------------------------
@@ -464,8 +471,6 @@ class SMPFusionModel(nn.Module):
         glove_token_count: Optional[torch.Tensor] = None,
         user_desc: Optional[torch.Tensor] = None,
         loc_desc: Optional[torch.Tensor] = None,
-        has_user_desc: Optional[torch.Tensor] = None,
-        has_loc_desc: Optional[torch.Tensor] = None,
         return_features: bool = False,
         modality_mask: Optional[Dict[str, bool]] = None,
     ):
@@ -481,28 +486,51 @@ class SMPFusionModel(nn.Module):
             glove_token_count=glove_token_count,
             user_desc=user_desc,
             loc_desc=loc_desc,
-            has_user_desc=has_user_desc,
-            has_loc_desc=has_loc_desc,
         )
 
         if modality_mask is not None:
             for name in ["text", "meta", "image"]:
                 if modality_mask.get(name, False) and features.get(name) is not None:
                     features[name] = torch.zeros_like(features[name])
-
             if modality_mask.get("text", False) or modality_mask.get("image", False):
                 if features.get("clip_sim") is not None:
                     features["clip_sim"] = torch.zeros_like(features["clip_sim"])
 
         fused = self.fusion(features)
-        # output = self.RegressionHead(fused)
 
-        output = self.ModalityAwareMoEHead(
+        B = fused.size(0)
+        device = fused.device
+
+        # Runtime availability flags for the MoE gate.
+        # Do NOT read old presence-flag metadata columns here.  A zero vector means
+        # the precomputed embedding is unavailable for that sample.
+        user_desc_available = (
+            (user_desc.to(device).abs().sum(dim=-1, keepdim=True) > 0).float()
+            if user_desc is not None
+            else torch.zeros(B, 1, device=device)
+        )
+        loc_desc_available = (
+            (loc_desc.to(device).abs().sum(dim=-1, keepdim=True) > 0).float()
+            if loc_desc is not None
+            else torch.zeros(B, 1, device=device)
+        )
+        image_available = (
+            torch.ones(B, 1, device=device)
+            if (image_tensor is not None)
+            else torch.zeros(B, 1, device=device)
+        )
+        modality_flags = torch.cat(
+            [user_desc_available, loc_desc_available, image_available],
+            dim=-1,
+        )
+
+        zero = lambda: torch.zeros(B, self.hidden_dim, device=device)
+        output = self.MetaWeightedMoEHead(
             fused=fused,
-            text_feat=features["text"],
-            meta_feat=features["meta"],
-            image_feat=features["image"],
-            clip_sim=features["clip_sim"],
+            text_feat=features["text"] if features["text"] is not None else zero(),
+            meta_feat=features["meta"] if features["meta"] is not None else zero(),
+            image_feat=features["image"] if features["image"] is not None else zero(),
+            modality_flags=modality_flags,
         )
 
         if return_features:

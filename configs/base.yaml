@@ -3,6 +3,8 @@ exp_name: base_exp
 
 data:
   official_train_path: /local/smp/processed_v2/official_train.parquet
+  user_desc_emb_path: /local/smp/processed_v2/embeddings/user_desc_embeddings.npy
+  user_desc_idx_path: /local/smp/processed_v2/embeddings/user_desc_uid_index.json
 
 model:
   use_text: true
@@ -24,7 +26,8 @@ image:
   root_dir: /local/smp/data
 
 meta:
-  branch_dim: 256
+  branch_dim: 128          # smaller than hidden_dim so gated fusion is meaningful
+  desc_bottleneck_dim: 64  # VectorCompressor: 768 → 64 → branch_dim
 
 fusion:
   type: pairwise_gated
@@ -49,7 +52,7 @@ output:
   root_dir: outputs
 
 preprocess:
-  num_cols: null
+  num_cols: null   # uses MetadataPreprocessor defaults (includes new geo/user_desc cols)
   cat_cols: null
   bin_cols: null
   log1p_cols: null

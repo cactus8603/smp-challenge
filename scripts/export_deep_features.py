@@ -114,6 +114,39 @@ def ensure_user_aggregate_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+
+
+def add_geo_encoding_features(train_df: pd.DataFrame, target_df: pd.DataFrame) -> pd.DataFrame:
+    """Same fold-safe geo features as train.py, computed from fold-train only."""
+    out = target_df.copy()
+    if "label" not in train_df.columns:
+        return out
+
+    train_label = pd.to_numeric(train_df["label"], errors="coerce")
+    global_mean = float(train_label.mean()) if train_label.notna().any() else 0.0
+
+    for col in ["country", "city", "location_text"]:
+        if col not in train_df.columns:
+            continue
+        if col not in out.columns:
+            out[col] = None
+
+        enc_col = f"{col}_target_enc"
+        te = (
+            train_df[[col]]
+            .assign(_label=train_label)
+            .groupby(col, dropna=True)["_label"]
+            .mean()
+            .rename(enc_col)
+        )
+        out[enc_col] = out[col].map(te).fillna(global_mean).astype(np.float32)
+
+        freq_col = f"{col}_freq"
+        freq = train_df[col].value_counts(dropna=True).rename(freq_col)
+        out[freq_col] = np.log1p(out[col].map(freq).fillna(0)).astype(np.float32)
+
+    return out
+
 def build_model(cfg, preprocessor, device):
     model_cfg = cfg["model"]
     text_cfg = cfg["text"]
@@ -144,6 +177,11 @@ def build_model(cfg, preprocessor, device):
         fusion_type=fusion_cfg["type"],
         meta_branch_dim=int(meta_cfg["branch_dim"]),
         use_clip_similarity=bool(fusion_cfg.get("use_clip_similarity", False)),
+        use_user_desc=bool(meta_cfg.get("use_user_desc", True)),
+        user_desc_dim=int(meta_cfg.get("user_desc_dim", 768)),
+        use_loc_desc=bool(meta_cfg.get("use_loc_desc", False)),
+        loc_desc_dim=int(meta_cfg.get("loc_desc_dim", 400)),
+        desc_bottleneck_dim=int(meta_cfg.get("desc_bottleneck_dim", 64)),
     ).to(device)
 
     return model
@@ -171,6 +209,13 @@ def export_loader(model, loader, device, label_mean, label_std) -> pd.DataFrame:
         if glove_token_count is not None:
             glove_token_count = glove_token_count.to(device)
 
+        user_desc = batch.get("user_desc", None)
+        if user_desc is not None:
+            user_desc = user_desc.to(device)
+        loc_desc = batch.get("loc_desc", None)
+        if loc_desc is not None:
+            loc_desc = loc_desc.to(device)
+
         out = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -181,6 +226,8 @@ def export_loader(model, loader, device, label_mean, label_std) -> pd.DataFrame:
             glove_tokens=batch.get("glove_tokens", None),
             glove_text=batch.get("glove_text", None),
             glove_token_count=glove_token_count,
+            user_desc=user_desc,
+            loc_desc=loc_desc,
             return_features=True,
         )
 
@@ -194,8 +241,8 @@ def export_loader(model, loader, device, label_mean, label_std) -> pd.DataFrame:
 
         data = {
             "post_id": batch["post_id"],
-            "Uid": batch["Uid"],
-            "Pid": batch["Pid"],
+            "Uid": batch.get("uid", batch.get("Uid")),
+            "Pid": batch.get("pid", batch.get("Pid")),
             "label": batch["labels"].detach().cpu().numpy() * label_std + label_mean,
             "deep_pred": pred_raw,
             "deep_pred_norm": pred_norm,
@@ -205,17 +252,15 @@ def export_loader(model, loader, device, label_mean, label_std) -> pd.DataFrame:
         if clip_sim is not None:
             data["clip_sim"] = clip_sim.squeeze(-1).detach().cpu().numpy()
 
-        df = pd.DataFrame(data)
+        feature_cols: Dict[str, np.ndarray] = {}
+        for name, arr in [("fused", fused), ("text", text), ("meta", meta), ("image", image)]:
+            for i in range(arr.shape[1]):
+                feature_cols[f"{name}_{i}"] = arr[:, i]
 
-        for i in range(fused.shape[1]):
-            df[f"fused_{i}"] = fused[:, i]
-        for i in range(text.shape[1]):
-            df[f"text_{i}"] = text[:, i]
-        for i in range(meta.shape[1]):
-            df[f"meta_{i}"] = meta[:, i]
-        for i in range(image.shape[1]):
-            df[f"image_{i}"] = image[:, i]
-
+        df = pd.concat(
+            [pd.DataFrame(data), pd.DataFrame(feature_cols)],
+            axis=1,
+        )
         rows.append(df)
 
     return pd.concat(rows, axis=0, ignore_index=True)
@@ -252,6 +297,9 @@ def main():
     train_df = add_user_aggregate_features_fold(train_df, train_df)
     val_df = add_user_aggregate_features_fold(train_df, val_df)
 
+    train_df = add_geo_encoding_features(train_df, train_df)
+    val_df = add_geo_encoding_features(train_df, val_df)
+
     label_mean = train_df["label"].mean()
     label_std = train_df["label"].std()
 
@@ -275,6 +323,10 @@ def main():
         use_image=bool(model_cfg["use_image"]),
         image_path_col=image_cfg.get("path_col", "image_path"),
         image_root_dir=image_cfg.get("root_dir", None),
+        user_desc_emb_path=data_cfg.get("user_desc_emb_path"),
+        user_desc_idx_path=data_cfg.get("user_desc_idx_path"),
+        loc_desc_emb_path=data_cfg.get("loc_desc_emb_path"),
+        loc_desc_idx_path=data_cfg.get("loc_desc_idx_path"),
         is_train=False,
     )
 
