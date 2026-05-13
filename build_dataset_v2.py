@@ -187,6 +187,269 @@ def join_unique(parts: List[Any], sep: str = " ") -> str:
     return sep.join(out).strip()
 
 
+
+# -----------------------------------------------------------------------------
+# Location parsing / enrichment
+# -----------------------------------------------------------------------------
+_COUNTRY_ALIASES = {
+    "usa": "United States",
+    "u.s.a": "United States",
+    "u.s.a.": "United States",
+    "us": "United States",
+    "u.s": "United States",
+    "u.s.": "United States",
+    "united states of america": "United States",
+    "america": "United States",
+    "uk": "United Kingdom",
+    "u.k": "United Kingdom",
+    "u.k.": "United Kingdom",
+    "gb": "United Kingdom",
+    "g.b.": "United Kingdom",
+    "great britain": "United Kingdom",
+    "england": "United Kingdom",
+    "scotland": "United Kingdom",
+    "wales": "United Kingdom",
+    "brasil": "Brazil",
+    "deutschland": "Germany",
+    "españa": "Spain",
+    "espana": "Spain",
+    "méxico": "Mexico",
+    "mexico": "Mexico",
+    "czech republic": "Czechia",
+    "russian federation": "Russia",
+    "republic of korea": "South Korea",
+    "korea": "South Korea",
+    "ru": "Russia",
+    "russia": "Russia",
+    "the netherlands": "Netherlands",
+    "taiwan": "Taiwan",
+    "taiwan, province of china": "Taiwan",
+    "taiwan province of china": "Taiwan",
+    "prc": "China",
+    "peoples republic of china": "China",
+}
+
+_KNOWN_COUNTRY_NAMES = {
+    "United States", "United Kingdom", "Canada", "Australia", "New Zealand",
+    "France", "Germany", "Italy", "Spain", "Portugal", "Netherlands", "The Netherlands", "Belgium",
+    "Switzerland", "Austria", "Ireland", "Sweden", "Norway", "Denmark", "Finland",
+    "Poland", "Czechia", "Greece", "Turkey", "Russia", "Ukraine",
+    "Japan", "South Korea", "China", "Taiwan", "Hong Kong", "Singapore",
+    "Thailand", "Malaysia", "Indonesia", "Philippines", "Vietnam", "India",
+    "Brazil", "Argentina", "Chile", "Mexico", "Colombia", "Peru",
+    "South Africa", "Egypt", "Morocco", "Israel", "United Arab Emirates",
+}
+
+_US_STATE_NAMES = {
+    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+    "Connecticut", "Delaware", "Florida", "Georgia", "Hawaii", "Idaho",
+    "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana",
+    "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+    "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada",
+    "New Hampshire", "New Jersey", "New Mexico", "New York",
+    "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon",
+    "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota",
+    "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington",
+    "West Virginia", "Wisconsin", "Wyoming", "District of Columbia",
+}
+
+_US_STATE_ABBR = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota",
+    "MS": "Mississippi", "MO": "Missouri", "MT": "Montana", "NE": "Nebraska",
+    "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
+    "NM": "New Mexico", "NY": "New York", "NC": "North Carolina",
+    "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma", "OR": "Oregon",
+    "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+    "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
+    "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
+    "DC": "District of Columbia",
+}
+
+
+def clean_location_part(value: Any) -> str:
+    s = clean_description(value)
+    if not s:
+        return ""
+    s = re.sub(r"\s+", " ", s).strip(" ,;/|")
+    if s.lower() in {"none", "nan", "null", "<na>", "unknown", "unk"}:
+        return ""
+    return s
+
+
+def is_empty_location(value: Any) -> bool:
+    return clean_location_part(value) == ""
+
+
+def normalize_country(value: Any) -> str:
+    s = clean_location_part(value)
+    if not s:
+        return ""
+
+    key = re.sub(r"[.]", "", s.lower()).strip()
+    if key in _COUNTRY_ALIASES:
+        return _COUNTRY_ALIASES[key]
+    return s
+
+
+def normalize_state(value: Any) -> str:
+    s = clean_location_part(value)
+    if not s:
+        return ""
+
+    upper = s.upper().replace(".", "")
+    if upper in _US_STATE_ABBR:
+        return _US_STATE_ABBR[upper]
+    return s
+
+
+def parse_location_text(value: Any) -> Tuple[str, str, str]:
+    """
+    Heuristically parse free-form Flickr location text into city/state/country.
+
+    Examples:
+        London, United Kingdom
+            -> city=London, state="", country=United Kingdom
+
+        Buffalo, New York, United States of America
+            -> city=Buffalo, state=New York, country=United States
+
+        France
+            -> city="", state="", country=France
+    """
+    raw = clean_location_part(value)
+    if not raw:
+        return "", "", ""
+
+    raw = raw.replace("|", ",").replace(";", ",")
+    parts = [clean_location_part(p) for p in raw.split(",")]
+    parts = [p for p in parts if p]
+
+    if not parts:
+        return "", "", ""
+
+    if len(parts) == 1:
+        original = clean_location_part(parts[0])
+        only = normalize_country(original)
+        key = re.sub(r"[.]", "", only.lower()).strip()
+
+        if only in _KNOWN_COUNTRY_NAMES or key in _COUNTRY_ALIASES:
+            return "", "", normalize_country(only)
+
+        # Handle common space-separated forms without commas:
+        #   "England UK" -> country=United Kingdom
+        #   "Paris France" -> city=Paris, country=France
+        tokens = original.split()
+        if len(tokens) >= 2:
+            last_token_country = normalize_country(tokens[-1])
+            last_key = re.sub(r"[.]", "", last_token_country.lower()).strip()
+            if last_token_country in _KNOWN_COUNTRY_NAMES or last_key in _COUNTRY_ALIASES:
+                city_guess = clean_location_part(" ".join(tokens[:-1]))
+                return city_guess, "", normalize_country(last_token_country)
+
+        # Keep one-part unknown locations as city-ish information.
+        return only, "", ""
+
+    country = normalize_country(parts[-1])
+    city = ""
+    state = ""
+
+    if len(parts) == 2:
+        city = parts[0]
+    else:
+        city = parts[0]
+        state = normalize_state(parts[-2])
+
+    return clean_location_part(city), normalize_state(state), normalize_country(country)
+
+
+def first_non_empty(*values: Any) -> str:
+    for value in values:
+        s = clean_location_part(value)
+        if s:
+            return s
+    return ""
+
+
+def enrich_location_from_text(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fill city/state/country from location_description_clean/location_description/location_text
+    while preserving existing non-empty city/state/country from official files.
+
+    This should run BEFORE add_extra_features(), because add_extra_features()
+    builds location_text and full_text from city/state/country.
+    """
+    out = df.copy()
+
+    for c in [
+        "city",
+        "state",
+        "country",
+        "location_description",
+        "location_description_clean",
+        "location_text",
+    ]:
+        if c not in out.columns:
+            out[c] = None
+
+    # Prefer cleaned user location text; fall back to raw location_description
+    # and then any pre-existing location_text.
+    source_text = [
+        first_non_empty(loc_clean, loc_raw, loc_text)
+        for loc_clean, loc_raw, loc_text in zip(
+            out["location_description_clean"],
+            out["location_description"],
+            out["location_text"],
+        )
+    ]
+
+    parsed = [parse_location_text(x) for x in source_text]
+    parsed_city = pd.Series([x[0] for x in parsed], index=out.index)
+    parsed_state = pd.Series([x[1] for x in parsed], index=out.index)
+    parsed_country = pd.Series([x[2] for x in parsed], index=out.index)
+
+    def fill_existing(existing: pd.Series, parsed_values: pd.Series, normalizer) -> pd.Series:
+        existing_clean = existing.map(clean_location_part)
+        parsed_clean = parsed_values.map(normalizer)
+        mask = existing_clean.map(lambda x: x == "")
+        return existing_clean.where(~mask, parsed_clean)
+
+    out["city"] = fill_existing(out["city"], parsed_city, clean_location_part)
+    out["state"] = fill_existing(out["state"], parsed_state, normalize_state)
+    out["country"] = fill_existing(out["country"], parsed_country, normalize_country)
+
+    # Simple presence flags, useful for later metadata binary columns.
+    out["has_city"] = out["city"].map(lambda x: int(bool(clean_location_part(x))))
+    out["has_state"] = out["state"].map(lambda x: int(bool(clean_location_part(x))))
+    out["has_country"] = out["country"].map(lambda x: int(bool(clean_location_part(x))))
+
+    LOGGER.info(
+        "Location enrichment: city=%d/%d, state=%d/%d, country=%d/%d",
+        int(out["has_city"].sum()), len(out),
+        int(out["has_state"].sum()), len(out),
+        int(out["has_country"].sum()), len(out),
+    )
+
+    for col in ["city", "state", "country"]:
+        top = (
+            out[col]
+            .map(clean_location_part)
+            .replace("", pd.NA)
+            .dropna()
+            .value_counts()
+            .head(5)
+            .to_dict()
+        )
+        if top:
+            LOGGER.info("Top %s values after enrichment: %s", col, top)
+
+    return out
+
 # -----------------------------------------------------------------------------
 # JSON loading
 # -----------------------------------------------------------------------------
@@ -606,22 +869,29 @@ def add_extra_features(
         df["location_description_clean"] = df["location_description"].map(clean_description)
     df["profile_summary_clean"] = df["profile_summary"].map(clean_description)
 
-    # location_text: include cleaned location_description plus city/state/country.
-    # city/state/country may be absent in original data; then this still works.
+    # location_text should stay clean and non-duplicated.
+    # Prefer the original cleaned free-form user location.
+    # If it is missing, fall back to city/state/country.
     loc_texts = []
     for loc_desc, city, state, country in zip(
         df["location_description_clean"], df["city"], df["state"], df["country"]
     ):
-        loc_texts.append(
-            join_unique([
-                truncate_words(loc_desc, max_location_words),
-                clean_description(city),
-                clean_description(state),
-                clean_description(country),
-            ], sep=" ")
+        loc_desc = truncate_words(loc_desc, max_location_words)
+        fallback = join_unique(
+            [
+                clean_location_part(city),
+                normalize_state(state),
+                normalize_country(country),
+            ],
+            sep=", ",
         )
+        loc_texts.append(loc_desc or fallback)
+
     df["location_text"] = loc_texts
     df["has_location_text"] = df["location_text"].map(lambda x: int(bool(safe_str(x))))
+    df["has_city"] = df["city"].map(lambda x: int(bool(clean_location_part(x))))
+    df["has_state"] = df["state"].map(lambda x: int(bool(clean_location_part(x))))
+    df["has_country"] = df["country"].map(lambda x: int(bool(clean_location_part(x))))
 
     # Full text only uses cleaned/truncated fields.
     full_texts = []
@@ -876,6 +1146,11 @@ def load_split(input_dir: Path, split: str) -> pd.DataFrame:
     else:
         LOGGER.warning("%s split: user table is empty or missing", split)
 
+    # Fill city/state/country from user location text before building location_text/full_text.
+    # This fixes processed parquet files where country/state/city are empty but
+    # location_description has values like "London, United Kingdom".
+    out = enrich_location_from_text(out)
+
     out = add_time_features(out)
     out = add_cyclic_time_features(out)
     out = add_extra_features(out)
@@ -898,7 +1173,8 @@ def load_split(input_dir: Path, split: str) -> pd.DataFrame:
         "is_weekend", "is_night", "is_workhour",
         "hour_sin", "hour_cos", "weekday_sin", "weekday_cos", "month_sin", "month_cos",
         "latitude", "longitude", "geoaccuracy", "has_geo", "lat_bin", "lon_bin", "geo_cluster",
-        "city", "state", "country", "location_description", "location_description_clean", "location_text", "has_location_text",
+        "city", "state", "country", "has_city", "has_state", "has_country",
+        "location_description", "location_description_clean", "location_text", "has_location_text",
         "pathalias", "ispublic", "mediastatus",
         "photo_firstdate", "photo_count", "ispro", "canbuypro",
         "timezone_offset", "photo_firstdatetaken", "timezone_id",

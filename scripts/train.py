@@ -240,6 +240,114 @@ def ensure_user_aggregate_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+
+
+# ---------------------------------------------------------------------
+# Location text parsing
+# ---------------------------------------------------------------------
+_LOCATION_MISSING_VALUES = {"", "nan", "none", "null", "unknown", "unk", "0", "0.0"}
+
+
+def _clean_location_component(x: Any) -> str:
+    """Normalize one location component from raw location_text/city/state/country."""
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    s = str(x).strip()
+    if not s:
+        return ""
+    s = " ".join(s.split())
+    if s.lower() in _LOCATION_MISSING_VALUES:
+        return ""
+    # Light canonicalization for common country aliases.
+    alias = {
+        "usa": "United States",
+        "u.s.a.": "United States",
+        "u.s.a": "United States",
+        "us": "United States",
+        "u.s.": "United States",
+        "united states of america": "United States",
+        "uk": "United Kingdom",
+        "u.k.": "United Kingdom",
+        "brasil": "Brazil",
+    }
+    return alias.get(s.lower(), s)
+
+
+def _is_missing_location_value(x: Any) -> bool:
+    return _clean_location_component(x) == ""
+
+
+def _parse_location_text_value(x: Any) -> tuple[str, str, str]:
+    """
+    Heuristic parser for Flickr-style location_text.
+
+    Examples:
+      "London, United Kingdom" -> city=London, country=United Kingdom
+      "Buffalo, New York, United States of America" -> city=Buffalo, state=New York, country=United States
+      "France" -> country=France
+    """
+    s = _clean_location_component(x)
+    if not s:
+        return "", "", ""
+
+    parts = [_clean_location_component(p) for p in s.split(",")]
+    parts = [p for p in parts if p]
+    if not parts:
+        return "", "", ""
+
+    if len(parts) == 1:
+        return "", "", parts[0]
+    if len(parts) == 2:
+        return parts[0], "", parts[1]
+
+    city = parts[0]
+    state = ", ".join(parts[1:-1])
+    country = parts[-1]
+    return city, state, country
+
+
+def enrich_location_from_text(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fill empty city/state/country from location_text before geo features are built.
+
+    The processed parquet currently has useful location_text but empty city/state/country.
+    This function makes those fields usable for categorical features and fold-safe
+    target/frequency encoding. Existing non-empty city/state/country values are kept.
+    """
+    out = df.copy()
+    if "location_text" not in out.columns:
+        out["location_text"] = ""
+    for col in ["city", "state", "country"]:
+        if col not in out.columns:
+            out[col] = ""
+
+    parsed = out["location_text"].map(_parse_location_text_value)
+    parsed_city = parsed.map(lambda t: t[0])
+    parsed_state = parsed.map(lambda t: t[1])
+    parsed_country = parsed.map(lambda t: t[2])
+
+    for col, parsed_col in [
+        ("city", parsed_city),
+        ("state", parsed_state),
+        ("country", parsed_country),
+    ]:
+        missing = out[col].map(_is_missing_location_value)
+        out.loc[missing, col] = parsed_col[missing]
+        out[col] = out[col].map(_clean_location_component)
+
+    # Compact debug summary; useful in logs/check script.
+    for col in ["location_text", "city", "state", "country"]:
+        non_empty = int(out[col].fillna("").astype(str).str.strip().ne("").sum())
+        print(f"[GEO] {col}: non_empty={non_empty}/{len(out)}")
+
+    return out
+
+
 def add_geo_encoding_features(
     train_df: pd.DataFrame,
     target_df: pd.DataFrame,
@@ -261,7 +369,7 @@ def add_geo_encoding_features(
     train_label = pd.to_numeric(train_df["label"], errors="coerce")
     global_mean = float(train_label.mean()) if train_label.notna().any() else 0.0
 
-    for col in ["country", "city", "location_text"]:
+    for col in ["country", "state", "city", "location_text"]:
         if col not in train_df.columns:
             continue
 
@@ -371,6 +479,10 @@ def main():
         n_folds=args.n_folds,
         group_col="Uid",
     )
+
+    # Fill empty city/state/country from location_text before geo encoding.
+    train_df = enrich_location_from_text(train_df)
+    val_df = enrich_location_from_text(val_df)
 
     # ---------------------------------------------------------
     # IMPORTANT: recompute label-derived user aggregates

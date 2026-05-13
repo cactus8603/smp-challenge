@@ -57,6 +57,17 @@ def _safe_str(x: Any, default: str = "") -> str:
     return x if x else default
 
 
+def _has_text_value(x: Any) -> int:
+    """Return 1 when a raw text-like value is present and non-empty."""
+    return int(bool(_safe_str(x, "")))
+
+
+def _has_numeric_value(x: Any) -> int:
+    """Return 1 when a raw numeric-like value is finite."""
+    v = _safe_float(x)
+    return int(v is not None and np.isfinite(v))
+
+
 def _parse_vector(x: Any, expected_dim: int) -> Optional[list]:
     """
     Parse a comma-separated vector string into a list of floats.
@@ -94,12 +105,6 @@ def _parse_vector(x: Any, expected_dim: int) -> Optional[list]:
         return None
 
 
-
-    median: float
-    mean: float
-    std: float
-
-
 class MetadataPreprocessor:
     """
     Paper-style metadata preprocessing for SMP v3 tables.
@@ -109,6 +114,9 @@ class MetadataPreprocessor:
     - binary: fill missing with 0
     - numeric: optional log1p for heavy-tail columns, median imputation, z-score normalization
     - user history style columns: context-appropriate defaults
+    - has_* presence flags are kept as ordinary binary metadata features.
+      They let the metadata encoder learn missingness patterns, but they are
+      not used for hard-coded model routing/index lookup.
     """
 
     def __init__(
@@ -123,92 +131,47 @@ class MetadataPreprocessor:
         loc_desc_dim: int = 400,
     ) -> None:
         self.num_cols = num_cols or [
-            "hour",
-            "weekday",
-            "year",
-            "month",
-            "day",
-            "weekofyear",
-            "hour_sin",
-            "hour_cos",
-            "weekday_sin",
-            "weekday_cos",
-            "month_sin",
-            "month_cos",
-            "latitude",
-            "longitude",
-            "geoaccuracy",
-            "title_len",
-            "tags_len",
-            "full_text_len",
-            "title_word_count",
-            "full_text_word_count",
-            "tag_count",
-            "avg_tag_len",
-            "title_digit_ratio",
-            "title_upper_ratio",
-            "title_punct_ratio",
-            "full_text_digit_ratio",
-            "full_text_punct_ratio",
+            "hour", "weekday", "year", "month", "day", "weekofyear",
+            "hour_sin", "hour_cos", "weekday_sin", "weekday_cos", "month_sin", "month_cos",
+            "latitude", "longitude", "geoaccuracy",
+            "title_len", "tags_len", "full_text_len",
+            "title_word_count", "full_text_word_count", "tag_count", "avg_tag_len",
+            "title_digit_ratio", "title_upper_ratio", "title_punct_ratio",
+            "full_text_digit_ratio", "full_text_punct_ratio",
             "timezone_offset",
-            "photo_count_log1p",
-            "follower_count_log1p",
-            "following_count_log1p",
-            "total_views_log1p",
-            "total_favorites_log1p",
-            "mean_views_log1p",
-            "mean_favorites_log1p",
-            "mean_tags_log1p",
-            "account_age_days_log1p",
-            "camera_age_days_log1p",
-            "follower_following_ratio",
-            "views_per_photo",
-            "favorites_per_photo",
-            "user_prev_post_count",
-            "user_mean_label",
-            "user_active_hour_mean",
-            "user_category_nunique",
+            "photo_count_log1p", "follower_count_log1p", "following_count_log1p",
+            "total_views_log1p", "total_favorites_log1p",
+            "mean_views_log1p", "mean_favorites_log1p", "mean_tags_log1p",
+            "account_age_days_log1p", "camera_age_days_log1p",
+            "follower_following_ratio", "views_per_photo", "favorites_per_photo",
+            "user_prev_post_count", "user_mean_label", "user_active_hour_mean", "user_category_nunique",
             # user_description text stats
-            "user_desc_len",
-            "user_desc_word_count",
+            "user_desc_len", "user_desc_word_count",
             # geo target encoding + frequency (computed in train.py per fold)
-            "country_target_enc",
-            "city_target_enc",
-            "location_text_target_enc",
-            "country_freq",
-            "city_freq",
-            "location_text_freq",
+            "country_target_enc", "state_target_enc", "city_target_enc", "location_text_target_enc",
+            "country_freq", "state_freq", "city_freq", "location_text_freq",
         ]
         self.cat_cols = cat_cols or [
-            "category",
-            "subcategory",
-            "concept",
-            "category_subcategory_combo",
-            "category_concept_combo",
-            "geo_cluster",
-            "timezone_id",
-            "mediastatus",
-            "mediatype",
+            "category", "subcategory", "concept",
+            "category_subcategory_combo", "category_concept_combo",
+            "geo_cluster", "timezone_id", "mediastatus", "mediatype",
             # geocode enrichment
-            "city",
-            "country",
+            "city", "state", "country",
         ]
-        # Binary metadata should contain only real binary metadata.
-        # Old presence-flag fields are removed because availability is now
-        # inferred directly from the runtime tensors (user_desc / loc_desc / image).
+        # Keep has_* as ordinary binary metadata features.
+        # These are useful missingness / availability signals for the metadata
+        # encoder. They should NOT be used through brittle hard-coded index
+        # logic such as model.set_bin_col_idx(...).
         self.bin_cols = bin_cols or [
-            "is_weekend",
-            "is_night",
-            "is_workhour",
-            "ispro",
-            "canbuypro",
-            "ispublic",
+            "is_weekend", "is_night", "is_workhour", "ispro", "canbuypro", "ispublic",
+            "has_geo", "has_title", "has_tags", "has_full_text",
+            "has_user_description", "has_location_text", "has_city", "has_state", "has_country", "has_image",
         ]
         self.text_cols = text_cols or ["title", "alltags", "full_text"]
         self.log1p_cols = log1p_cols or []
         self.normalize_numeric = normalize_numeric
         self.user_desc_dim = user_desc_dim
-        self.loc_desc_dim  = loc_desc_dim
+        self.loc_desc_dim = loc_desc_dim
 
         self.num_stats: Dict[str, NumericStats] = {}
         self.cat_vocab: Dict[str, Dict[str, int]] = {}
@@ -229,11 +192,52 @@ class MetadataPreprocessor:
 
     def _ensure_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
+
+        # Ensure raw fields used to derive presence flags exist before we create
+        # has_* columns. This keeps old datasets and newer enriched datasets
+        # compatible with the same config.
+        raw_needed = [
+            "title", "alltags", "full_text",
+            "user_description", "location_description", "location_text",
+            "city", "state", "country", "latitude", "longitude", "image_path",
+        ]
+        for c in raw_needed:
+            if c not in out.columns:
+                out[c] = None
+
+        # Derive missingness / availability features only when they are part of
+        # bin_cols. If a config explicitly provides a different bin_cols list,
+        # we respect that list and create only the requested flags.
+        if "has_geo" in self.bin_cols:
+            out["has_geo"] = (
+                out["latitude"].map(_has_numeric_value).astype(bool)
+                & out["longitude"].map(_has_numeric_value).astype(bool)
+            ).astype(np.int64)
+        if "has_title" in self.bin_cols:
+            out["has_title"] = out["title"].map(_has_text_value).astype(np.int64)
+        if "has_tags" in self.bin_cols:
+            out["has_tags"] = out["alltags"].map(_has_text_value).astype(np.int64)
+        if "has_full_text" in self.bin_cols:
+            out["has_full_text"] = out["full_text"].map(_has_text_value).astype(np.int64)
+        if "has_user_description" in self.bin_cols:
+            out["has_user_description"] = out["user_description"].map(_has_text_value).astype(np.int64)
+        if "has_location_text" in self.bin_cols:
+            out["has_location_text"] = out["location_text"].map(_has_text_value).astype(np.int64)
+        if "has_city" in self.bin_cols:
+            out["has_city"] = out["city"].map(_has_text_value).astype(np.int64)
+        if "has_state" in self.bin_cols:
+            out["has_state"] = out["state"].map(_has_text_value).astype(np.int64)
+        if "has_country" in self.bin_cols:
+            out["has_country"] = out["country"].map(_has_text_value).astype(np.int64)
+        if "has_image" in self.bin_cols:
+            out["has_image"] = out["image_path"].map(_has_text_value).astype(np.int64)
+
         for c in self.num_cols + self.cat_cols + self.bin_cols + self.text_cols:
             if c not in out.columns:
                 out[c] = None
+
         # Raw description text may still exist for upstream feature engineering,
-        # but this preprocessor no longer parses it into vectors or presence flags.
+        # and user_desc embeddings are loaded separately by SMPDataset.
         for c in ("user_description", "location_description"):
             if c not in out.columns:
                 out[c] = ""
@@ -252,7 +256,6 @@ class MetadataPreprocessor:
 
         for col in self.num_cols:
             s_raw = pd.to_numeric(df[col], errors="coerce")
-
             median = float(s_raw.median()) if s_raw.notna().any() else 0.0
             mean = float(s_raw.mean()) if s_raw.notna().any() else 0.0
             std = float(s_raw.std(ddof=0)) if s_raw.notna().any() else 1.0
@@ -318,8 +321,8 @@ class MetadataPreprocessor:
         out["label"] = pd.to_numeric(out["label"], errors="coerce").fillna(0.0).astype(np.float32)
 
         # Description embeddings are loaded by SMPDataset from .npy/.json files.
-        # No user_desc_vec / loc_desc_vec / presence columns are emitted here.
-
+        # Presence flags such as has_user_description remain ordinary binary
+        # metadata features and do not control any hard-coded routing here.
         return out
 
     def fit_transform(self, train_df: pd.DataFrame) -> pd.DataFrame:
@@ -351,7 +354,7 @@ class MetadataPreprocessor:
             "log1p_cols": self.log1p_cols,
             "normalize_numeric": self.normalize_numeric,
             "user_desc_dim": self.user_desc_dim,
-            "loc_desc_dim":  self.loc_desc_dim,
+            "loc_desc_dim": self.loc_desc_dim,
             "num_stats": {k: asdict(v) for k, v in self.num_stats.items()},
             "cat_vocab": self.cat_vocab,
             "cat_cardinalities": self.cat_cardinalities,
