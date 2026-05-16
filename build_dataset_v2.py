@@ -893,22 +893,27 @@ def add_extra_features(
     df["has_state"] = df["state"].map(lambda x: int(bool(clean_location_part(x))))
     df["has_country"] = df["country"].map(lambda x: int(bool(clean_location_part(x))))
 
-    # Full text only uses cleaned/truncated fields.
+    # Full text is post-level text only.
+    #
+    # IMPORTANT:
+    # - user_description/profile must NOT be added here anymore.
+    #   It is handled by the separate user_desc auxiliary modality.
+    # - location_text must NOT be added here anymore.
+    #   Structured geo information is handled by city/state/country and
+    #   geo target/frequency features in metadata.
+    #
+    # This keeps the CLIP text branch focused on the post itself:
+    #   title + tags + topic
     full_texts = []
-    for title, tags, category, subcategory, concept, location_text, profile, user_desc in zip(
+    for title, tags, category, subcategory, concept in zip(
         df["title_clean"],
         df["alltags_clean"],
         df["category"],
         df["subcategory"],
         df["concept"],
-        df["location_text"],
-        df["profile_summary_clean"],
-        df["user_description_clean"],
     ):
         topic = join_unique([category, subcategory, concept], sep=" ")
         tag_text = truncate_words(tags, max_tags_for_full_text)
-        # Prefer LLM profile summary if available; otherwise fall back to short clean bio.
-        profile_text = truncate_words(profile, max_profile_words) or truncate_words(user_desc, max_user_words)
 
         parts = []
         if safe_str(title):
@@ -917,13 +922,16 @@ def add_extra_features(
             parts.append("tags: " + tag_text)
         if safe_str(topic):
             parts.append("topic: " + topic)
-        if safe_str(location_text):
-            parts.append("location: " + truncate_words(location_text, max_location_words))
-        if safe_str(profile_text):
-            parts.append("profile: " + profile_text)
         full_texts.append(" | ".join(parts).strip())
 
     df["full_text"] = full_texts
+
+    # Aliases expected by MetadataPreprocessor defaults.
+    # Keep only numeric/profile-availability metadata here; the actual profile
+    # semantics enter through user_desc_embeddings.npy as a separate modality.
+    df["user_desc_len"] = df["user_description_clean"].map(lambda x: len(safe_str(x)))
+    df["user_desc_word_count"] = df["user_description_clean"].map(count_words)
+
     return df
 
 
@@ -1181,6 +1189,7 @@ def load_split(input_dir: Path, split: str) -> pd.DataFrame:
         "user_description", "user_description_clean", "profile_summary", "profile_summary_clean",
         "has_user_description", "has_location_description",
         "user_description_clean_len", "user_description_clean_word_count",
+        "user_desc_len", "user_desc_word_count",
         "location_text_len", "location_text_word_count",
         "follower_count", "following_count", "total_views", "total_favorites",
         "mean_views", "mean_favorites", "mean_tags",

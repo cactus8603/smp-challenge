@@ -1,0 +1,91 @@
+base: base_xattn.yaml
+exp_name: xattn_udcap
+train:
+  batch_size: 512
+  lr: 0.00015
+  meta_warmup_epochs: 0
+fusion:
+  type: residual_cross_attention
+  order: text_meta_first
+  use_clip_similarity: true
+  clip_similarity_mode: projected
+  num_heads: 4
+  text_res_scale: 0.5
+  meta_res_scale: 1.2
+  image_res_scale: 0.5
+  tm_res_scale: 0.75
+model:
+  head_type: regression
+  head_hidden_mult: 1.5
+  head_num_layers: 3
+  dropout: 0.1
+  use_meta_aux_head: true
+  meta_aux_scale: 0.2
+  use_meta_residual: true
+  meta_residual_init: 0.0
+  meta_residual_dropout: 0.0
+meta:
+  branch_dim: 128
+  encoder_type: ft_transformer
+  use_semantic_groups: false
+  ft_token_dim: 192
+  ft_num_layers: 3
+  ft_num_heads: 8
+  ft_ffn_mult: 2
+  ft_dropout: 0.1
+  use_user_desc: true
+  user_desc_dim: 768
+  desc_bottleneck_dim: 64
+  user_desc_scale: 0.03
+  use_loc_desc: false
+  loc_desc_scale: 0.0
+user_desc_encoder:
+  enabled: true
+  mode: sentence_transformers
+  model_name: sentence-transformers/all-mpnet-base-v2
+  uid_col: Uid
+  text_col: user_description_clean
+  fallback_text_col: user_description
+  output_dim: 768
+  batch_size: 128
+  normalize_embeddings: true
+  max_chars: 1024
+  cache_dir: /local/smp/processed_v2/embeddings/hf_user_desc
+  cache_name: all_mpnet_base_v2_user_desc
+  force_rebuild: false
+  device: null
+preprocess:
+  target_encoding_smoothing: 30.0
+  use_user_desc_lite: true
+  user_desc_lite_debug: true
+tag_embedding:
+  use: true
+  type: vec
+  source: vec
+  language: en
+  vec_path: /local/smp/fasttext/wiki-news-300d-1M.vec
+  cache_dir: /local/smp/fasttext
+  cache_path: /local/smp/fasttext/fasttext_en_300k_cache.pt
+  max_vectors: 300000
+  trainable: false
+  normalize_output: false
+loss:
+  name: hybrid
+  alpha: 1.0
+  beta: 0.55
+  gamma: 0.18
+  delta: 0.24
+  eta: 0.04
+  zeta: 0.12
+  hard_scale: 1.2
+  high_target_scale: 0.3
+  reg_max_weight: 4.0
+  min_target_diff: 0.2
+  rank_max_weight: 5.0
+  variance_floor_ratio: 0.72
+  focal_gamma: 1.3
+monitor:
+  gbdt: false
+text:
+  use_caption: true
+  caption_max_freq: 50

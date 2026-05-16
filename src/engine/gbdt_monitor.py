@@ -1,3 +1,8 @@
+# NOTE:
+# This file is included only for consistency.
+# In this patch, scripts/train.py passes monitor_gbdt=False, so LightGBM/CatBoost
+# will not be executed during the architecture-search run.
+
 from __future__ import annotations
 
 import json
@@ -37,11 +42,11 @@ def extract_deep_features(
         else:
             image_tensor = None
 
-        glove_tokens = batch.get("glove_tokens", None)
-        glove_text = batch.get("glove_text", None)
-        glove_token_count = batch.get("glove_token_count", None)
-        if glove_token_count is not None:
-            glove_token_count = glove_token_count.to(device)
+        tag_tokens = batch.get("tag_tokens", None)
+        tag_text = batch.get("tag_text", None)
+        tag_token_count = batch.get("tag_token_count", None)
+        if tag_token_count is not None:
+            tag_token_count = tag_token_count.to(device)
 
         out = model(
             input_ids=input_ids,
@@ -50,9 +55,9 @@ def extract_deep_features(
             meta_cat=meta_cat,
             meta_bin=meta_bin,
             image_tensor=image_tensor,
-            glove_tokens=glove_tokens,
-            glove_text=glove_text,
-            glove_token_count=glove_token_count,
+            tag_tokens=tag_tokens,
+            tag_text=tag_text,
+            tag_token_count=tag_token_count,
             user_desc=batch["user_desc"].to(device) if "user_desc" in batch else None,
             loc_desc=batch["loc_desc"].to(device) if "loc_desc" in batch else None,
             return_features=True,
@@ -79,7 +84,12 @@ def extract_deep_features(
 
         clip_sim = out["features"].get("clip_sim")
         if clip_sim is not None:
-            col_dict["clip_sim"] = clip_sim.squeeze(-1).detach().cpu().numpy()
+            clip_arr = clip_sim.detach().cpu().numpy()
+            if clip_arr.ndim == 1 or (clip_arr.ndim == 2 and clip_arr.shape[1] == 1):
+                col_dict["clip_sim"] = clip_arr.reshape(-1)
+            else:
+                for i in range(clip_arr.shape[1]):
+                    col_dict[f"clip_sim_{i}"] = clip_arr[:, i]
 
         rows.append(pd.DataFrame(col_dict))
 

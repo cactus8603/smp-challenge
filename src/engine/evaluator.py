@@ -18,12 +18,13 @@ def _run_model_with_mask(
     meta_cat: torch.Tensor,
     meta_bin: torch.Tensor,
     image_tensor: Optional[torch.Tensor],
-    glove_tokens,
-    glove_text,
-    glove_token_count: Optional[torch.Tensor],
+    tag_tokens,
+    tag_text,
+    tag_token_count: Optional[torch.Tensor],
     user_desc: Optional[torch.Tensor] = None,
     loc_desc: Optional[torch.Tensor] = None,
     modality_mask: Optional[Dict[str, bool]] = None,
+    meta_only: bool = False,
 ):
     return model(
         input_ids=input_ids,
@@ -32,12 +33,13 @@ def _run_model_with_mask(
         meta_cat=meta_cat,
         meta_bin=meta_bin,
         image_tensor=image_tensor,
-        glove_tokens=glove_tokens,
-        glove_text=glove_text,
-        glove_token_count=glove_token_count,
+        tag_tokens=tag_tokens,
+        tag_text=tag_text,
+        tag_token_count=tag_token_count,
         user_desc=user_desc,
         loc_desc=loc_desc,
         modality_mask=modality_mask,
+        meta_only=meta_only,
     )
 
 
@@ -49,6 +51,7 @@ def validate(
     device: str,
     modality_mask: Optional[Dict[str, bool]] = None,
     verbose_debug: bool = True,
+    meta_only: bool = False,
 ) -> Tuple[float, float, float]:
     """
     Validate model on one dataloader.
@@ -63,6 +66,7 @@ def validate(
             {"text": True} -> zero out text feature after extraction
             {"meta": True} -> zero out meta feature after extraction
             {"image": True} -> zero out image feature after extraction
+            {"user_desc": True} -> zero out user_desc auxiliary modality
         verbose_debug: whether to print prediction statistics
 
     Returns:
@@ -84,7 +88,7 @@ def validate(
     label_std = getattr(dataset, "label_std", None)
     normalize_label = getattr(dataset, "normalize_label", False)
 
-    desc = "Valid"
+    desc = "Valid[meta_only]" if meta_only else "Valid"
     if modality_mask is not None:
         masked_names = [k for k, v in modality_mask.items() if v]
         if len(masked_names) > 0:
@@ -106,11 +110,11 @@ def validate(
         else:
             image_tensor = None
 
-        glove_tokens = batch.get("glove_tokens", None)
-        glove_text = batch.get("glove_text", None)
-        glove_token_count = batch.get("glove_token_count", None)
-        if glove_token_count is not None:
-            glove_token_count = glove_token_count.to(device)
+        tag_tokens = batch.get("tag_tokens", None)
+        tag_text = batch.get("tag_text", None)
+        tag_token_count = batch.get("tag_token_count", None)
+        if tag_token_count is not None:
+            tag_token_count = tag_token_count.to(device)
 
         user_desc     = batch["user_desc"].to(device) if "user_desc" in batch else None
         loc_desc      = batch["loc_desc"].to(device)  if "loc_desc"  in batch else None
@@ -123,12 +127,13 @@ def validate(
             meta_cat=meta_cat,
             meta_bin=meta_bin,
             image_tensor=image_tensor,
-            glove_tokens=glove_tokens,
-            glove_text=glove_text,
-            glove_token_count=glove_token_count,
+            tag_tokens=tag_tokens,
+            tag_text=tag_text,
+            tag_token_count=tag_token_count,
             user_desc=user_desc,
             loc_desc=loc_desc,
             modality_mask=modality_mask,
+            meta_only=meta_only,
         )
 
         preds = outputs.squeeze(-1)  # normalized prediction space
@@ -159,8 +164,6 @@ def validate(
         all_labels_raw.extend(labels_raw.tolist())
 
         progress.set_postfix(loss=f"{loss.item():.4f}")
-
-        # break  # debug: run only one batch
 
     avg_loss = total_loss / max(len(loader), 1)
 
@@ -199,11 +202,12 @@ def validate_modality_ablation(
     verbose_debug: bool = False,
 ):
     """
-    Run validation 4 times:
+    Run validation multiple times:
     - full
     - mask_text
     - mask_meta
     - mask_image
+    - mask_user_desc
 
     Returns:
         results dict with:
@@ -212,10 +216,12 @@ def validate_modality_ablation(
             "mask_text": {...},
             "mask_meta": {...},
             "mask_image": {...},
+            "mask_user_desc": {...},
             "drop": {
                 "text": ...,
                 "meta": ...,
-                "image": ...
+                "image": ...,
+                "user_desc": ...
             }
         }
     """
@@ -224,6 +230,7 @@ def validate_modality_ablation(
         "mask_text": {"text": True},
         "mask_meta": {"meta": True},
         "mask_image": {"image": True},
+        "mask_user_desc": {"user_desc": True},
     }
 
     results = {}
@@ -248,10 +255,11 @@ def validate_modality_ablation(
         "text": base_spearman - results["mask_text"]["spearman"],
         "meta": base_spearman - results["mask_meta"]["spearman"],
         "image": base_spearman - results["mask_image"]["spearman"],
+        "user_desc": base_spearman - results["mask_user_desc"]["spearman"],
     }
 
     print("\n=== Modality Ablation Summary ===")
-    for k in ["full", "mask_text", "mask_meta", "mask_image"]:
+    for k in ["full", "mask_text", "mask_meta", "mask_image", "mask_user_desc"]:
         print(
             f"{k:>10s} | "
             f"loss={results[k]['loss']:.4f} | "
@@ -263,5 +271,6 @@ def validate_modality_ablation(
     print(f"{'text':>10s}: {results['drop']['text']:.4f}")
     print(f"{'meta':>10s}: {results['drop']['meta']:.4f}")
     print(f"{'image':>10s}: {results['drop']['image']:.4f}")
+    print(f"{'user_desc':>10s}: {results['drop']['user_desc']:.4f}")
 
     return results

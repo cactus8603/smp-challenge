@@ -39,6 +39,7 @@ if str(ROOT) not in sys.path:
 
 from src.datasets.metadata_preprocessor import MetadataPreprocessor
 from src.datasets.smp_dataset import SMPDataset, smp_collate_fn
+from src.utils.user_desc_embeddings import maybe_prepare_user_desc_embeddings
 
 
 def load_yaml(path: Path) -> Dict[str, Any]:
@@ -417,6 +418,13 @@ def main() -> None:
     print(f"[INFO] raw dataframe shape: {df.shape}")
     print(f"[INFO] path: {official_train_path}")
 
+    user_desc_emb_path, user_desc_idx_path = maybe_prepare_user_desc_embeddings(
+        cfg=cfg,
+        df=df,
+        project_root=ROOT,
+    )
+    data_cfg = cfg["data"]
+
     raw_cols_to_check = [
         "post_id",
         "Uid",
@@ -429,6 +437,8 @@ def main() -> None:
         "user_description_clean",
         "location_description_clean",
         "location_text",
+        "loc_desc_len",
+        "loc_desc_word_count",
         "country",
         "state",
         "city",
@@ -522,6 +532,8 @@ def main() -> None:
         "num__city_freq",
         "num__state_freq",
         "num__location_text_freq",
+        "num__loc_desc_len",
+        "num__loc_desc_word_count",
     ]
     for col in transformed_checks:
         summarize_transformed_column(target_tf, col)
@@ -558,8 +570,7 @@ def main() -> None:
     )
 
     print_section("4) User description embedding files")
-    user_desc_emb_path = data_cfg.get("user_desc_emb_path")
-    user_desc_idx_path = data_cfg.get("user_desc_idx_path")
+    # Paths are prepared by maybe_prepare_user_desc_embeddings() above.
     print(f"[INFO] user_desc_emb_path: {user_desc_emb_path}")
     print(f"[INFO] user_desc_idx_path: {user_desc_idx_path}")
 
@@ -696,5 +707,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-# python3 scripts/check_data_flow.py --config configs/text_meta_image_v2.yaml --fold 0 --n_folds 5 --batch_size 8

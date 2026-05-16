@@ -1,10 +1,20 @@
 base: base.yaml
-
-exp_name: smp_v2_MetaWeightedMoE_user_desc_geo
-
+exp_name: smp_v2_current_arch_oldfeat_sim_userdesclite
 train:
   batch_size: 512
-
-image:
-  path_col: image_path
-  model_name: openai/clip-vit-base-patch32
+fusion:
+  type: pairwise_gated
+  use_clip_similarity: true
+  clip_similarity_mode: raw
+meta:
+  use_semantic_groups: false
+  use_user_desc: false
+  user_desc_scale: 0.0
+preprocess:
+  use_user_desc_lite: true
+  user_desc_lite_debug: true
+tag_embedding:
+  use: True
+  type: fasttext
+monitor:
+  gbdt: false

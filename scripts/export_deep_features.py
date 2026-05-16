@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 from src.datasets.metadata_preprocessor import MetadataPreprocessor
 from src.datasets.smp_dataset import SMPDataset, smp_collate_fn
 from src.models.fusion_model import SMPFusionModel
+from src.utils.user_desc_embeddings import maybe_prepare_user_desc_embeddings
 
 
 def load_yaml(path: Path) -> Dict[str, Any]:
@@ -77,12 +78,19 @@ def _safe_nunique(series: pd.Series) -> int:
 
 
 def add_user_aggregate_features_fold(train_df: pd.DataFrame, target_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build label-derived user aggregate features using ONLY the current fold train_df,
+    then apply them to target_df. Drops stale placeholder columns before merge.
+    """
     if train_df.empty or "Uid" not in train_df.columns or "Uid" not in target_df.columns:
         return target_df
 
     work = train_df.copy()
     work["label"] = pd.to_numeric(work["label"], errors="coerce")
-    work["hour"] = pd.to_numeric(work["hour"] if "hour" in work.columns else None, errors="coerce")
+    if "hour" in work.columns:
+        work["hour"] = pd.to_numeric(work["hour"], errors="coerce")
+    else:
+        work["hour"] = np.nan
 
     agg = (
         work.groupby("Uid", dropna=True)
@@ -96,7 +104,13 @@ def add_user_aggregate_features_fold(train_df: pd.DataFrame, target_df: pd.DataF
         )
         .reset_index()
     )
-    return target_df.merge(agg, on="Uid", how="left")
+
+    agg_cols = [c for c in agg.columns if c != "Uid"]
+    out = target_df.drop(
+        columns=[c for c in agg_cols if c in target_df.columns],
+        errors="ignore",
+    )
+    return out.merge(agg, on="Uid", how="left")
 
 
 def ensure_user_aggregate_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -395,6 +409,14 @@ def main():
     model_cfg = cfg["model"]
 
     df = load_dataframe(data_cfg["official_train_path"])
+
+    user_desc_emb_path, user_desc_idx_path = maybe_prepare_user_desc_embeddings(
+        cfg=cfg,
+        df=df,
+        project_root=ROOT,
+    )
+    data_cfg = cfg["data"]
+
     df = ensure_user_aggregate_columns(df)
 
     train_df, val_df = make_fold_split(
@@ -437,8 +459,8 @@ def main():
         use_image=bool(model_cfg["use_image"]),
         image_path_col=image_cfg.get("path_col", "image_path"),
         image_root_dir=image_cfg.get("root_dir", None),
-        user_desc_emb_path=data_cfg.get("user_desc_emb_path"),
-        user_desc_idx_path=data_cfg.get("user_desc_idx_path"),
+        user_desc_emb_path=user_desc_emb_path,
+        user_desc_idx_path=user_desc_idx_path,
         loc_desc_emb_path=data_cfg.get("loc_desc_emb_path"),
         loc_desc_idx_path=data_cfg.get("loc_desc_idx_path"),
         is_train=False,

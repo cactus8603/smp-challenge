@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-import json
 import re
 from typing import Any, Dict, List, Sequence
 
-import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
@@ -49,7 +47,7 @@ class SMPDataset(Dataset):
 
     This version explicitly separates:
     - CLIP text path: short, token-budgeted text
-    - GloVe text path: cleaned lexical tokens
+    - tag text path: cleaned lexical tokens
     """
 
     def __init__(
@@ -68,11 +66,12 @@ class SMPDataset(Dataset):
         image_path_col: str = "image_path",
         image_root_dir: str | None = None,
         is_train: bool = True,
-        # precomputed description embeddings
-        user_desc_emb_path: str | None = None,   # path to user_desc .npy file
-        user_desc_idx_path: str | None = None,   # path to user_desc uid_index .json
-        loc_desc_emb_path: str | None = None,    # optional path to location_desc .npy file
-        loc_desc_idx_path: str | None = None,    # optional path to location_desc key/index .json
+        # caption handling for CLIP text
+        use_caption: bool = False,
+        caption_max_freq: int | None = 50,
+        # user_description sentence embeddings
+        user_desc_emb_path: str | None = None,   # path to .npy file
+        user_desc_idx_path: str | None = None,   # path to uid_index .json
     ) -> None:
         if not preprocessor.fitted:
             raise ValueError("preprocessor must be fitted before building SMPDataset.")
@@ -89,6 +88,8 @@ class SMPDataset(Dataset):
         self.use_image = use_image
         self.image_path_col = image_path_col
         self.is_train = is_train
+        self.use_caption = bool(use_caption)
+        self.caption_max_freq = caption_max_freq
 
         self.tokenizer = AutoTokenizer.from_pretrained(text_model_name) if use_text else None
         self.image_processor = CLIPImageProcessor.from_pretrained(image_model_name) if use_image else None
@@ -105,43 +106,41 @@ class SMPDataset(Dataset):
         self.meta_cat_dim = len(self.cat_cols)
         self.meta_bin_dim = len(self.bin_cols)
 
-        # ── precomputed description embeddings ────────────────────────
+        # ── optional caption filter for CLIP text ─────────────────────
+        self._generic_captions: set[str] = set()
+        if self.use_caption and self.caption_max_freq is not None and "caption" in self.df.columns:
+            cap = self.df["caption"].map(lambda x: safe_str(x, ""))
+            freq = cap[cap != ""].value_counts()
+            self._generic_captions = set(freq[freq > int(self.caption_max_freq)].index.tolist())
+            print(
+                f"[SMPDataset] Caption filter: {len(self._generic_captions)} generic captions "
+                f"(freq > {self.caption_max_freq}) will be skipped."
+            )
+
+        # ── user_description sentence embeddings ──────────────────────
         self.user_desc_embeddings: np.ndarray | None = None
-        self.user_desc_uid_index: dict[str, int] | None = None
+        self.user_desc_uid_index: dict | None = None
         self.user_desc_emb_dim: int = 0
 
-        self.loc_desc_embeddings: np.ndarray | None = None
-        self.loc_desc_uid_index: dict[str, int] | None = None
-        self.loc_desc_emb_dim: int = 0
-
-        def _load_embedding_pair(
-            emb_path_value: str | None,
-            idx_path_value: str | None,
-            name: str,
-        ) -> tuple[np.ndarray | None, dict[str, int] | None, int]:
-            if emb_path_value is None or idx_path_value is None:
-                return None, None, 0
-            emb_path = Path(emb_path_value)
-            idx_path = Path(idx_path_value)
-            if not emb_path.exists() or not idx_path.exists():
-                print(f"[SMPDataset] WARNING: {name} embedding files not found; disabled.")
-                return None, None, 0
-            embeddings = np.load(str(emb_path)).astype(np.float32, copy=False)
-            index = {str(k): int(v) for k, v in json.loads(idx_path.read_text(encoding="utf-8")).items()}
-            dim = int(embeddings.shape[1])
-            coverage = sum(1 for uid in self.df["Uid"].astype(str) if uid in index)
-            print(
-                f"[SMPDataset] Loaded {name} embeddings: "
-                f"shape={embeddings.shape}, coverage={coverage}/{len(self.df)} rows"
-            )
-            return embeddings, index, dim
-
-        self.user_desc_embeddings, self.user_desc_uid_index, self.user_desc_emb_dim = _load_embedding_pair(
-            user_desc_emb_path, user_desc_idx_path, "user_desc"
-        )
-        self.loc_desc_embeddings, self.loc_desc_uid_index, self.loc_desc_emb_dim = _load_embedding_pair(
-            loc_desc_emb_path, loc_desc_idx_path, "loc_desc"
-        )
+        if user_desc_emb_path is not None and user_desc_idx_path is not None:
+            import numpy as np
+            import json
+            emb_path = Path(user_desc_emb_path)
+            idx_path = Path(user_desc_idx_path)
+            if emb_path.exists() and idx_path.exists():
+                self.user_desc_embeddings = np.load(str(emb_path))
+                self.user_desc_uid_index  = json.loads(idx_path.read_text(encoding="utf-8"))
+                self.user_desc_emb_dim    = self.user_desc_embeddings.shape[1]
+                n_with_emb = sum(
+                    1 for uid in self.df["Uid"].astype(str)
+                    if uid in self.user_desc_uid_index
+                )
+                print(f"[SMPDataset] Loaded user_desc embeddings: "
+                      f"shape={self.user_desc_embeddings.shape}, "
+                      f"coverage={n_with_emb}/{len(self.df)} rows")
+            else:
+                print(f"[SMPDataset] WARNING: user_desc_emb_path or idx_path not found, "
+                      f"user_desc embeddings disabled.")
 
         required_cols = self.num_cols + self.cat_cols + self.bin_cols + [
             "title",
@@ -218,7 +217,7 @@ class SMPDataset(Dataset):
                 break
         return selected
 
-    def is_valid_glove_token(self, token: str) -> bool:
+    def is_valid_tag_token(self, token: str) -> bool:
         token = safe_str(token, "").lower()
         if not token:
             return False
@@ -244,6 +243,31 @@ class SMPDataset(Dataset):
         )
         return len(encoded["input_ids"])
 
+    def _get_caption_text(self, row: pd.Series) -> str:
+        """Return a usable caption string, or empty if disabled/generic/missing."""
+        if not self.use_caption:
+            return ""
+        caption = safe_str(row.get("caption", ""))
+        if not caption:
+            return ""
+        if caption in self._generic_captions:
+            return ""
+        return caption
+
+    def _append_part_if_fits(
+        self,
+        parts: List[str],
+        new_part: str,
+        max_tokens: int,
+    ) -> List[str]:
+        """Append a CLIP text part only if it stays inside the token budget."""
+        if not new_part:
+            return parts
+        candidate = " | ".join([p for p in parts + [new_part] if p]).strip()
+        if self.count_clip_tokens(candidate) <= max_tokens:
+            return parts + [new_part]
+        return parts
+
     def build_clip_text(
         self,
         row: pd.Series,
@@ -258,6 +282,7 @@ class SMPDataset(Dataset):
         category = safe_str(row.get("category", ""))
         subcategory = safe_str(row.get("subcategory", ""))
         concept = safe_str(row.get("concept", ""))
+        caption = self._get_caption_text(row)
 
         tags = self.select_tags(row.get("alltags", ""), max_tags=max_tags)
 
@@ -289,6 +314,7 @@ class SMPDataset(Dataset):
             final_parts.append("tags: " + " ".join(kept_tags))
         if topic_text:
             final_parts.append(topic_text)
+        final_parts = self._append_part_if_fits(final_parts, f"caption: {caption}" if caption else "", max_tokens)
 
         final_text = " | ".join([p for p in final_parts if p]).strip()
 
@@ -302,6 +328,7 @@ class SMPDataset(Dataset):
                     shrink_parts.append("tags: " + " ".join(kept_tags))
                 if topic_text:
                     shrink_parts.append(topic_text)
+                shrink_parts = self._append_part_if_fits(shrink_parts, f"caption: {caption}" if caption else "", max_tokens)
                 candidate_text = " | ".join([p for p in shrink_parts if p]).strip()
                 if self.count_clip_tokens(candidate_text) <= max_tokens:
                     final_text = candidate_text
@@ -320,7 +347,7 @@ class SMPDataset(Dataset):
 
         return final_text
 
-    def build_glove_tokens(
+    def build_tag_tokens(
         self,
         row: pd.Series,
         max_title_tokens: int = 24,
@@ -328,7 +355,7 @@ class SMPDataset(Dataset):
         max_topic_tokens: int = 8,
     ) -> List[str]:
         """
-        Build a cleaned token list for future GloVe / lexical features.
+        Build a cleaned token list for future tag / lexical features.
         This is separate from CLIP text.
         """
         title = safe_str(row.get("title", ""))
@@ -336,22 +363,22 @@ class SMPDataset(Dataset):
         subcategory = safe_str(row.get("subcategory", ""))
         concept = safe_str(row.get("concept", ""))
 
-        title_tokens = [t for t in self.simple_tokenize(title) if self.is_valid_glove_token(t)][:max_title_tokens]
+        title_tokens = [t for t in self.simple_tokenize(title) if self.is_valid_tag_token(t)][:max_title_tokens]
         tag_tokens = [
             t.lower()
             for t in self.select_tags(row.get("alltags", ""), max_tags=max_tag_tokens)
-            if self.is_valid_glove_token(t.lower())
+            if self.is_valid_tag_token(t.lower())
         ]
         topic_text = " ".join(
             self.dedup_preserve_order([x for x in [category, subcategory, concept] if x], lowercase_key=False)
         )
-        topic_tokens = [t for t in self.simple_tokenize(topic_text) if self.is_valid_glove_token(t)][:max_topic_tokens]
+        topic_tokens = [t for t in self.simple_tokenize(topic_text) if self.is_valid_tag_token(t)][:max_topic_tokens]
 
         tokens = self.dedup_preserve_order(title_tokens + tag_tokens + topic_tokens, lowercase_key=True)
         return tokens
 
-    def build_glove_text(self, row: pd.Series) -> str:
-        return " ".join(self.build_glove_tokens(row))
+    def build_tag_text(self, row: pd.Series) -> str:
+        return " ".join(self.build_tag_tokens(row))
 
     def build_text(self, row: pd.Series) -> str:
         """
@@ -388,8 +415,8 @@ class SMPDataset(Dataset):
         row = self.df.iloc[idx]
         clip_text = self.build_clip_text(row)
         clip_token_count_raw = self.count_clip_tokens(clip_text)
-        glove_tokens = self.build_glove_tokens(row)
-        glove_text = " ".join(glove_tokens)
+        tag_tokens = self.build_tag_tokens(row)
+        tag_text = " ".join(tag_tokens)
 
         debug_row: Dict[str, Any] = {
             "idx": idx,
@@ -399,14 +426,16 @@ class SMPDataset(Dataset):
             "label": _safe_float(row.get("label", 0.0)),
             "title": safe_str(row.get("title", "")),
             "alltags": safe_str(row.get("alltags", "")),
+            "caption_preview": safe_str(row.get("caption", ""))[:text_preview_chars],
+            "caption_used": int(bool(self._get_caption_text(row))),
             "full_text_preview": safe_str(row.get("full_text", ""))[:text_preview_chars],
             "clip_text_preview": clip_text[:text_preview_chars],
             "clip_text_len_chars": len(clip_text),
             "clip_token_count_raw": clip_token_count_raw,
             "clip_was_truncated": int(clip_token_count_raw > 77),
-            "glove_text_preview": glove_text[:text_preview_chars],
-            "glove_token_count": len(glove_tokens),
-            "glove_tokens_preview": glove_tokens[:20],
+            "tag_text_preview": tag_text[:text_preview_chars],
+            "tag_token_count": len(tag_tokens),
+            "tag_tokens_preview": tag_tokens[:20],
         }
 
         if self.use_meta:
@@ -444,8 +473,8 @@ class SMPDataset(Dataset):
         # text
         # -------------------------
         clip_text = self.build_clip_text(row)
-        glove_tokens = self.build_glove_tokens(row)
-        glove_text = " ".join(glove_tokens)
+        tag_tokens = self.build_tag_tokens(row)
+        tag_text = " ".join(tag_tokens)
 
         if self.use_text:
             raw_encoded = self.tokenizer(
@@ -482,9 +511,9 @@ class SMPDataset(Dataset):
             item["clip_token_count"] = torch.tensor(0, dtype=torch.long)
             item["clip_was_truncated"] = torch.tensor(0, dtype=torch.long)
 
-        item["glove_text"] = glove_text
-        item["glove_tokens"] = glove_tokens
-        item["glove_token_count"] = torch.tensor(len(glove_tokens), dtype=torch.long)
+        item["tag_text"] = tag_text
+        item["tag_tokens"] = tag_tokens
+        item["tag_token_count"] = torch.tensor(len(tag_tokens), dtype=torch.long)
 
         # -------------------------
         # metadata
@@ -503,15 +532,15 @@ class SMPDataset(Dataset):
                 dtype=torch.float32,
             )
 
-            uid_str = safe_str(row.get("Uid", ""))
-
-            # user_description sentence embedding.  Missing index → zero vector.
+            # ── user_description sentence embedding ───────────────────
+            import numpy as _np
             if self.user_desc_embeddings is not None and self.user_desc_uid_index is not None:
+                uid_str = safe_str(row.get("Uid", ""))
                 emb_idx = self.user_desc_uid_index.get(uid_str, None)
                 vec = (
                     self.user_desc_embeddings[emb_idx]
                     if emb_idx is not None
-                    else np.zeros(self.user_desc_emb_dim, dtype=np.float32)
+                    else _np.zeros(self.user_desc_emb_dim, dtype=_np.float32)
                 )
                 item["user_desc"] = torch.tensor(vec, dtype=torch.float32)
             else:
@@ -520,20 +549,7 @@ class SMPDataset(Dataset):
                     dtype=torch.float32,
                 )
 
-            # Optional location/profile embedding.  Same uid-based convention by default.
-            if self.loc_desc_embeddings is not None and self.loc_desc_uid_index is not None:
-                emb_idx = self.loc_desc_uid_index.get(uid_str, None)
-                vec = (
-                    self.loc_desc_embeddings[emb_idx]
-                    if emb_idx is not None
-                    else np.zeros(self.loc_desc_emb_dim, dtype=np.float32)
-                )
-                item["loc_desc"] = torch.tensor(vec, dtype=torch.float32)
-            else:
-                item["loc_desc"] = torch.zeros(
-                    self.loc_desc_emb_dim or self.preprocessor.loc_desc_dim,
-                    dtype=torch.float32,
-                )
+            item["loc_desc"] = torch.zeros(self.preprocessor.loc_desc_dim, dtype=torch.float32)
 
         else:
             item["meta_num"] = torch.zeros(self.meta_num_dim, dtype=torch.float32)
@@ -542,9 +558,7 @@ class SMPDataset(Dataset):
             item["user_desc"] = torch.zeros(
                 self.user_desc_emb_dim or self.preprocessor.user_desc_dim, dtype=torch.float32
             )
-            item["loc_desc"] = torch.zeros(
-                self.loc_desc_emb_dim or self.preprocessor.loc_desc_dim, dtype=torch.float32
-            )
+            item["loc_desc"] = torch.zeros(self.preprocessor.loc_desc_dim, dtype=torch.float32)
 
         # -------------------------
         # image
@@ -648,9 +662,9 @@ def smp_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     output["clip_token_count_raw"] = torch.stack([x["clip_token_count_raw"] for x in batch], dim=0)
     output["clip_token_count"] = torch.stack([x["clip_token_count"] for x in batch], dim=0)
     output["clip_was_truncated"] = torch.stack([x["clip_was_truncated"] for x in batch], dim=0)
-    output["glove_text"] = [x.get("glove_text", "") for x in batch]
-    output["glove_tokens"] = [x.get("glove_tokens", []) for x in batch]
-    output["glove_token_count"] = torch.stack([x["glove_token_count"] for x in batch], dim=0)
+    output["tag_text"] = [x.get("tag_text", "") for x in batch]
+    output["tag_tokens"] = [x.get("tag_tokens", []) for x in batch]
+    output["tag_token_count"] = torch.stack([x["tag_token_count"] for x in batch], dim=0)
 
     return output
 
@@ -769,8 +783,8 @@ def debug_batch(
             "clip_token_count_raw": int(batch["clip_token_count_raw"][i].item()) if "clip_token_count_raw" in batch else 0,
             "clip_token_count": int(batch["clip_token_count"][i].item()) if "clip_token_count" in batch else 0,
             "clip_was_truncated": int(batch["clip_was_truncated"][i].item()) if "clip_was_truncated" in batch else 0,
-            "glove_text_preview": batch["glove_text"][i][:180] if "glove_text" in batch else "",
-            "glove_token_count": int(batch["glove_token_count"][i].item()) if "glove_token_count" in batch else 0,
+            "tag_text_preview": batch["tag_text"][i][:180] if "tag_text" in batch else "",
+            "tag_token_count": int(batch["tag_token_count"][i].item()) if "tag_token_count" in batch else 0,
             "seq_len": int(attention_mask[i].sum().item()) if attention_mask.ndim == 2 else 0,
             "meta_num_mean": float(meta_num[i].mean().item()) if meta_num.ndim >= 2 and meta_num.shape[1] > 0 else 0.0,
             "meta_num_std": float(meta_num[i].std().item()) if meta_num.ndim >= 2 and meta_num.shape[1] > 1 else 0.0,

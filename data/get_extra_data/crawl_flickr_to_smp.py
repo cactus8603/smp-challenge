@@ -27,6 +27,9 @@ Usage:
       --resume \\
       --dedupe_on_image_path
 
+nohup ./run_smp_category_crawl_v3.sh > /local/smp/logs/main_v3.log 2>&1 &
+echo $!
+
 Required env:
   FLICKR_API_KEY   — your Flickr API key
 """

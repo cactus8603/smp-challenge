@@ -342,3 +342,191 @@ class PairwiseGatedFusion(BaseFusion):
         final_input = torch.cat(final_parts, dim=-1)
         fused = self.final_fusion(final_input) + self.final_skip(final_input)
         return fused
+
+class ResidualCrossAttentionFusion(BaseFusion):
+    """
+    Non-MoE residual cross-attention fusion for text/meta/image.
+
+    Design goals:
+    - Fuse at the representation level, not at the prediction/expert level.
+    - Default: text + metadata interact first; image is added after that.
+    - Optional: image + metadata can interact first for ablation.
+    - No softmax competition between modalities.
+    - Use concat pooling instead of mean pooling so metadata is not averaged away.
+    - Preserve each modality through explicit learnable residual scales.
+
+    Inputs expected in features:
+        text: [B, H]
+        meta: [B, H]
+        image: [B, H]
+        clip_sim: optional [B, extra_dim]
+    Output:
+        fused: [B, output_dim]
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 256,
+        output_dim: int = 256,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        use_layernorm: bool = True,
+        extra_dim: int = 0,
+        meta_res_scale: float = 1.20,
+        text_res_scale: float = 0.50,
+        image_res_scale: float = 0.50,
+        tm_res_scale: float = 0.75,
+        max_res_scale: float = 3.0,
+        order: str = "text_meta_first",
+    ) -> None:
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError(
+                f"hidden_dim={hidden_dim} must be divisible by num_heads={num_heads}."
+            )
+
+        act_layer = _get_activation(activation)
+        self.hidden_dim = int(hidden_dim)
+        self.output_dim = int(output_dim)
+        self.extra_dim = int(extra_dim)
+        self.max_res_scale = float(max_res_scale)
+        self.order = str(order or "text_meta_first").lower()
+        if self.order not in {"text_meta_first", "image_meta_first"}:
+            raise ValueError(f"Unsupported ResidualCrossAttentionFusion order: {order}")
+
+        self.tm_type_embed = nn.Parameter(torch.zeros(1, 2, hidden_dim))
+        self.tmi_type_embed = nn.Parameter(torch.zeros(1, 2, hidden_dim))
+        nn.init.normal_(self.tm_type_embed, mean=0.0, std=0.02)
+        nn.init.normal_(self.tmi_type_embed, mean=0.0, std=0.02)
+
+        self.tm_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.tmi_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.tm_norm = nn.LayerNorm(hidden_dim) if use_layernorm else nn.Identity()
+        self.tmi_norm = nn.LayerNorm(hidden_dim) if use_layernorm else nn.Identity()
+
+        self.tm_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 4, output_dim),  # text_ctx, meta_ctx, raw text, raw meta
+            nn.LayerNorm(output_dim) if use_layernorm else nn.Identity(),
+            act_layer(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(output_dim, output_dim),
+            nn.LayerNorm(output_dim) if use_layernorm else nn.Identity(),
+        )
+
+        self.text_res = nn.Linear(hidden_dim, output_dim)
+        self.meta_res = nn.Linear(hidden_dim, output_dim)
+        self.image_res = nn.Linear(hidden_dim, output_dim)
+        self.tm_res = nn.Linear(output_dim, output_dim)
+
+        # Independent learnable scales, intentionally NOT softmax-normalized.
+        # Multiple modalities can be strong at the same time.
+        self.meta_res_scale = nn.Parameter(torch.tensor(float(meta_res_scale)))
+        self.text_res_scale = nn.Parameter(torch.tensor(float(text_res_scale)))
+        self.image_res_scale = nn.Parameter(torch.tensor(float(image_res_scale)))
+        self.tm_res_scale = nn.Parameter(torch.tensor(float(tm_res_scale)))
+
+        final_input_dim = output_dim * 6 + self.extra_dim
+        # concat = tm_ctx, image_ctx, tm_repr, text_res, meta_res, image_res, optional sim
+        self.final_proj = nn.Sequential(
+            nn.Linear(final_input_dim, output_dim * 2),
+            nn.LayerNorm(output_dim * 2) if use_layernorm else nn.Identity(),
+            act_layer(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(output_dim * 2, output_dim),
+            nn.LayerNorm(output_dim) if use_layernorm else nn.Identity(),
+            act_layer(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(output_dim, output_dim),
+            nn.LayerNorm(output_dim) if use_layernorm else nn.Identity(),
+        )
+        self.final_skip = nn.Linear(final_input_dim, output_dim)
+
+    def _validate_feature(self, feat: Optional[torch.Tensor], name: str) -> torch.Tensor:
+        if feat is None:
+            raise ValueError(f"ResidualCrossAttentionFusion requires '{name}' feature, but got None.")
+        if feat.ndim != 2:
+            raise ValueError(f"Feature '{name}' must have shape [B, D], got {tuple(feat.shape)}")
+        if feat.size(1) != self.hidden_dim:
+            raise ValueError(
+                f"Feature '{name}' dim mismatch: expected {self.hidden_dim}, got {feat.size(1)}"
+            )
+        return feat
+
+    def _scale(self, p: torch.Tensor) -> torch.Tensor:
+        return p.clamp(0.0, self.max_res_scale)
+
+    def _attn_block(
+        self,
+        attn: nn.MultiheadAttention,
+        norm: nn.Module,
+        tokens: torch.Tensor,
+        type_embed: torch.Tensor,
+    ) -> torch.Tensor:
+        x = tokens + type_embed[:, : tokens.size(1), :]
+        attn_out, _ = attn(x, x, x, need_weights=False)
+        return norm(x + attn_out)
+
+    def forward(self, features: Dict[str, Optional[torch.Tensor]]) -> torch.Tensor:
+        text_feat = self._validate_feature(features.get("text", None), "text")
+        meta_feat = self._validate_feature(features.get("meta", None), "meta")
+        image_feat = self._validate_feature(features.get("image", None), "image")
+
+        # Stage 1: one strong modality interacts with metadata first.
+        # Default is text_meta_first because text/meta have been the strongest
+        # signals in our ablations. image_meta_first is available for ablation
+        # if image drop becomes larger than meta drop.
+        if self.order == "text_meta_first":
+            early_a = text_feat
+            early_b = meta_feat
+            late_feat = image_feat
+        else:  # image_meta_first
+            early_a = image_feat
+            early_b = meta_feat
+            late_feat = text_feat
+
+        early_tokens = torch.stack([early_a, early_b], dim=1)  # [B, 2, H]
+        early_tokens = self._attn_block(self.tm_attn, self.tm_norm, early_tokens, self.tm_type_embed)
+        early_a_ctx = early_tokens[:, 0, :]
+        meta_ctx = early_tokens[:, 1, :]
+
+        # Concat pooling avoids averaging metadata away.
+        early_repr = self.tm_proj(torch.cat([early_a_ctx, meta_ctx, early_a, meta_feat], dim=-1))
+
+        # Stage 2: early representation interacts with the remaining modality.
+        late_tokens = torch.stack([early_repr, late_feat], dim=1)  # [B, 2, H]
+        late_tokens = self._attn_block(self.tmi_attn, self.tmi_norm, late_tokens, self.tmi_type_embed)
+        tm_ctx = late_tokens[:, 0, :]
+        image_ctx = late_tokens[:, 1, :]
+
+        text_r = self._scale(self.text_res_scale) * self.text_res(text_feat)
+        meta_r = self._scale(self.meta_res_scale) * self.meta_res(meta_feat)
+        image_r = self._scale(self.image_res_scale) * self.image_res(image_feat)
+        tm_r = self._scale(self.tm_res_scale) * self.tm_res(early_repr)
+
+        final_parts = [tm_ctx, image_ctx, tm_r, text_r, meta_r, image_r]
+
+        if self.extra_dim > 0:
+            extra_feat = features.get("clip_sim", None)
+            if extra_feat is None:
+                raise ValueError("ResidualCrossAttentionFusion expected 'clip_sim' but got None.")
+            if extra_feat.ndim != 2 or extra_feat.size(1) != self.extra_dim:
+                raise ValueError(
+                    f"clip_sim dim mismatch: expected [B, {self.extra_dim}], got {tuple(extra_feat.shape)}"
+                )
+            final_parts.append(extra_feat)
+
+        final_input = torch.cat(final_parts, dim=-1)
+        return self.final_proj(final_input) + self.final_skip(final_input)
+

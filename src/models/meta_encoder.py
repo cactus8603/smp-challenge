@@ -1,7 +1,6 @@
-
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -12,52 +11,33 @@ def build_mlp(
     input_dim: int,
     hidden_dims: List[int],
     dropout: float = 0.1,
-    activation: str = "relu",
+    activation: str = "gelu",
     use_layernorm: bool = True,
 ) -> nn.Sequential:
-    """
-    Build a configurable MLP block.
-
-    Example:
-        input_dim=16, hidden_dims=[128, 256]
-        -> Linear(16,128) -> Act -> LN -> Dropout
-        -> Linear(128,256) -> Act -> LN -> Dropout
-    """
-    if activation.lower() == "relu":
-        act_layer = nn.ReLU
-    elif activation.lower() == "gelu":
-        act_layer = nn.GELU
-    else:
-        raise ValueError(f"Unsupported activation: {activation}")
-
+    if input_dim <= 0:
+        raise ValueError("build_mlp input_dim must be positive.")
     if not hidden_dims:
-        raise ValueError("build_mlp requires at least one hidden_dim.")
+        raise ValueError("build_mlp requires at least one hidden dim.")
 
-    layers = []
-    prev_dim = input_dim
+    act_layer = nn.GELU if activation.lower() == "gelu" else nn.ReLU
 
-    for hidden_dim in hidden_dims:
-        layers.append(nn.Linear(prev_dim, hidden_dim))
+    layers: List[nn.Module] = []
+    prev = input_dim
+    for h in hidden_dims:
+        layers.append(nn.Linear(prev, h))
         if use_layernorm:
-            layers.append(nn.LayerNorm(hidden_dim))  # Pre-LN: before activation
+            layers.append(nn.LayerNorm(h))
         layers.append(act_layer())
         if dropout > 0:
             layers.append(nn.Dropout(dropout))
-        prev_dim = hidden_dim
-
+        prev = h
     return nn.Sequential(*layers)
 
 
 class VectorCompressor(nn.Module):
     """
-    Compress a high-dimensional pre-computed vector (e.g. user_description 400-dim)
-    into branch_dim via a small bottleneck MLP.
-
-    Architecture:
-        Linear(input_dim, bottleneck_dim) -> LayerNorm -> GELU -> Dropout
-        -> Linear(bottleneck_dim, output_dim) -> LayerNorm -> GELU -> Dropout
-
-    Missing vectors are represented as all-zero input vectors by the dataset.
+    Compress high-dimensional precomputed vectors, e.g. user_desc embeddings.
+    Kept here because fusion_model imports it from meta_encoder.py.
     """
 
     def __init__(
@@ -81,136 +61,545 @@ class VectorCompressor(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return self.net(x.float())
 
 
-class CategoricalEmbeddingEncoder(nn.Module):
-    """
-    Encode multiple categorical fields with separate embeddings.
-
-    Args:
-        cardinalities:
-            Number of categories for each categorical field.
-            Each field is expected to already be integer-encoded and include an UNK id.
-        embedding_dim:
-            If fixed_embedding_dim is None, each field uses:
-                min(max_embedding_dim, max(min_embedding_dim, ceil(sqrt(cardinality))))
-        output_dim:
-            Project concatenated embeddings to this dimension.
-    """
-
+class FieldwiseCategoricalEncoder(nn.Module):
     def __init__(
         self,
         cardinalities: Sequence[int],
         output_dim: int,
-        hidden_dims: Optional[List[int]] = None,
+        dropout: float = 0.1,
         fixed_embedding_dim: Optional[int] = None,
         min_embedding_dim: int = 4,
         max_embedding_dim: int = 32,
-        dropout: float = 0.1,
-        activation: str = "relu",
-        use_layernorm: bool = True,
     ) -> None:
         super().__init__()
-
         self.cardinalities = list(cardinalities)
         self.num_fields = len(self.cardinalities)
+        self.output_dim = output_dim
 
         if self.num_fields == 0:
             self.embeddings = nn.ModuleList()
-            self.total_embedding_dim = 0
-            self.encoder = None
-            self.output_dim = 0
+            self.proj = None
             return
 
         embedding_dims: List[int] = []
         for card in self.cardinalities:
-            if card <= 0:
-                raise ValueError(f"Invalid categorical cardinality: {card}")
+            card = max(int(card), 1)
             if fixed_embedding_dim is not None:
-                emb_dim = fixed_embedding_dim
+                emb_dim = int(fixed_embedding_dim)
             else:
                 emb_dim = int(card ** 0.5)
                 emb_dim = max(min_embedding_dim, emb_dim)
                 emb_dim = min(max_embedding_dim, emb_dim)
             embedding_dims.append(emb_dim)
 
-        self.embeddings = nn.ModuleList(
-            [nn.Embedding(cardinality, emb_dim) for cardinality, emb_dim in zip(self.cardinalities, embedding_dims)]
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(max(int(card), 1), int(dim))
+            for card, dim in zip(self.cardinalities, embedding_dims)
+        ])
+        total_dim = int(sum(embedding_dims))
+        self.proj = nn.Sequential(
+            nn.Linear(total_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
-        self.total_embedding_dim = sum(embedding_dims)
 
-        if hidden_dims is None:
-            hidden_dims = [max(output_dim, 64), output_dim]
-
-        self.encoder = build_mlp(
-            input_dim=self.total_embedding_dim,
-            hidden_dims=hidden_dims,
-            dropout=dropout,
-            activation=activation,
-            use_layernorm=use_layernorm,
-        )
-        self.output_dim = hidden_dims[-1]
-
-        if self.output_dim != output_dim:
-            self.proj = nn.Linear(self.output_dim, output_dim)
-            self.output_dim = output_dim
-        else:
-            self.proj = None
-
-    def forward(self, meta_cat: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            meta_cat: [B, D_cat], integer ids for each categorical field
-
-        Returns:
-            cat_repr: [B, output_dim]
-        """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.num_fields == 0:
-            batch_size = meta_cat.size(0)
-            return meta_cat.new_zeros((batch_size, 0), dtype=torch.float32)
+            return x.new_zeros((x.size(0), 0), dtype=torch.float32)
 
-        if meta_cat.dim() != 2 or meta_cat.size(1) != self.num_fields:
-            raise ValueError(
-                f"Expected meta_cat shape [B, {self.num_fields}], got {tuple(meta_cat.shape)}"
+        embs = []
+        x = x.long()
+        for i, emb in enumerate(self.embeddings):
+            ids = x[:, i].clamp(min=0, max=emb.num_embeddings - 1)
+            embs.append(emb(ids))
+        return self.proj(torch.cat(embs, dim=-1))
+
+
+def _clean_col_name(name: str) -> str:
+    for prefix in ("num__", "cat__", "bin__"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+class SemanticMetaGroupEncoder(nn.Module):
+    """
+    Encode one semantic metadata group.
+
+    This keeps the semantic grouping idea, but avoids a Transformer inside
+    metadata. Each group produces one token, then tokens are combined by a
+    learned soft gate.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        num_indices: Sequence[int],
+        cat_indices: Sequence[int],
+        bin_indices: Sequence[int],
+        cat_cardinalities: Sequence[int],
+        group_dim: int,
+        dropout: float = 0.1,
+        fixed_cat_embedding_dim: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.name = name
+        self.num_indices = list(num_indices)
+        self.cat_indices = list(cat_indices)
+        self.bin_indices = list(bin_indices)
+
+        self.register_buffer("_num_idx", torch.tensor(self.num_indices, dtype=torch.long), persistent=False)
+        self.register_buffer("_cat_idx", torch.tensor(self.cat_indices, dtype=torch.long), persistent=False)
+        self.register_buffer("_bin_idx", torch.tensor(self.bin_indices, dtype=torch.long), persistent=False)
+
+        self.use_num = len(self.num_indices) > 0
+        self.use_cat = len(self.cat_indices) > 0
+        self.use_bin = len(self.bin_indices) > 0
+
+        part_count = int(self.use_num) + int(self.use_cat) + int(self.use_bin)
+        if part_count == 0:
+            raise ValueError(f"Semantic group {name} is empty.")
+
+        if self.use_num:
+            self.num_encoder = build_mlp(
+                input_dim=len(self.num_indices),
+                hidden_dims=[max(group_dim, 64), group_dim],
+                dropout=dropout,
+                activation="gelu",
+                use_layernorm=True,
+            )
+        else:
+            self.num_encoder = None
+
+        if self.use_cat:
+            selected_cards = [int(cat_cardinalities[i]) for i in self.cat_indices]
+            self.cat_encoder = FieldwiseCategoricalEncoder(
+                cardinalities=selected_cards,
+                output_dim=group_dim,
+                dropout=dropout,
+                fixed_embedding_dim=fixed_cat_embedding_dim,
+            )
+        else:
+            self.cat_encoder = None
+
+        if self.use_bin:
+            self.bin_encoder = build_mlp(
+                input_dim=len(self.bin_indices),
+                hidden_dims=[max(group_dim // 2, 32), group_dim],
+                dropout=dropout,
+                activation="gelu",
+                use_layernorm=True,
+            )
+        else:
+            self.bin_encoder = None
+
+        if part_count == 1:
+            self.merge = nn.Identity()
+        else:
+            self.merge = nn.Sequential(
+                nn.Linear(group_dim * part_count, group_dim),
+                nn.LayerNorm(group_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(group_dim, group_dim),
+                nn.LayerNorm(group_dim),
             )
 
-        embedded_fields = []
+    def forward(
+        self,
+        meta_num: Optional[torch.Tensor],
+        meta_cat: Optional[torch.Tensor],
+        meta_bin: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        parts: List[torch.Tensor] = []
+
+        if self.use_num:
+            if meta_num is None:
+                raise ValueError(f"{self.name} requires meta_num")
+            x = meta_num.index_select(1, self._num_idx.to(meta_num.device)).float()
+            parts.append(self.num_encoder(x))
+
+        if self.use_cat:
+            if meta_cat is None:
+                raise ValueError(f"{self.name} requires meta_cat")
+            x = meta_cat.index_select(1, self._cat_idx.to(meta_cat.device)).long()
+            parts.append(self.cat_encoder(x))
+
+        if self.use_bin:
+            if meta_bin is None:
+                raise ValueError(f"{self.name} requires meta_bin")
+            x = meta_bin.index_select(1, self._bin_idx.to(meta_bin.device)).float()
+            parts.append(self.bin_encoder(x))
+
+        if len(parts) == 1:
+            return parts[0]
+        return self.merge(torch.cat(parts, dim=-1))
+
+
+class SemanticGroupGatedFusion(nn.Module):
+    """
+    Stable semantic group fusion:
+        group_tokens -> soft gate -> weighted sum -> output MLP
+
+    No Transformer here. This should be closer to the old stable pairwise model
+    while still letting metadata use semantic grouping.
+    """
+
+    def __init__(
+        self,
+        group_dim: int,
+        output_dim: int,
+        num_groups: int,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.group_embedding = nn.Parameter(torch.zeros(1, num_groups, group_dim))
+        nn.init.normal_(self.group_embedding, mean=0.0, std=0.02)
+
+        self.gate_net = nn.Sequential(
+            nn.Linear(group_dim, max(group_dim // 2, 32)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(max(group_dim // 2, 32), 1),
+        )
+
+        self.out = nn.Sequential(
+            nn.Linear(group_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(output_dim, output_dim),
+            nn.LayerNorm(output_dim),
+        )
+
+    def forward(self, group_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = group_tokens + self.group_embedding[:, : group_tokens.size(1), :]
+        logits = self.gate_net(x).squeeze(-1)
+        weights = F.softmax(logits, dim=-1)
+        fused = (x * weights.unsqueeze(-1)).sum(dim=1)
+        return self.out(fused), weights
+
+
+class LegacyTypedMetaEncoder(nn.Module):
+    """
+    Fallback typed encoder: num/cat/bin branches with gated merge.
+    """
+
+    def __init__(
+        self,
+        num_input_dim: int,
+        cat_cardinalities: Sequence[int],
+        bin_input_dim: int,
+        output_dim: int,
+        branch_dim: int,
+        dropout: float = 0.1,
+        fixed_cat_embedding_dim: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+
+        self.use_num = num_input_dim > 0
+        self.use_cat = len(cat_cardinalities) > 0
+        self.use_bin = bin_input_dim > 0
+
+        if self.use_num:
+            self.num_encoder = build_mlp(
+                input_dim=num_input_dim,
+                hidden_dims=[max(branch_dim, 128), branch_dim],
+                dropout=dropout,
+            )
+        else:
+            self.num_encoder = None
+
+        if self.use_cat:
+            self.cat_encoder = FieldwiseCategoricalEncoder(
+                cat_cardinalities,
+                output_dim=branch_dim,
+                dropout=dropout,
+                fixed_embedding_dim=fixed_cat_embedding_dim,
+            )
+        else:
+            self.cat_encoder = None
+
+        if self.use_bin:
+            self.bin_encoder = build_mlp(
+                input_dim=bin_input_dim,
+                hidden_dims=[max(branch_dim // 2, 32), branch_dim],
+                dropout=dropout,
+            )
+        else:
+            self.bin_encoder = None
+
+        n = int(self.use_num) + int(self.use_cat) + int(self.use_bin)
+        self.n = n
+        self.gate = nn.Sequential(
+            nn.Linear(branch_dim * n, branch_dim),
+            nn.GELU(),
+            nn.Linear(branch_dim, n),
+        ) if n > 1 else None
+
+        self.out = nn.Sequential(
+            nn.Linear(branch_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(output_dim, output_dim),
+            nn.LayerNorm(output_dim),
+        )
+
+    def forward(
+        self,
+        meta_num: Optional[torch.Tensor],
+        meta_cat: Optional[torch.Tensor],
+        meta_bin: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        reps: List[torch.Tensor] = []
+        if self.use_num:
+            reps.append(self.num_encoder(meta_num.float()))
+        if self.use_cat:
+            reps.append(self.cat_encoder(meta_cat.long()))
+        if self.use_bin:
+            reps.append(self.bin_encoder(meta_bin.float()))
+
+        if len(reps) == 1:
+            fused = reps[0]
+            gate_weights = fused.new_ones((fused.size(0), 1))
+        else:
+            stacked = torch.stack(reps, dim=1)
+            logits = self.gate(torch.cat(reps, dim=-1))
+            gate_weights = F.softmax(logits, dim=-1)
+            fused = (stacked * gate_weights.unsqueeze(-1)).sum(dim=1)
+
+        return self.out(fused), gate_weights
+
+
+class NumericFeatureTokenizer(nn.Module):
+    """
+    FT-Transformer numeric tokenizer.
+
+    Each numeric feature has its own weight vector and bias:
+        token_i = x_i * W_i + b_i
+    """
+
+    def __init__(self, num_features: int, token_dim: int) -> None:
+        super().__init__()
+        self.num_features = int(num_features)
+        self.token_dim = int(token_dim)
+        if self.num_features > 0:
+            self.weight = nn.Parameter(torch.empty(self.num_features, self.token_dim))
+            self.bias = nn.Parameter(torch.zeros(self.num_features, self.token_dim))
+            nn.init.xavier_uniform_(self.weight)
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    def forward(self, x: Optional[torch.Tensor]) -> torch.Tensor:
+        if self.num_features <= 0:
+            if x is None:
+                raise ValueError("NumericFeatureTokenizer has no features and cannot infer batch/device.")
+            return x.new_zeros((x.size(0), 0, self.token_dim), dtype=torch.float32)
+        if x is None:
+            raise ValueError("NumericFeatureTokenizer requires meta_num.")
+        x = x.float()
+        if x.size(1) != self.num_features:
+            raise ValueError(f"Expected {self.num_features} numeric features, got {x.size(1)}")
+        return x.unsqueeze(-1) * self.weight.unsqueeze(0) + self.bias.unsqueeze(0)
+
+
+class BinaryFeatureTokenizer(nn.Module):
+    """
+    Binary tokenizer. Binary flags are treated like small numeric feature tokens.
+    """
+
+    def __init__(self, bin_features: int, token_dim: int) -> None:
+        super().__init__()
+        self.bin_features = int(bin_features)
+        self.token_dim = int(token_dim)
+        if self.bin_features > 0:
+            self.weight = nn.Parameter(torch.empty(self.bin_features, self.token_dim))
+            self.bias = nn.Parameter(torch.zeros(self.bin_features, self.token_dim))
+            nn.init.xavier_uniform_(self.weight)
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    def forward(self, x: Optional[torch.Tensor]) -> torch.Tensor:
+        if self.bin_features <= 0:
+            if x is None:
+                raise ValueError("BinaryFeatureTokenizer has no features and cannot infer batch/device.")
+            return x.new_zeros((x.size(0), 0, self.token_dim), dtype=torch.float32)
+        if x is None:
+            raise ValueError("BinaryFeatureTokenizer requires meta_bin.")
+        x = x.float()
+        if x.size(1) != self.bin_features:
+            raise ValueError(f"Expected {self.bin_features} binary features, got {x.size(1)}")
+        return x.unsqueeze(-1) * self.weight.unsqueeze(0) + self.bias.unsqueeze(0)
+
+
+class CategoricalFeatureTokenizer(nn.Module):
+    """
+    Field-wise categorical tokenizer for FT-Transformer.
+    Each categorical field owns its embedding table and produces one token.
+    """
+
+    def __init__(self, cardinalities: Sequence[int], token_dim: int) -> None:
+        super().__init__()
+        self.cardinalities = [max(int(c), 1) for c in cardinalities]
+        self.num_fields = len(self.cardinalities)
+        self.token_dim = int(token_dim)
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(card, self.token_dim) for card in self.cardinalities
+        ])
+        for emb in self.embeddings:
+            nn.init.normal_(emb.weight, mean=0.0, std=0.02)
+
+    def forward(self, x: Optional[torch.Tensor], batch_size: Optional[int] = None, device=None) -> torch.Tensor:
+        if self.num_fields <= 0:
+            if x is not None:
+                batch_size = x.size(0)
+                device = x.device
+            if batch_size is None or device is None:
+                raise ValueError("CategoricalFeatureTokenizer cannot infer empty output shape.")
+            return torch.zeros(batch_size, 0, self.token_dim, device=device, dtype=torch.float32)
+        if x is None:
+            raise ValueError("CategoricalFeatureTokenizer requires meta_cat.")
+        x = x.long()
+        if x.size(1) != self.num_fields:
+            raise ValueError(f"Expected {self.num_fields} categorical fields, got {x.size(1)}")
+        tokens = []
         for i, emb in enumerate(self.embeddings):
-            field_ids = meta_cat[:, i].long()
-            embedded_fields.append(emb(field_ids))
+            ids = x[:, i].clamp(min=0, max=emb.num_embeddings - 1)
+            tokens.append(emb(ids))
+        return torch.stack(tokens, dim=1)
 
-        x = torch.cat(embedded_fields, dim=-1)
-        x = self.encoder(x)
 
-        if self.proj is not None:
-            x = self.proj(x)
+class FTTransformerMetaEncoder(nn.Module):
+    """
+    Feature Tokenizer + Transformer metadata encoder.
 
-        return x
+    It tokenizes every numeric/categorical/binary feature as an individual token,
+    prepends a CLS token, runs a compact TransformerEncoder, then projects CLS
+    to output_dim.
+    """
+
+    def __init__(
+        self,
+        num_input_dim: int,
+        cat_cardinalities: Sequence[int],
+        bin_input_dim: int,
+        output_dim: int,
+        token_dim: int = 192,
+        num_layers: int = 3,
+        num_heads: int = 8,
+        ffn_mult: int = 2,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        use_layernorm: bool = True,
+    ) -> None:
+        super().__init__()
+        self.num_input_dim = int(num_input_dim)
+        self.cat_cardinalities = list(cat_cardinalities or [])
+        self.cat_input_dim = len(self.cat_cardinalities)
+        self.bin_input_dim = int(bin_input_dim)
+        self.output_dim = int(output_dim)
+        self.token_dim = int(token_dim)
+        self.num_layers = int(num_layers)
+        self.num_heads = int(num_heads)
+
+        if self.token_dim % self.num_heads != 0:
+            raise ValueError(f"ft_token_dim={self.token_dim} must be divisible by ft_num_heads={self.num_heads}.")
+        if self.num_input_dim + self.cat_input_dim + self.bin_input_dim <= 0:
+            raise ValueError("FTTransformerMetaEncoder requires at least one metadata feature.")
+
+        self.num_tokenizer = NumericFeatureTokenizer(self.num_input_dim, self.token_dim) if self.num_input_dim > 0 else None
+        self.cat_tokenizer = CategoricalFeatureTokenizer(self.cat_cardinalities, self.token_dim) if self.cat_input_dim > 0 else None
+        self.bin_tokenizer = BinaryFeatureTokenizer(self.bin_input_dim, self.token_dim) if self.bin_input_dim > 0 else None
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.token_dim))
+        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+
+        # Lightweight field-type embeddings help the transformer distinguish
+        # numeric/categorical/binary tokens without hard-coded groups.
+        self.type_embeddings = nn.Parameter(torch.zeros(1, 4, self.token_dim))  # cls, num, cat, bin
+        nn.init.normal_(self.type_embeddings, mean=0.0, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.token_dim,
+            nhead=self.num_heads,
+            dim_feedforward=max(self.token_dim * int(ffn_mult), self.token_dim),
+            dropout=dropout,
+            activation=activation,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=self.num_layers)
+        self.final_norm = nn.LayerNorm(self.token_dim) if use_layernorm else nn.Identity()
+
+        self.out = nn.Sequential(
+            nn.Linear(self.token_dim, output_dim),
+            nn.LayerNorm(output_dim) if use_layernorm else nn.Identity(),
+            nn.GELU(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(output_dim, output_dim),
+            nn.LayerNorm(output_dim) if use_layernorm else nn.Identity(),
+        )
+
+    def forward(
+        self,
+        meta_num: Optional[torch.Tensor],
+        meta_cat: Optional[torch.Tensor],
+        meta_bin: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size = None
+        device = None
+        for x in (meta_num, meta_cat, meta_bin):
+            if x is not None:
+                batch_size = x.size(0)
+                device = x.device
+                break
+        if batch_size is None or device is None:
+            raise ValueError("FTTransformerMetaEncoder cannot infer batch/device from empty metadata.")
+
+        tokens: List[torch.Tensor] = []
+        cls = self.cls_token.expand(batch_size, -1, -1) + self.type_embeddings[:, 0:1, :]
+        tokens.append(cls)
+
+        if self.num_tokenizer is not None:
+            num_tok = self.num_tokenizer(meta_num) + self.type_embeddings[:, 1:2, :]
+            tokens.append(num_tok)
+        if self.cat_tokenizer is not None:
+            cat_tok = self.cat_tokenizer(meta_cat, batch_size=batch_size, device=device) + self.type_embeddings[:, 2:3, :]
+            tokens.append(cat_tok)
+        if self.bin_tokenizer is not None:
+            bin_tok = self.bin_tokenizer(meta_bin) + self.type_embeddings[:, 3:4, :]
+            tokens.append(bin_tok)
+
+        x = torch.cat(tokens, dim=1)
+        x = self.transformer(x)
+        cls_out = self.final_norm(x[:, 0, :])
+        out = self.out(cls_out)
+
+        # Placeholder info tensor for compatibility with MetaEncoder(return_gate_weights=True).
+        # Shape [B, 1] means there is no soft gate here.
+        info = out.new_ones((out.size(0), 1))
+        return out, info
 
 
 class MetaEncoder(nn.Module):
     """
-    Heterogeneous metadata encoder.
+    Semantic grouped metadata encoder without Transformer.
 
-    Inputs:
-        - meta_num:      [B, D_num]   numeric metadata
-        - meta_cat:      [B, D_cat]   categorical metadata ids
-        - meta_bin:      [B, D_bin]   binary metadata
-        - user_desc:     [B, 400]     user_description vector (zeros if unavailable)
-        - loc_desc:      [B, 400]     location_description vector (zeros if unavailable)
+    Groups:
+    - taxonomy
+    - temporal_user
+    - geo
+    - content_profile_availability
+    - other
 
-    Design:
-        1. Numeric branch:              MLP → branch_dim
-        2. Categorical branch:          Embedding + MLP → branch_dim
-        3. Binary branch:               MLP → branch_dim
-        4. Gated fusion over structured metadata branches
-        5. Final MLP → output_dim
-
-    Note:
-        user_description/location_description are supported for backward compatibility,
-        but the current recommended architecture keeps them outside MetaEncoder as
-        auxiliary residual branches in SMPFusionModel.
+    Each group can contain num/cat/bin subsets. Final fusion is soft gated sum.
     """
 
     def __init__(
@@ -225,182 +614,221 @@ class MetaEncoder(nn.Module):
         bin_hidden_dims: Optional[List[int]] = None,
         fusion_hidden_dims: Optional[List[int]] = None,
         dropout: float = 0.1,
-        activation: str = "relu",
+        activation: str = "gelu",
         use_layernorm: bool = True,
         fixed_cat_embedding_dim: Optional[int] = None,
         min_cat_embedding_dim: int = 4,
         max_cat_embedding_dim: int = 32,
-        # ── vector description branches ──────────────────────
-        user_desc_dim: int = 768,       # sentence-transformers all-mpnet-base-v2 output dim
+        user_desc_dim: int = 768,
         loc_desc_dim: int = 400,
         desc_bottleneck_dim: int = 64,
         use_user_desc: bool = False,
-        use_loc_desc: bool = False,     # 關閉：location_description 官方資料全是 None
+        use_loc_desc: bool = False,
+        meta_num_cols: Optional[Sequence[str]] = None,
+        meta_cat_cols: Optional[Sequence[str]] = None,
+        meta_bin_cols: Optional[Sequence[str]] = None,
+        use_semantic_groups: bool = True,
+        encoder_type: str = "legacy",  # legacy | semantic_groups | ft_transformer
+        ft_token_dim: int = 192,
+        ft_num_layers: int = 3,
+        ft_num_heads: int = 8,
+        ft_ffn_mult: int = 2,
+        ft_dropout: Optional[float] = None,
+        semantic_group_layers: int = 0,
+        semantic_group_heads: int = 4,
+        semantic_group_ffn_mult: int = 4,
     ) -> None:
         super().__init__()
 
-        self.num_input_dim   = num_input_dim
+        self.num_input_dim = int(num_input_dim)
         self.cat_cardinalities = list(cat_cardinalities or [])
-        self.cat_input_dim   = len(self.cat_cardinalities)
-        self.bin_input_dim   = bin_input_dim
-        self.output_dim      = output_dim
-        self.branch_dim      = branch_dim
-        self.use_user_desc   = use_user_desc and user_desc_dim > 0
-        self.use_loc_desc    = use_loc_desc  and loc_desc_dim  > 0
+        self.cat_input_dim = len(self.cat_cardinalities)
+        self.bin_input_dim = int(bin_input_dim)
+        self.output_dim = int(output_dim)
+        self.branch_dim = int(branch_dim)
 
-        if self.num_input_dim < 0 or self.bin_input_dim < 0:
-            raise ValueError("Input dimensions must be non-negative.")
-        if (self.num_input_dim == 0 and self.cat_input_dim == 0
-                and self.bin_input_dim == 0
-                and not self.use_user_desc and not self.use_loc_desc):
-            raise ValueError("At least one metadata branch must be non-empty.")
+        self.meta_num_cols = list(meta_num_cols or [])
+        self.meta_cat_cols = list(meta_cat_cols or [])
+        self.meta_bin_cols = list(meta_bin_cols or [])
 
-        # ── Numeric branch ────────────────────────────────────
-        self.use_num = self.num_input_dim > 0
-        if self.use_num:
-            if num_hidden_dims is None:
-                num_hidden_dims = [max(branch_dim, 128), branch_dim]
-            self.num_encoder = build_mlp(
-                input_dim=self.num_input_dim,
-                hidden_dims=num_hidden_dims,
-                dropout=dropout,
+        self.encoder_type = str(encoder_type or "legacy").lower()
+        # Backward compatible alias: older configs used use_semantic_groups=true.
+        if self.encoder_type in {"semantic", "semantic_group", "semantic_groups"}:
+            self.encoder_type = "semantic_groups"
+        if self.encoder_type in {"ft", "fttransformer", "ft-transformer"}:
+            self.encoder_type = "ft_transformer"
+        if self.encoder_type not in {"legacy", "semantic_groups", "ft_transformer"}:
+            raise ValueError(f"Unsupported meta encoder_type={encoder_type}")
+        if use_semantic_groups and self.encoder_type == "legacy":
+            self.encoder_type = "semantic_groups"
+
+        self.use_semantic_groups = bool(
+            self.encoder_type == "semantic_groups"
+            and (
+                len(self.meta_num_cols) == self.num_input_dim
+                and len(self.meta_cat_cols) == self.cat_input_dim
+                and len(self.meta_bin_cols) == self.bin_input_dim
+            )
+        )
+        self.use_ft_transformer = self.encoder_type == "ft_transformer"
+
+        self.ft_encoder = None
+        self.group_names = ["num", "cat", "bin"]
+        self.group_encoders = None
+        self.group_fusion = None
+        self.legacy_encoder = None
+
+        if self.use_ft_transformer:
+            self.ft_encoder = FTTransformerMetaEncoder(
+                num_input_dim=self.num_input_dim,
+                cat_cardinalities=self.cat_cardinalities,
+                bin_input_dim=self.bin_input_dim,
+                output_dim=self.output_dim,
+                token_dim=int(ft_token_dim),
+                num_layers=int(ft_num_layers),
+                num_heads=int(ft_num_heads),
+                ffn_mult=int(ft_ffn_mult),
+                dropout=dropout if ft_dropout is None else float(ft_dropout),
                 activation=activation,
                 use_layernorm=use_layernorm,
             )
-            self.num_out_dim = num_hidden_dims[-1]
-            self.num_proj = None
-            if self.num_out_dim != branch_dim:
-                self.num_proj = nn.Linear(self.num_out_dim, branch_dim)
-                self.num_out_dim = branch_dim
-        else:
-            self.num_encoder = self.num_proj = None
-            self.num_out_dim = 0
+        elif self.use_semantic_groups:
+            self.group_names, group_defs = self._build_group_defs()
+            self.group_encoders = nn.ModuleDict()
+            for group_name, defs in group_defs.items():
+                self.group_encoders[group_name] = SemanticMetaGroupEncoder(
+                    name=group_name,
+                    num_indices=defs["num"],
+                    cat_indices=defs["cat"],
+                    bin_indices=defs["bin"],
+                    cat_cardinalities=self.cat_cardinalities,
+                    group_dim=self.branch_dim,
+                    dropout=dropout,
+                    fixed_cat_embedding_dim=fixed_cat_embedding_dim,
+                )
 
-        # ── Categorical branch ────────────────────────────────
-        self.use_cat = self.cat_input_dim > 0
-        if self.use_cat:
-            self.cat_encoder = CategoricalEmbeddingEncoder(
-                cardinalities=self.cat_cardinalities,
-                output_dim=branch_dim,
-                hidden_dims=cat_hidden_dims,
-                fixed_embedding_dim=fixed_cat_embedding_dim,
-                min_embedding_dim=min_cat_embedding_dim,
-                max_embedding_dim=max_cat_embedding_dim,
-                dropout=dropout,
-                activation=activation,
-                use_layernorm=use_layernorm,
-            )
-            self.cat_out_dim = self.cat_encoder.output_dim
-        else:
-            self.cat_encoder = None
-            self.cat_out_dim = 0
-
-        # ── Binary branch ─────────────────────────────────────
-        self.use_bin = self.bin_input_dim > 0
-        if self.use_bin:
-            if bin_hidden_dims is None:
-                hidden = max(branch_dim // 2, 32)
-                bin_hidden_dims = [hidden, branch_dim]
-            self.bin_encoder = build_mlp(
-                input_dim=self.bin_input_dim,
-                hidden_dims=bin_hidden_dims,
-                dropout=dropout,
-                activation=activation,
-                use_layernorm=use_layernorm,
-            )
-            self.bin_out_dim = bin_hidden_dims[-1]
-            self.bin_proj = None
-            if self.bin_out_dim != branch_dim:
-                self.bin_proj = nn.Linear(self.bin_out_dim, branch_dim)
-                self.bin_out_dim = branch_dim
-        else:
-            self.bin_encoder = self.bin_proj = None
-            self.bin_out_dim = 0
-
-        # ── user_description branch ───────────────────────────
-        if self.use_user_desc:
-            self.user_desc_encoder = VectorCompressor(
-                input_dim=user_desc_dim,
-                bottleneck_dim=desc_bottleneck_dim,
-                output_dim=branch_dim,
+            self.group_fusion = SemanticGroupGatedFusion(
+                group_dim=self.branch_dim,
+                output_dim=self.output_dim,
+                num_groups=len(self.group_names),
                 dropout=dropout,
             )
         else:
-            self.user_desc_encoder = None
-
-        # ── location_description branch ───────────────────────
-        if self.use_loc_desc:
-            self.loc_desc_encoder = VectorCompressor(
-                input_dim=loc_desc_dim,
-                bottleneck_dim=desc_bottleneck_dim,
-                output_dim=branch_dim,
+            self.legacy_encoder = LegacyTypedMetaEncoder(
+                num_input_dim=self.num_input_dim,
+                cat_cardinalities=self.cat_cardinalities,
+                bin_input_dim=self.bin_input_dim,
+                output_dim=self.output_dim,
+                branch_dim=self.branch_dim,
                 dropout=dropout,
+                fixed_cat_embedding_dim=fixed_cat_embedding_dim,
             )
-        else:
-            self.loc_desc_encoder = None
 
-        # ── Gated fusion ──────────────────────────────────────
-        active_branch_count = (
-            int(self.use_num)
-            + int(self.use_cat)
-            + int(self.use_bin)
-            + int(self.use_user_desc)
-            + int(self.use_loc_desc)
-        )
-        self.active_branch_count = active_branch_count
+    def _build_group_defs(self) -> Tuple[List[str], Dict[str, Dict[str, List[int]]]]:
+        group_order = ["taxonomy", "temporal_user", "geo", "content_profile_availability", "other"]
+        group_defs: Dict[str, Dict[str, List[int]]] = {
+            g: {"num": [], "cat": [], "bin": []} for g in group_order
+        }
 
-        if active_branch_count > 1:
-            self.gate_mlp = nn.Sequential(
-                nn.Linear(branch_dim * active_branch_count, branch_dim),
-                nn.ReLU(),
-                nn.Linear(branch_dim, active_branch_count),
-            )
-        else:
-            self.gate_mlp = None
+        used_num, used_cat, used_bin = set(), set(), set()
 
-        # ── Final fusion MLP ──────────────────────────────────
-        if fusion_hidden_dims is None:
-            fusion_hidden_dims = [output_dim]
-        self.fusion_mlp = build_mlp(
-            input_dim=branch_dim,
-            hidden_dims=fusion_hidden_dims,
-            dropout=dropout,
-            activation=activation,
-            use_layernorm=use_layernorm,
-        )
-        fusion_out_dim = fusion_hidden_dims[-1]
-        self.fusion_proj = (
-            nn.Linear(fusion_out_dim, output_dim)
-            if fusion_out_dim != output_dim else None
-        )
+        def add(kind: str, group: str, idx: int) -> None:
+            group_defs[group][kind].append(idx)
+            if kind == "num":
+                used_num.add(idx)
+            elif kind == "cat":
+                used_cat.add(idx)
+            else:
+                used_bin.add(idx)
 
-    # ── helpers ───────────────────────────────────────────────
-    def _encode_num(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.num_encoder(x)
-        if self.num_proj is not None:
-            x = self.num_proj(x)
-        return x
+        taxonomy_cat = {
+            "category", "subcategory", "concept",
+            "category_subcategory_combo", "category_concept_combo",
+        }
+        geo_cat = {"geo_cluster", "timezone_id", "city", "state", "country"}
 
-    def _encode_cat(self, x: torch.Tensor) -> torch.Tensor:
-        return self.cat_encoder(x)
+        geo_num_keywords = {
+            "latitude", "longitude", "geoaccuracy",
+            "country_target_enc", "state_target_enc", "city_target_enc",
+            "location_text_target_enc",
+            "country_freq", "state_freq", "city_freq", "location_text_freq",
+        }
 
-    def _encode_bin(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.bin_encoder(x)
-        if self.bin_proj is not None:
-            x = self.bin_proj(x)
-        return x
+        temporal_user_num_keywords = {
+            # Time features
+            "hour", "weekday", "year", "month", "day", "weekofyear",
+            "hour_sin", "hour_cos", "weekday_sin", "weekday_cos",
+            "month_sin", "month_cos",
 
-    def _get_batch_size(self, *tensors) -> int:
-        for t in tensors:
-            if t is not None:
-                return t.size(0)
-        raise ValueError("All inputs are None.")
+            # Fold-safe user aggregates (highest-signal features)
+            "user_prev_post_count", "user_mean_label", "user_median_label",
+            "user_std_label", "user_category_nunique", "user_active_hour_mean",
 
-    def _zero_vec(self, input_dim: int, batch_size: int) -> torch.Tensor:
-        device = next(self.parameters()).device
-        return torch.zeros(batch_size, input_dim, device=device)
+            # User profile (only fields that actually exist in official data)
+            "photo_count_log1p",
+        }
 
-    # ── forward ───────────────────────────────────────────────
+        content_profile_num_keywords = {
+            "title_len", "tags_len", "full_text_len",
+            "title_word_count", "full_text_word_count",
+            "tag_count", "avg_tag_len",
+            "title_digit_ratio", "title_upper_ratio", "title_punct_ratio",
+            "full_text_digit_ratio", "full_text_punct_ratio",
+            "clip_token_count", "clip_token_count_raw",
+            "tag_token_count",
+            "user_desc_len", "user_desc_word_count", "user_desc_keyword_count",
+        }
+
+        temporal_user_bin = {"is_weekend", "is_night", "is_workhour", "ispro", "canbuypro", "ispublic"}
+        geo_bin = {"has_geo", "has_location_text", "has_city", "has_state", "has_country"}
+        availability_bin = {
+            "has_title", "has_tags", "has_full_text", "has_user_description", "has_image",
+            "user_desc_kw_photo", "user_desc_kw_travel", "user_desc_kw_art",
+            "user_desc_kw_nature", "user_desc_kw_camera", "user_desc_kw_pro",
+            "user_desc_kw_social", "user_desc_kw_location",
+        }
+
+        for i, col in enumerate(self.meta_cat_cols):
+            raw = _clean_col_name(col)
+            if raw in taxonomy_cat:
+                add("cat", "taxonomy", i)
+            elif raw in geo_cat:
+                add("cat", "geo", i)
+
+        for i, col in enumerate(self.meta_num_cols):
+            raw = _clean_col_name(col)
+            if raw in geo_num_keywords:
+                add("num", "geo", i)
+            elif raw in temporal_user_num_keywords:
+                add("num", "temporal_user", i)
+            elif raw in content_profile_num_keywords:
+                add("num", "content_profile_availability", i)
+
+        for i, col in enumerate(self.meta_bin_cols):
+            raw = _clean_col_name(col)
+            if raw in temporal_user_bin:
+                add("bin", "temporal_user", i)
+            elif raw in geo_bin:
+                add("bin", "geo", i)
+            elif raw in availability_bin:
+                add("bin", "content_profile_availability", i)
+
+        for i in range(self.num_input_dim):
+            if i not in used_num:
+                add("num", "other", i)
+        for i in range(self.cat_input_dim):
+            if i not in used_cat:
+                add("cat", "other", i)
+        for i in range(self.bin_input_dim):
+            if i not in used_bin:
+                add("bin", "other", i)
+
+        non_empty_names = [
+            g for g in group_order
+            if group_defs[g]["num"] or group_defs[g]["cat"] or group_defs[g]["bin"]
+        ]
+        return non_empty_names, {g: group_defs[g] for g in non_empty_names}
+
     def forward(
         self,
         meta_num: Optional[torch.Tensor] = None,
@@ -410,111 +838,43 @@ class MetaEncoder(nn.Module):
         loc_desc: Optional[torch.Tensor] = None,
         return_gate_weights: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Args:
-            meta_num:  [B, D_num]
-            meta_cat:  [B, D_cat]
-            meta_bin:  [B, D_bin]
-            user_desc: [B, 768]  float32; zeros for users without description
-            loc_desc:  [B, D]    float32; zeros when unavailable
-            return_gate_weights: also return [B, N_branches] gate weights
+        if self.use_ft_transformer:
+            out, info = self.ft_encoder(meta_num, meta_cat, meta_bin)
+            return (out, info) if return_gate_weights else out
 
-        Returns:
-            meta_repr [B, output_dim], optionally gate_weights [B, N_branches]
-        """
-        branch_reprs: List[torch.Tensor] = []
-        B = self._get_batch_size(meta_num, meta_cat, meta_bin, user_desc, loc_desc)
+        if not self.use_semantic_groups:
+            out, gates = self.legacy_encoder(meta_num, meta_cat, meta_bin)
+            return (out, gates) if return_gate_weights else out
 
-        if self.use_num:
-            if meta_num is None:
-                raise ValueError("meta_num required but not provided")
-            branch_reprs.append(self._encode_num(meta_num.float()))
-
-        if self.use_cat:
-            if meta_cat is None:
-                raise ValueError("meta_cat required but not provided")
-            branch_reprs.append(self._encode_cat(meta_cat.long()))
-
-        if self.use_bin:
-            if meta_bin is None:
-                raise ValueError("meta_bin required but not provided")
-            branch_reprs.append(self._encode_bin(meta_bin.float()))
-
-        # ── user_description ──────────────────────────────────
-        # Zero vector = no description; VectorCompressor handles it naturally
-        if self.use_user_desc:
-            if user_desc is None:
-                user_desc = self._zero_vec(self.user_desc_encoder.input_dim, B)
-            branch_reprs.append(self.user_desc_encoder(user_desc.float()))
-
-        # ── location_description ──────────────────────────────
-        if self.use_loc_desc:
-            if loc_desc is None:
-                loc_desc = self._zero_vec(self.loc_desc_encoder.input_dim, B)
-            branch_reprs.append(self.loc_desc_encoder(loc_desc.float()))
-
-        # ── gated fusion ──────────────────────────────────────
-        if len(branch_reprs) == 1:
-            fused = branch_reprs[0]
-            gate_weights = fused.new_ones((B, 1))
-        else:
-            stacked     = torch.stack(branch_reprs, dim=1)             # [B, N, D]
-            gate_input  = torch.cat(branch_reprs, dim=-1)              # [B, N*D]
-            gate_logits = self.gate_mlp(gate_input)                    # [B, N]
-            gate_weights = F.softmax(gate_logits, dim=-1)              # [B, N]
-            fused = (stacked * gate_weights.unsqueeze(-1)).sum(dim=1)  # [B, D]
-
-        out = self.fusion_mlp(fused)
-        if self.fusion_proj is not None:
-            out = self.fusion_proj(out)
-
-        if return_gate_weights:
-            return out, gate_weights
-        return out
+        group_tokens = []
+        for name in self.group_names:
+            group_tokens.append(self.group_encoders[name](meta_num, meta_cat, meta_bin))
+        tokens = torch.stack(group_tokens, dim=1)
+        out, weights = self.group_fusion(tokens)
+        return (out, weights) if return_gate_weights else out
 
 
 if __name__ == "__main__":
-    batch_size = 4
-    num_input_dim = 12
-    cat_cardinalities = [10, 20, 5]
-    bin_input_dim = 6
+    B = 4
+    num_cols = ["num__hour", "num__city_target_enc", "num__user_desc_len"]
+    cat_cols = ["cat__category", "cat__city"]
+    bin_cols = ["bin__has_geo", "bin__has_user_description"]
 
     model = MetaEncoder(
-        num_input_dim=num_input_dim,
-        cat_cardinalities=cat_cardinalities,
-        bin_input_dim=bin_input_dim,
+        num_input_dim=len(num_cols),
+        cat_cardinalities=[10, 100],
+        bin_input_dim=len(bin_cols),
         output_dim=256,
         branch_dim=128,
-        dropout=0.1,
-        use_user_desc=True,
-        use_loc_desc=False,
-        user_desc_dim=768,
-        loc_desc_dim=400,
-        desc_bottleneck_dim=64,
+        meta_num_cols=num_cols,
+        meta_cat_cols=cat_cols,
+        meta_bin_cols=bin_cols,
+        use_semantic_groups=True,
     )
-
-    meta_num = torch.randn(batch_size, num_input_dim)
-    meta_cat = torch.randint(0, 5, (batch_size, len(cat_cardinalities)))
-    meta_bin = torch.randint(0, 2, (batch_size, bin_input_dim)).float()
-
-    # Real vectors; zero vector means unavailable.
-    user_desc = torch.randn(batch_size, 768)
-    loc_desc = torch.randn(batch_size, 400)
-    user_desc[2] = 0.0
-    loc_desc[2] = 0.0
-
-    meta_repr, gate_weights = model(
-        meta_num=meta_num,
-        meta_cat=meta_cat,
-        meta_bin=meta_bin,
-        user_desc=user_desc,
-        loc_desc=loc_desc,
+    y, w = model(
+        meta_num=torch.randn(B, len(num_cols)),
+        meta_cat=torch.randint(0, 5, (B, len(cat_cols))),
+        meta_bin=torch.randint(0, 2, (B, len(bin_cols))).float(),
         return_gate_weights=True,
     )
-
-    print("meta_repr   :", meta_repr.shape)       # [4, 256]
-    print("gate_weights:", gate_weights.shape)    # [4, 5]
-    print("gate_weights sample:", gate_weights[0].detach().tolist())
-
-    print("forward ok")
-
+    print(y.shape, w.shape, model.group_names)

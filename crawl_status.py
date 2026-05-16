@@ -12,7 +12,7 @@ crawl_status.py
 
 用法：
   python3 crawl_status.py
-  python3 crawl_status.py --base_dir /local/smp/extra_data
+  python3 crawl_status.py --base_dir /local/smp/extra_data_v2
   python3 crawl_status.py --base_dir /local/smp/extra_data_v2 --total_items 480000
   python3 crawl_status.py --base_dir /local/smp/extra_data_v2 --cat Travel
   python3 crawl_status.py --base_dir /local/smp/extra_data_v2 --skip_images --sample 200

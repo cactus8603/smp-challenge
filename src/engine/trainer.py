@@ -76,6 +76,7 @@ def train_one_epoch(
     grad_clip_norm: Optional[float] = None,
     writer: Optional[SummaryWriter] = None,
     epoch: int = 0,
+    meta_only: bool = False,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -86,17 +87,6 @@ def train_one_epoch(
     step = 0
 
     for batch in progress:
-        # --------------------------
-        # debugging: check batch contents and shapes
-        # # --------------------------
-        # print(batch["input_ids"].shape)          # CLIP
-        # print(batch["attention_mask"].shape)
-        # print(batch["clip_text"][:2])
-
-        # print(batch["glove_token_count"][:5])    # GloVe
-        # print(batch["glove_tokens"][:2])
-        # print(batch["glove_text"][:2])
-
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         meta_num = batch["meta_num"].to(device)
@@ -112,16 +102,16 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        # GloVe branch inputs
-        glove_tokens = batch.get("glove_tokens", None)
-        glove_text = batch.get("glove_text", None)
-        glove_token_count = batch.get("glove_token_count", None)
-        if glove_token_count is not None:
-            glove_token_count = glove_token_count.to(device)
+        # tag branch inputs
+        tag_tokens = batch.get("tag_tokens", None)
+        tag_text = batch.get("tag_text", None)
+        tag_token_count = batch.get("tag_token_count", None)
+        if tag_token_count is not None:
+            tag_token_count = tag_token_count.to(device)
 
         # user_description / location_description
         user_desc = batch["user_desc"].to(device) if "user_desc" in batch else None
-        loc_desc  = batch["loc_desc"].to(device)  if "loc_desc"  in batch else None
+        loc_desc = batch["loc_desc"].to(device) if "loc_desc" in batch else None
 
         outputs = model(
             input_ids=input_ids,
@@ -130,17 +120,16 @@ def train_one_epoch(
             meta_cat=meta_cat,
             meta_bin=meta_bin,
             image_tensor=image_tensor,
-            glove_tokens=glove_tokens,
-            glove_text=glove_text,
-            glove_token_count=glove_token_count,
+            tag_tokens=tag_tokens,
+            tag_text=tag_text,
+            tag_token_count=tag_token_count,
             user_desc=user_desc,
             loc_desc=loc_desc,
+            meta_only=meta_only,
         )
 
         preds = outputs.squeeze(-1)
-        
         loss = criterion(preds, labels)
-        # print(preds[:5], labels[:5], loss.item())  # Debugging: print predictions, labels, and loss
 
         loss.backward()
 
@@ -152,7 +141,7 @@ def train_one_epoch(
 
         total_loss += loss.item()
 
-        # 記錄各損失
+        # record component losses if criterion exposes them
         if hasattr(criterion, "last_reg_loss"):
             total_reg_loss += criterion.last_reg_loss
             total_rank_loss += criterion.last_rank_loss
@@ -165,12 +154,7 @@ def train_one_epoch(
         step += 1
         progress.set_postfix(loss=f"{loss.item():.4f}")
 
-        # Full epoch training: do not break early.
-
-    avg_loss = total_loss / max(step, 1)
-    avg_reg_loss = total_reg_loss / max(len(loader), 1)
-    avg_rank_loss = total_rank_loss / max(len(loader), 1)
-
+    avg_loss = total_loss / max(len(loader), 1)
     return avg_loss
 
 
@@ -188,6 +172,8 @@ class Trainer:
         tb_dir: Path,
         logger: Optional[logging.Logger] = None,
         grad_clip_norm: Optional[float] = None,
+        ablation_spearman_threshold: float = 0.58,
+        meta_warmup_epochs: int = 0,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
@@ -199,17 +185,27 @@ class Trainer:
         self.ckpt_dir = ckpt_dir
         self.tb_dir = tb_dir
         self.grad_clip_norm = grad_clip_norm
+        self.ablation_spearman_threshold = float(ablation_spearman_threshold)
+        self.meta_warmup_epochs = int(meta_warmup_epochs)
+        self._original_requires_grad = {name: p.requires_grad for name, p in model.named_parameters()}
 
         self.logger = logger or setup_logger(exp_dir, exp_name)
         self.writer = SummaryWriter(log_dir=str(tb_dir))
 
         self.best_spearman = -1.0
         self.best_epoch = -1
-        self.best_lightgbm_spearman = float("-inf")
-        self.best_catboost_spearman = float("-inf")
-        self.best_lightgbm_epoch = -1
-        self.best_catboost_epoch = -1
         self.history: List[Dict] = []
+
+
+    def _set_meta_warmup_trainable(self, enabled: bool) -> None:
+        """Freeze everything except meta_encoder and meta_aux_head during warmup."""
+        if enabled:
+            for name, p in self.model.named_parameters():
+                p.requires_grad = ("meta_encoder" in name) or ("meta_aux_head" in name)
+        else:
+            for name, p in self.model.named_parameters():
+                if name in self._original_requires_grad:
+                    p.requires_grad = self._original_requires_grad[name]
 
     def fit(
         self,
@@ -225,6 +221,17 @@ class Trainer:
             epoch_start = time.time()
             self.logger.info(f"Epoch {epoch}/{epochs}")
 
+            meta_only_epoch = epoch <= self.meta_warmup_epochs
+            if meta_only_epoch:
+                self._set_meta_warmup_trainable(True)
+                self.logger.info(
+                    f"Meta-only warmup epoch {epoch}/{self.meta_warmup_epochs}: "
+                    "training meta_encoder + meta_aux_head only."
+                )
+            elif self.meta_warmup_epochs > 0 and epoch == self.meta_warmup_epochs + 1:
+                self._set_meta_warmup_trainable(False)
+                self.logger.info("Meta warmup finished; restored original trainable parameters.")
+
             train_loss = train_one_epoch(
                 model=self.model,
                 loader=train_loader,
@@ -235,6 +242,7 @@ class Trainer:
                 grad_clip_norm=self.grad_clip_norm,
                 writer=self.writer,
                 epoch=epoch,
+                meta_only=meta_only_epoch,
             )
 
             val_loss, val_mae, val_spearman = validate(
@@ -242,26 +250,12 @@ class Trainer:
                 loader=val_loader,
                 criterion=self.criterion,
                 device=self.device,
+                meta_only=meta_only_epoch,
             )
 
-            # Run expensive LightGBM / CatBoost monitor only when the deep model
-            # reaches a new best validation Spearman. This keeps training fast and
-            # still evaluates GBDT on the checkpoints that matter.
             gbdt_scores = {}
-            is_new_best = val_spearman > self.best_spearman
-            should_run_gbdt = (
-                monitor_gbdt
-                and is_new_best
-                and (gbdt_interval <= 1 or epoch % gbdt_interval == 0)
-            )
 
-            if should_run_gbdt:
-                self.logger.info(
-                    "[GBDT Monitor] New best deep val_spearman "
-                    f"{val_spearman:.4f} > {self.best_spearman:.4f}; "
-                    "running LightGBM/CatBoost..."
-                )
-
+            if monitor_gbdt and epoch % gbdt_interval == 0:
                 gbdt_scores = run_gbdt_monitor(
                     model=self.model,
                     train_loader=train_loader,
@@ -271,10 +265,6 @@ class Trainer:
                     run_catboost=True,
                     max_train_batches=gbdt_max_train_batches,
                     max_val_batches=gbdt_max_val_batches,
-                    save_dir=self.ckpt_dir / "gbdt",
-                    best_lightgbm_spearman=self.best_lightgbm_spearman,
-                    best_catboost_spearman=self.best_catboost_spearman,
-                    epoch=epoch,
                 )
 
                 self.logger.info(
@@ -283,29 +273,6 @@ class Trainer:
                     f"lightgbm={gbdt_scores.get('lightgbm_spearman', float('nan')):.4f} | "
                     f"catboost={gbdt_scores.get('catboost_spearman', float('nan')):.4f}"
                 )
-
-                if "lightgbm_error" in gbdt_scores:
-                    self.logger.info(f"[GBDT Monitor][LightGBM ERROR] {gbdt_scores['lightgbm_error']}")
-                if "catboost_error" in gbdt_scores:
-                    self.logger.info(f"[GBDT Monitor][CatBoost ERROR] {gbdt_scores['catboost_error']}")
-
-                lgb_score = float(gbdt_scores.get("lightgbm_spearman", float("nan")))
-                if bool(gbdt_scores.get("lightgbm_saved", False)):
-                    self.best_lightgbm_spearman = lgb_score
-                    self.best_lightgbm_epoch = epoch
-                    self.logger.info(
-                        "[GBDT Monitor] Saved new best LightGBM "
-                        f"spearman={lgb_score:.4f} to {gbdt_scores.get('lightgbm_model_path')}"
-                    )
-
-                cat_score = float(gbdt_scores.get("catboost_spearman", float("nan")))
-                if bool(gbdt_scores.get("catboost_saved", False)):
-                    self.best_catboost_spearman = cat_score
-                    self.best_catboost_epoch = epoch
-                    self.logger.info(
-                        "[GBDT Monitor] Saved new best CatBoost "
-                        f"spearman={cat_score:.4f} to {gbdt_scores.get('catboost_model_path')}"
-                    )
 
                 self.writer.add_scalar(
                     "metric_gbdt/deep_spearman",
@@ -322,21 +289,34 @@ class Trainer:
                     gbdt_scores.get("catboost_spearman", float("nan")),
                     epoch,
                 )
-            elif monitor_gbdt:
-                reason = "not a new best" if not is_new_best else "gbdt_interval skip"
-                self.logger.info(
-                    "[GBDT Monitor] skipped "
-                    f"({reason}); val_spearman={val_spearman:.4f}, "
-                    f"best={self.best_spearman:.4f}"
-                )
 
-            results = validate_modality_ablation(
-                model=self.model,
-                loader=val_loader,
-                criterion=self.criterion,
-                device=self.device,
-                verbose_debug=False,
-            )
+            # ---------------------------------------------------------
+            # Expensive modality ablation is only worth running when the
+            # full validation score is already promising.
+            # This avoids extra Valid[text/meta/image/user_desc_masked] passes
+            # during weak early epochs or failed runs.
+            # ---------------------------------------------------------
+            ablation_results = None
+            if (not meta_only_epoch) and val_spearman > self.ablation_spearman_threshold:
+                self.logger.info(
+                    f"val_spearman={val_spearman:.4f} > "
+                    f"{self.ablation_spearman_threshold:.4f}; running modality ablation."
+                )
+                ablation_results = validate_modality_ablation(
+                    model=self.model,
+                    loader=val_loader,
+                    criterion=self.criterion,
+                    device=self.device,
+                    verbose_debug=False,
+                )
+            else:
+                if meta_only_epoch:
+                    self.logger.info("Skip modality ablation during meta-only warmup.")
+                else:
+                    self.logger.info(
+                        f"Skip modality ablation: val_spearman={val_spearman:.4f} <= "
+                        f"{self.ablation_spearman_threshold:.4f}"
+                    )
 
             epoch_time = time.time() - epoch_start
 
@@ -355,22 +335,21 @@ class Trainer:
             self.writer.add_scalar("lr", self.optimizer.param_groups[0]["lr"], epoch)
             self.writer.add_scalar("time/epoch_seconds", epoch_time, epoch)
 
-            self.history.append(
-                {
-                    "epoch": epoch,
-                    "train_loss": float(train_loss),
-                    "val_loss": float(val_loss),
-                    "val_mae": float(val_mae),
-                    "val_spearman": float(val_spearman),
-                    "epoch_time_sec": float(epoch_time),
-                    "gbdt_ran": bool(should_run_gbdt),
-                    "gbdt_scores": {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in gbdt_scores.items()},
-                    "best_lightgbm_spearman": float(self.best_lightgbm_spearman),
-                    "best_lightgbm_epoch": int(self.best_lightgbm_epoch),
-                    "best_catboost_spearman": float(self.best_catboost_spearman),
-                    "best_catboost_epoch": int(self.best_catboost_epoch),
-                }
-            )
+            epoch_record = {
+                "epoch": epoch,
+                "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
+                "val_mae": float(val_mae),
+                "val_spearman": float(val_spearman),
+                "epoch_time_sec": float(epoch_time),
+                "ablation_ran": bool(ablation_results is not None),
+                "meta_only_epoch": bool(meta_only_epoch),
+            }
+
+            if ablation_results is not None:
+                epoch_record["modality_ablation"] = ablation_results
+
+            self.history.append(epoch_record)
 
             save_json({"history": self.history}, self.exp_dir / "history.json")
 
@@ -382,7 +361,12 @@ class Trainer:
                 path=self.ckpt_dir / "latest.pt",
             )
 
-            if val_spearman > self.best_spearman:
+            # Do not compare/save meta-only warmup epochs as best full-model checkpoints.
+            # meta_only uses a different inference path (meta_feat -> meta_aux_head),
+            # so its score is not directly comparable with full multimodal validation.
+            if meta_only_epoch:
+                self.logger.info("Skip saving best.pt during meta-only warmup.")
+            elif val_spearman > self.best_spearman:
                 self.best_spearman = val_spearman
                 self.best_epoch = epoch
 
@@ -401,25 +385,11 @@ class Trainer:
             "exp_name": self.exp_name,
             "best_epoch": self.best_epoch,
             "best_val_spearman": float(self.best_spearman),
-            "best_lightgbm_epoch": self.best_lightgbm_epoch,
-            "best_lightgbm_spearman": float(self.best_lightgbm_spearman),
-            "best_catboost_epoch": self.best_catboost_epoch,
-            "best_catboost_spearman": float(self.best_catboost_spearman),
-            "best_lightgbm_path": str(self.ckpt_dir / "gbdt" / "best_lightgbm.txt"),
-            "best_catboost_path": str(self.ckpt_dir / "gbdt" / "best_catboost.cbm"),
         }
         save_json(summary, self.exp_dir / "summary.json")
 
         self.logger.info("Training finished.")
         self.logger.info(f"Best epoch: {self.best_epoch}")
         self.logger.info(f"Best val spearman: {self.best_spearman:.4f}")
-        self.logger.info(
-            f"Best LightGBM spearman: {self.best_lightgbm_spearman:.4f} "
-            f"at epoch {self.best_lightgbm_epoch}"
-        )
-        self.logger.info(
-            f"Best CatBoost spearman: {self.best_catboost_spearman:.4f} "
-            f"at epoch {self.best_catboost_epoch}"
-        )
 
         return summary
