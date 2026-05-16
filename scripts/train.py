@@ -1063,6 +1063,8 @@ if __name__ == "__main__":
 # nohup python3 scripts/train.py --config configs/cross_attention_v2_fix.yaml --fold 0 --n_folds 5 > cross_attention_v2_fix.log 2>&1 &
 
 """
+nohup python3 scripts/train.py --config configs/xattn_udcap.yaml --fold 0 --n_folds 5 > xattn_udcap_fold0.log 2>&1 &
+
 === Modality Ablation Summary ===
       full | loss=0.9288 | mae=1.7273 | spearman=0.5963
  mask_text | loss=0.9809 | mae=1.7514 | spearman=0.5506

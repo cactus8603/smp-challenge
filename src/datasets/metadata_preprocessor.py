@@ -106,7 +106,23 @@ def _has_numeric_value(x: Any) -> int:
     return int(v is not None and np.isfinite(v))
 
 
-<<<<<<< HEAD
+def _has_valid_geo(lat: Any, lon: Any) -> int:
+    """
+    Return 1 only for real coordinates.
+
+    SMP raw files often encode missing geo as 0/0. The dataset builder treats
+    0.0 latitude/longitude as missing, so the metadata preprocessor must keep
+    the same rule instead of marking 0/0 as valid.
+    """
+    lat_v = _safe_float(lat)
+    lon_v = _safe_float(lon)
+    if lat_v is None or lon_v is None:
+        return 0
+    if not (np.isfinite(lat_v) and np.isfinite(lon_v)):
+        return 0
+    return int((lat_v != 0.0) or (lon_v != 0.0))
+
+
 def _word_count(x: Any) -> int:
     s = _safe_str(x, "")
     return len(s.split()) if s else 0
@@ -262,8 +278,6 @@ def _derive_text_length_features(out: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-=======
->>>>>>> 89feca2996a4b0120f22edce8af37cba6fa47dbb
 def _parse_vector(x: Any, expected_dim: int) -> Optional[list]:
     """
     Parse a comma-separated vector string into a list of floats.
@@ -354,12 +368,14 @@ class MetadataPreprocessor:
             "hour", "weekday", "year", "month", "day", "weekofyear",
             "hour_sin", "hour_cos", "weekday_sin", "weekday_cos", "month_sin", "month_cos",
 
-            # ── Geo numeric ───────────────────────────────────
+            # ── Geo / timezone numeric ───────────────────────
             "latitude", "longitude", "geoaccuracy",
+            "timezone_offset",
 
             # ── Text stats ────────────────────────────────────
             "title_len", "tags_len", "full_text_len",
             "title_word_count", "full_text_word_count", "tag_count", "avg_tag_len",
+            "location_text_len", "location_text_word_count",
             "title_digit_ratio", "title_upper_ratio", "title_punct_ratio",
             "full_text_digit_ratio", "full_text_punct_ratio",
 
@@ -372,6 +388,7 @@ class MetadataPreprocessor:
 
             # ── user_description features ─────────────────────
             "user_desc_len", "user_desc_word_count", "user_desc_keyword_count",
+            "user_description_sentiment",
 
             # ── Location encoding ─────────────────────────────
             "location_text_target_enc", "location_text_freq",
@@ -379,7 +396,6 @@ class MetadataPreprocessor:
             "country_freq", "state_freq", "city_freq",
 
             # ── REMOVED (constant / null in official data) ────
-            # "timezone_offset",        # all 0
             # "account_age_days_log1p", # all 0
             # "camera_age_days_log1p",  # all 0
             # "follower_count_log1p",   # not in official data
@@ -408,6 +424,7 @@ class MetadataPreprocessor:
             "is_weekend", "is_night", "is_workhour",
             "ispro", "ispublic",
             "has_geo", "has_title", "has_tags",
+            "has_timezone",
             "has_user_description", "has_location_text",
             "user_desc_kw_photo", "user_desc_kw_travel", "user_desc_kw_art",
             "user_desc_kw_nature", "user_desc_kw_camera", "user_desc_kw_pro",
@@ -446,46 +463,26 @@ class MetadataPreprocessor:
         out = df.copy()
 
         # Ensure raw fields used to derive presence flags exist before we create
-<<<<<<< HEAD
         # has_* columns. This keeps old datasets and newer enriched datasets
         # compatible with the same config.
         raw_needed = [
             "title", "alltags", "full_text",
             "user_description", "location_description", "location_description_clean", "location_text",
             "city", "state", "country", "latitude", "longitude", "image_path",
-=======
-        # has_* columns.  This keeps old datasets and newer enriched datasets
-        # compatible with the same config.
-        raw_needed = [
-            "title",
-            "alltags",
-            "full_text",
-            "user_description",
-            "location_description",
-            "location_text",
-            "city",
-            "country",
-            "latitude",
-            "longitude",
-            "image_path",
->>>>>>> 89feca2996a4b0120f22edce8af37cba6fa47dbb
         ]
         for c in raw_needed:
             if c not in out.columns:
                 out[c] = None
 
         # Derive missingness / availability features only when they are part of
-<<<<<<< HEAD
         # bin_cols. If a config explicitly provides a different bin_cols list,
-=======
-        # bin_cols.  If a config explicitly provides a different bin_cols list,
->>>>>>> 89feca2996a4b0120f22edce8af37cba6fa47dbb
         # we respect that list and create only the requested flags.
         if "has_geo" in self.bin_cols:
-            out["has_geo"] = (
-                out["latitude"].map(_has_numeric_value).astype(bool)
-                & out["longitude"].map(_has_numeric_value).astype(bool)
-            ).astype(np.int64)
+            out["has_geo"] = [
+                _has_valid_geo(lat, lon)
+                for lat, lon in zip(out["latitude"], out["longitude"])
+            ]
+            out["has_geo"] = pd.Series(out["has_geo"], index=out.index).astype(np.int64)
         if "has_title" in self.bin_cols:
             out["has_title"] = out["title"].map(_has_text_value).astype(np.int64)
         if "has_tags" in self.bin_cols:
@@ -498,17 +495,13 @@ class MetadataPreprocessor:
             out["has_location_text"] = out["location_text"].map(_has_text_value).astype(np.int64)
         if "has_city" in self.bin_cols:
             out["has_city"] = out["city"].map(_has_text_value).astype(np.int64)
-<<<<<<< HEAD
         if "has_state" in self.bin_cols:
             out["has_state"] = out["state"].map(_has_text_value).astype(np.int64)
-=======
->>>>>>> 89feca2996a4b0120f22edce8af37cba6fa47dbb
         if "has_country" in self.bin_cols:
             out["has_country"] = out["country"].map(_has_text_value).astype(np.int64)
         if "has_image" in self.bin_cols:
             out["has_image"] = out["image_path"].map(_has_text_value).astype(np.int64)
 
-<<<<<<< HEAD
         out = _derive_text_length_features(out)
 
         # YAML-controlled user_desc_lite:
@@ -521,8 +514,6 @@ class MetadataPreprocessor:
                 if c in out.columns:
                     out[c] = 0
 
-=======
->>>>>>> 89feca2996a4b0120f22edce8af37cba6fa47dbb
         for c in self.num_cols + self.cat_cols + self.bin_cols + self.text_cols:
             if c not in out.columns:
                 out[c] = None
@@ -648,10 +639,6 @@ class MetadataPreprocessor:
         # Description embeddings are loaded by SMPDataset from .npy/.json files.
         # Presence flags such as has_user_description remain ordinary binary
         # metadata features and do not control any hard-coded routing here.
-<<<<<<< HEAD
-=======
-
->>>>>>> 89feca2996a4b0120f22edce8af37cba6fa47dbb
         return out
 
     def fit_transform(self, train_df: pd.DataFrame) -> pd.DataFrame:

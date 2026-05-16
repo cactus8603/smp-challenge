@@ -33,6 +33,9 @@ Key changes in v2 (over v1):
 - Build location_text from location_description_clean + city/state/country.
 - Build full_text ONLY from clean fields.
 - full_train mode does NOT precompute label-derived user aggregate features, avoiding KFold leakage.
+
+python3 build_dataset.py --input_dir /local/smp/data --output_dir /local/smp/processed_v3 --split_mode full_train
+
 """
 
 from __future__ import annotations
