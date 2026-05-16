@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from src.datasets.metadata_preprocessor import MetadataPreprocessor
+from src.datasets.metadata_preprocessor_v2 import MetadataPreprocessorV2 as MetadataPreprocessor
 from src.datasets.smp_dataset import SMPDataset, smp_collate_fn
 from src.engine.trainer import Trainer
 from src.models.fusion_model import SMPFusionModel
@@ -47,6 +47,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="Number of GroupKFold splits.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from latest.pt checkpoint if it exists.",
     )
     return parser.parse_args()
 
@@ -91,8 +96,8 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def build_loss(loss_name: str):
-    name = loss_name.lower()
+def build_loss(loss_cfg: dict):
+    name = loss_cfg["name"].lower()
 
     if name == "mse":
         return torch.nn.MSELoss()
@@ -110,37 +115,27 @@ def build_loss(loss_name: str):
             max_weight=3.0,
         )
     elif name == "hybrid":
-        # return HybridLoss(
-        #     alpha=1.0,
-        #     beta=0.3,
-        #     gamma=0.1,
-        #     margin=0.0,
-        #     min_target_diff=0.1,
-        #     weight_by_target_diff=True,
-        #     max_weight=5.0,
-        #     high_target_scale=0.5,
-        #     reg_max_weight=3.0,
-        # )
         return HybridLoss(
-            alpha=1.0,
-            beta=0.45,
-            gamma=0.15,
-            delta=0.10,
-            eta=0.08,
-            zeta=0.20,
+            alpha=float(loss_cfg.get("alpha", 1.0)),
+            beta=float(loss_cfg.get("beta", 0.45)),
+            gamma=float(loss_cfg.get("gamma", 0.15)),
+            delta=float(loss_cfg.get("delta", 0.10)),
+            eta=float(loss_cfg.get("eta", 0.08)),
+            zeta=float(loss_cfg.get("zeta", 0.20)),
 
-            hard_scale=1.2,
-            high_target_scale=0.25,
-            reg_max_weight=4.0,
+            hard_scale=float(loss_cfg.get("hard_scale", 1.2)),
+            high_target_scale=float(loss_cfg.get("high_target_scale", 0.25)),
+            reg_max_weight=float(loss_cfg.get("reg_max_weight", 4.0)),
 
-            min_target_diff=0.15,
-            rank_max_weight=4.0,
+            min_target_diff=float(loss_cfg.get("min_target_diff", 0.15)),
+            rank_max_weight=float(loss_cfg.get("rank_max_weight", 4.0)),
 
-            variance_floor_ratio=0.60,
-            focal_gamma=1.5,
+            variance_floor_ratio=float(loss_cfg.get("variance_floor_ratio", 0.60)),
+            focal_gamma=float(loss_cfg.get("focal_gamma", 1.5)),
+            label_smooth_sigma=float(loss_cfg.get("label_smooth_sigma", 0.0)),
         )
     else:
-        raise ValueError(f"Unsupported loss: {loss_name}")
+        raise ValueError(f"Unsupported loss: {name}")
 
 
 def load_dataframe(path: str) -> pd.DataFrame:
@@ -416,6 +411,9 @@ def main():
     # -------------------------
     # datasets
     # -------------------------
+    caption_max_freq = data_cfg.get("caption_max_freq", 50)
+    use_caption = bool(data_cfg.get("use_caption", True))
+
     train_dataset = SMPDataset(
         df=train_df,
         preprocessor=preprocessor,
@@ -425,6 +423,8 @@ def main():
         user_desc_idx_path=user_desc_idx_path,
         loc_desc_emb_path=loc_desc_emb_path,
         loc_desc_idx_path=loc_desc_idx_path,
+        caption_max_freq=caption_max_freq,
+        use_caption=use_caption,
         normalize_label=True,
         label_mean=label_mean,
         label_std=label_std,
@@ -446,6 +446,8 @@ def main():
         user_desc_idx_path=user_desc_idx_path,
         loc_desc_emb_path=loc_desc_emb_path,
         loc_desc_idx_path=loc_desc_idx_path,
+        caption_max_freq=caption_max_freq,
+        use_caption=use_caption,
         normalize_label=True,
         label_mean=label_mean,
         label_std=label_std,
@@ -513,6 +515,7 @@ def main():
         desc_bottleneck_dim=int(meta_cfg.get("desc_bottleneck_dim", 64)),
         user_desc_scale=float(meta_cfg.get("user_desc_scale", 0.10)),
         loc_desc_scale=float(meta_cfg.get("loc_desc_scale", 0.05)),
+        feature_gate_config=preprocessor.feature_gate_config,
     ).to(device)
 
     # -------------------------
@@ -524,7 +527,7 @@ def main():
         weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
     )
 
-    criterion = build_loss(loss_cfg["name"])
+    criterion = build_loss(loss_cfg)
 
     total_steps = len(train_loader) * int(train_cfg["epochs"])
     warmup_steps = int(total_steps * train_cfg["warmup_ratio"])
@@ -548,12 +551,32 @@ def main():
         grad_clip_norm=train_cfg.get("grad_clip_norm"),
     )
 
+    # -------------------------
+    # resume from checkpoint
+    # -------------------------
+    total_epochs = int(train_cfg["epochs"])
+    resume_ckpt = ckpt_dir / "latest.pt"
+    if args.resume and resume_ckpt.exists():
+        ckpt = torch.load(resume_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        resumed_epoch = int(ckpt["epoch"])
+        best_score_resume = float(ckpt.get("best_score", -1.0))
+        trainer.best_spearman = best_score_resume
+        remaining_epochs = total_epochs - resumed_epoch
+        print(f"[INFO] Resumed from epoch {resumed_epoch} | best_spearman={best_score_resume:.4f} | remaining={remaining_epochs}")
+        total_epochs = remaining_epochs
+    elif args.resume:
+        print(f"[WARNING] --resume set but no checkpoint found at {resume_ckpt}. Starting from scratch.")
+
     monitor_cfg = cfg.get("monitor", {})
 
     trainer.fit(
         train_loader=train_loader,
         val_loader=val_loader,
-        epochs=int(train_cfg["epochs"]),
+        epochs=total_epochs,
         monitor_gbdt=bool(monitor_cfg.get("gbdt", False)),
         gbdt_interval=int(monitor_cfg.get("gbdt_interval", 1)),
         gbdt_max_train_batches=monitor_cfg.get("gbdt_max_train_batches", None),

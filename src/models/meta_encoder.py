@@ -236,6 +236,8 @@ class MetaEncoder(nn.Module):
         desc_bottleneck_dim: int = 64,
         use_user_desc: bool = False,
         use_loc_desc: bool = False,     # 關閉：location_description 官方資料全是 None
+        # ── feature gating ────────────────────────────────────
+        feature_gate_config: Optional[List[dict]] = None,
     ) -> None:
         super().__init__()
 
@@ -243,6 +245,9 @@ class MetaEncoder(nn.Module):
         self.cat_cardinalities = list(cat_cardinalities or [])
         self.cat_input_dim   = len(self.cat_cardinalities)
         self.bin_input_dim   = bin_input_dim
+
+        # feature gate groups: each group gates a set of num/cat dims by one bin flag
+        self.feature_gate_config: List[dict] = feature_gate_config or []
         self.output_dim      = output_dim
         self.branch_dim      = branch_dim
         self.use_user_desc   = use_user_desc and user_desc_dim > 0
@@ -424,6 +429,31 @@ class MetaEncoder(nn.Module):
         """
         branch_reprs: List[torch.Tensor] = []
         B = self._get_batch_size(meta_num, meta_cat, meta_bin, user_desc, loc_desc)
+
+        # ── feature gating ────────────────────────────────────────────────────
+        # For each gate group: flag=0 → zero the gated num dims / force cat to UNK(0)
+        # Applied before branch MLPs so encoders never see spurious imputed values.
+        if self.feature_gate_config and meta_bin is not None:
+            num_cloned = False
+            cat_cloned = False
+            for group in self.feature_gate_config:
+                flag = meta_bin[:, group["flag_bin_idx"]].float()  # [B]
+
+                if meta_num is not None and group["num_indices"]:
+                    if not num_cloned:
+                        meta_num = meta_num.clone()
+                        num_cloned = True
+                    for idx in group["num_indices"]:
+                        meta_num[:, idx] = meta_num[:, idx] * flag
+
+                if meta_cat is not None and group["cat_indices"]:
+                    if not cat_cloned:
+                        meta_cat = meta_cat.clone()
+                        cat_cloned = True
+                    flag_long = flag.long()
+                    for idx in group["cat_indices"]:
+                        meta_cat[:, idx] = meta_cat[:, idx] * flag_long
+        # ─────────────────────────────────────────────────────────────────────
 
         if self.use_num:
             if meta_num is None:

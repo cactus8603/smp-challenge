@@ -73,6 +73,10 @@ class SMPDataset(Dataset):
         user_desc_idx_path: str | None = None,   # path to user_desc uid_index .json
         loc_desc_emb_path: str | None = None,    # optional path to location_desc .npy file
         loc_desc_idx_path: str | None = None,    # optional path to location_desc key/index .json
+        # caption quality filter: captions appearing > this threshold are treated as generic
+        caption_max_freq: int | None = 50,
+        # set to False to exclude BLIP-2 captions from CLIP text input entirely
+        use_caption: bool = True,
     ) -> None:
         if not preprocessor.fitted:
             raise ValueError("preprocessor must be fitted before building SMPDataset.")
@@ -100,6 +104,18 @@ class SMPDataset(Dataset):
         self.num_cols = preprocessor.transformed_num_cols
         self.cat_cols = preprocessor.transformed_cat_cols
         self.bin_cols = preprocessor.transformed_bin_cols
+
+        self.use_caption = use_caption
+
+        # Build set of generic/unreliable captions based on frequency
+        self._generic_captions: set[str] = set()
+        if caption_max_freq is not None and "caption" in self.df.columns:
+            freq = self.df["caption"].value_counts()
+            self._generic_captions = set(freq[freq > caption_max_freq].index.tolist())
+            print(
+                f"[SMPDataset] Caption filter: {len(self._generic_captions)} generic captions "
+                f"(freq > {caption_max_freq}) will fall back to tag path."
+            )
 
         self.meta_num_dim = len(self.num_cols)
         self.meta_cat_dim = len(self.cat_cols)
@@ -252,19 +268,24 @@ class SMPDataset(Dataset):
     ) -> str:
         """
         Build a short, information-dense text for CLIP.
-        Explicitly keep the final text within CLIP's 77-token limit.
+        Format: title | tags: … | topic: … | caption: …
+        Tags are the primary descriptor (greedy up to max_tags).
+        Caption is appended as a supplement only if tokens remain.
         """
         title = safe_str(row.get("title", ""))
         category = safe_str(row.get("category", ""))
         subcategory = safe_str(row.get("subcategory", ""))
         concept = safe_str(row.get("concept", ""))
-
-        tags = self.select_tags(row.get("alltags", ""), max_tags=max_tags)
+        caption = safe_str(row.get("caption", ""))
 
         topic_parts = [x for x in [category, subcategory, concept] if x]
         topic_parts = self.dedup_preserve_order(topic_parts, lowercase_key=False)
         topic_text = "topic: " + ", ".join(topic_parts) if topic_parts else ""
 
+        use_caption = self.use_caption and bool(caption) and caption not in self._generic_captions
+
+        # Step 1: greedy tag fill (title | tags | topic)
+        tags = self.select_tags(row.get("alltags", ""), max_tags=max_tags)
         kept_tags: List[str] = []
         for tag in tags:
             candidate_tags = kept_tags + [tag]
@@ -275,24 +296,22 @@ class SMPDataset(Dataset):
                 parts.append("tags: " + " ".join(candidate_tags))
             if topic_text:
                 parts.append(topic_text)
-
             candidate_text = " | ".join([p for p in parts if p]).strip()
             if self.count_clip_tokens(candidate_text) <= max_tokens:
                 kept_tags = candidate_tags
             else:
                 break
 
-        final_parts: List[str] = []
+        final_parts_tag: List[str] = []
         if title:
-            final_parts.append(title)
+            final_parts_tag.append(title)
         if kept_tags:
-            final_parts.append("tags: " + " ".join(kept_tags))
+            final_parts_tag.append("tags: " + " ".join(kept_tags))
         if topic_text:
-            final_parts.append(topic_text)
+            final_parts_tag.append(topic_text)
 
-        final_text = " | ".join([p for p in final_parts if p]).strip()
+        final_text = " | ".join([p for p in final_parts_tag if p]).strip()
 
-        # If still too long, shrink title from the end while keeping tags/topic.
         if self.count_clip_tokens(final_text) > max_tokens and title:
             title_words = title.split()
             while len(title_words) > 1:
@@ -306,6 +325,24 @@ class SMPDataset(Dataset):
                 if self.count_clip_tokens(candidate_text) <= max_tokens:
                     final_text = candidate_text
                     break
+
+        # Step 2: append caption in remaining token budget
+        if use_caption:
+            cap_budget = max_tokens - self.count_clip_tokens(final_text) - 5  # " | caption: "
+            if cap_budget > 4:
+                cap_words = caption.split()
+                lo, hi = 1, len(cap_words)
+                best = 0
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    candidate = final_text + " | caption: " + " ".join(cap_words[:mid])
+                    if self.count_clip_tokens(candidate) <= max_tokens:
+                        best = mid
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                if best > 0:
+                    final_text = final_text + " | caption: " + " ".join(cap_words[:best])
 
         # Final safety fallback.
         if self.tokenizer is not None and self.count_clip_tokens(final_text) > max_tokens:

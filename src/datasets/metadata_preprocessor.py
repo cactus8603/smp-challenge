@@ -439,7 +439,10 @@ class MetadataPreprocessor:
             user_desc_dim=payload.get("user_desc_dim", 400),
             loc_desc_dim=payload.get("loc_desc_dim", 400),
         )
-        obj.num_stats = {k: NumericStats(**v) for k, v in payload["num_stats"].items()}
+        obj.num_stats = {
+            k: NumericStats(median=v["median"], mean=v["mean"], std=v["std"])
+            for k, v in payload["num_stats"].items()
+        }
         obj.cat_vocab = {
             k: {str(kk): int(vv) for kk, vv in vocab.items()}
             for k, vocab in payload["cat_vocab"].items()

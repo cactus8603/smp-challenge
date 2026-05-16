@@ -55,6 +55,8 @@ class SMPFusionModel(nn.Module):
         desc_bottleneck_dim: int = 64,
         user_desc_scale: float = 0.10,
         loc_desc_scale: float = 0.05,
+        # ── feature gating ──────────────────────────────────
+        feature_gate_config: Optional[list] = None,
     ) -> None:
         super().__init__()
 
@@ -154,6 +156,7 @@ class SMPFusionModel(nn.Module):
                 user_desc_dim=user_desc_dim,
                 loc_desc_dim=loc_desc_dim,
                 desc_bottleneck_dim=desc_bottleneck_dim,
+                feature_gate_config=feature_gate_config,
             )
             fusion_input_dims["meta"] = hidden_dim
 

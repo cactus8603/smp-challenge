@@ -1,0 +1,81 @@
+base: baseline.yaml
+
+seed: 42
+exp_name: baseline_v1
+
+data:
+  official_train_path: /ssd1/lchiayu/smp-challenge/data/processed_v1/official_train.parquet
+
+# Limit preprocess to columns that exist in v1 data.
+# v2-only columns (city, country, user_desc_len, geo target encodings, etc.) are excluded
+# to avoid polluting the feature space with all-zero/UNK values.
+preprocess:
+  num_cols:
+    - hour
+    - weekday
+    - year
+    - month
+    - day
+    - weekofyear
+    - hour_sin
+    - hour_cos
+    - weekday_sin
+    - weekday_cos
+    - month_sin
+    - month_cos
+    - latitude
+    - longitude
+    - geoaccuracy
+    - title_len
+    - tags_len
+    - full_text_len
+    - title_word_count
+    - full_text_word_count
+    - tag_count
+    - avg_tag_len
+    - title_digit_ratio
+    - title_upper_ratio
+    - title_punct_ratio
+    - full_text_digit_ratio
+    - full_text_punct_ratio
+    - timezone_offset
+    - photo_count_log1p
+    - follower_count_log1p
+    - following_count_log1p
+    - total_views_log1p
+    - total_favorites_log1p
+    - mean_views_log1p
+    - mean_favorites_log1p
+    - mean_tags_log1p
+    - account_age_days_log1p
+    - camera_age_days_log1p
+    - follower_following_ratio
+    - views_per_photo
+    - favorites_per_photo
+    - user_prev_post_count
+    - user_mean_label
+    - user_active_hour_mean
+    - user_category_nunique
+
+  cat_cols:
+    - category
+    - subcategory
+    - concept
+    - category_subcategory_combo
+    - category_concept_combo
+    - geo_cluster
+    - timezone_id
+    - mediastatus
+    - mediatype
+
+  bin_cols:
+    - is_weekend
+    - is_night
+    - is_workhour
+    - ispro
+    - canbuypro
+    - ispublic
+    - has_geo
+    - has_title
+    - has_tags
+    - has_user_description

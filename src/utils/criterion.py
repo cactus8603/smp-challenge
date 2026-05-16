@@ -361,9 +361,11 @@ class HybridLoss(nn.Module):
 
         variance_floor_ratio: float = 0.7,
         focal_gamma: float = 2.0,
+        label_smooth_sigma: float = 0.0,  # Gaussian noise std added to targets during training
     ):
         super().__init__()
 
+        self.label_smooth_sigma = label_smooth_sigma
         self.reg_loss = HardRegressionLoss(
             beta=reg_beta,
             hard_scale=hard_scale,
@@ -402,6 +404,9 @@ class HybridLoss(nn.Module):
     def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         preds = preds.view(-1)
         targets = targets.view(-1)
+
+        if self.label_smooth_sigma > 0 and self.training:
+            targets = targets + torch.randn_like(targets) * self.label_smooth_sigma
 
         reg = self.reg_loss(preds, targets)
         rank = self.rank_loss(preds, targets)

@@ -1,0 +1,37 @@
+base: base.yaml
+
+exp_name: test_v9
+
+data:
+  official_train_path: /ssd1/lchiayu/smp-challenge/data/processed_v5/official_train_cap.parquet
+  use_caption: false   # BLIP-2 caption excluded from CLIP text input
+
+# NOTE: use_meta here activates the MetaEncoder for CLIP similarity features only
+#       (clip_text_image_sim, clip_text_caption_sim, clip_caption_image_sim)
+#       Traditional tabular metadata is intentionally excluded in this experiment.
+model:
+  use_text: true
+  use_image: true
+  use_meta: true
+
+fusion:
+  type: concat
+  use_clip_similarity: false   # similarity already pre-computed in processed_v5 num_cols
+
+train:
+  epochs: 13
+
+loss:
+  name: hybrid
+  zeta: 0.08
+  label_smooth_sigma: 0.15
+
+preprocess:
+  num_cols:
+    - clip_text_image_sim
+    - clip_text_caption_sim
+    - clip_caption_image_sim
+
+  cat_cols: []
+
+  bin_cols: []

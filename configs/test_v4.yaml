@@ -1,0 +1,96 @@
+base: base.yaml
+
+exp_name: test_v4
+
+data:
+  official_train_path: /ssd1/lchiayu/smp-challenge/data/processed_v4/official_train_cap.parquet
+  user_desc_emb_path: /ssd1/lchiayu/smp-challenge/data/processed_v2/embeddings/user_desc_embeddings.npy
+  user_desc_idx_path: /ssd1/lchiayu/smp-challenge/data/processed_v2/embeddings/user_desc_uid_index.json
+  caption_max_freq: 50
+
+preprocess:
+  num_cols:
+    # 時間特徵
+    - hour
+    - weekday
+    - year
+    - month
+    - day
+    - weekofyear
+    - hour_sin
+    - hour_cos
+    - weekday_sin
+    - weekday_cos
+    - month_sin
+    - month_cos
+    # 地理
+    - latitude
+    - longitude
+    - geoaccuracy
+    # 文字長度
+    - title_len
+    - tags_len
+    - full_text_len
+    - title_word_count
+    - full_text_word_count
+    - tag_count
+    - avg_tag_len
+    - title_digit_ratio
+    - title_upper_ratio
+    - title_punct_ratio
+    - full_text_digit_ratio
+    - full_text_punct_ratio
+    # 時區
+    - timezone_offset
+    # 用戶統計（log1p 已在 parquet 完成）
+    - photo_count_log1p
+    - follower_count_log1p
+    - following_count_log1p
+    - total_views_log1p
+    - total_favorites_log1p
+    - mean_views_log1p
+    - mean_favorites_log1p
+    - mean_tags_log1p
+    - account_age_days_log1p
+    - camera_age_days_log1p
+    - follower_following_ratio
+    - views_per_photo
+    - favorites_per_photo
+    # fold-train 動態計算
+    - user_prev_post_count
+    - user_mean_label
+    - user_active_hour_mean
+    - user_category_nunique
+    # v3 新增（有效的）
+    - user_description_sentiment
+    - user_description_clean_len
+    - user_description_clean_word_count
+
+  cat_cols:
+    - category
+    - subcategory
+    - concept
+    - category_subcategory_combo
+    - category_concept_combo
+    - geo_cluster
+    - timezone_id
+    - mediastatus
+    - mediatype
+    - city
+    - country
+
+  bin_cols:
+    - is_weekend
+    - is_night
+    - is_workhour
+    - ispro
+    - canbuypro
+    - ispublic
+    - has_geo
+    - has_title
+    - has_tags
+    - has_user_description
+    - has_location_text
+    - has_timezone
+    - has_city
+    - has_country

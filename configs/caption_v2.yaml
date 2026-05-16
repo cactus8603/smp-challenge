@@ -1,0 +1,9 @@
+base: baseline.yaml
+
+seed: 42
+exp_name: caption_v2
+
+data:
+  official_train_path: /ssd1/lchiayu/smp-challenge/data/processed_v2/official_train_cap.parquet
+  # captions appearing > 50 times are treated as generic and fall back to tag path
+  caption_max_freq: 50

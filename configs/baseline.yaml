@@ -1,0 +1,15 @@
+base: base.yaml
+
+seed: 42
+exp_name: baseline
+
+data:
+  official_train_path: /ssd1/lchiayu/smp-challenge/data/processed_v2/official_train.parquet
+  user_desc_emb_path: null
+  user_desc_idx_path: null
+  loc_desc_emb_path: null
+  loc_desc_idx_path: null
+
+meta:
+  use_user_desc: false
+  use_loc_desc: false
