@@ -404,7 +404,6 @@ class MetadataPreprocessor:
             # "timezone_id",   # cardinality=1
             # "mediastatus",   # cardinality=1
         ]
-<<<<<<< HEAD
         self.bin_cols = bin_cols or [
             "is_weekend", "is_night", "is_workhour",
             "ispro", "ispublic",
@@ -419,28 +418,6 @@ class MetadataPreprocessor:
             # "canbuypro",     # all 0
             # "has_full_text", # all 1
             # "has_image",     # all 1
-=======
-        # Keep has_* as ordinary binary metadata features.
-        # These are useful missingness / availability signals for the metadata
-        # encoder.  They should NOT be used through brittle hard-coded index
-        # logic such as model.set_bin_col_idx(...).
-        self.bin_cols = bin_cols or [
-            "is_weekend",
-            "is_night",
-            "is_workhour",
-            "ispro",
-            "canbuypro",
-            "ispublic",
-            "has_geo",
-            "has_title",
-            "has_tags",
-            "has_full_text",
-            "has_user_description",
-            "has_location_text",
-            "has_city",
-            "has_country",
-            "has_image",
->>>>>>> 89feca2996a4b0120f22edce8af37cba6fa47dbb
         ]
         self.text_cols = text_cols or ["title", "alltags", "full_text"]
         self.log1p_cols = log1p_cols or []
