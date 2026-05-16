@@ -106,6 +106,7 @@ def _has_numeric_value(x: Any) -> int:
     return int(v is not None and np.isfinite(v))
 
 
+<<<<<<< HEAD
 def _word_count(x: Any) -> int:
     s = _safe_str(x, "")
     return len(s.split()) if s else 0
@@ -261,6 +262,8 @@ def _derive_text_length_features(out: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+=======
+>>>>>>> 89feca2996a4b0120f22edce8af37cba6fa47dbb
 def _parse_vector(x: Any, expected_dim: int) -> Optional[list]:
     """
     Parse a comma-separated vector string into a list of floats.
@@ -401,6 +404,7 @@ class MetadataPreprocessor:
             # "timezone_id",   # cardinality=1
             # "mediastatus",   # cardinality=1
         ]
+<<<<<<< HEAD
         self.bin_cols = bin_cols or [
             "is_weekend", "is_night", "is_workhour",
             "ispro", "ispublic",
@@ -415,6 +419,28 @@ class MetadataPreprocessor:
             # "canbuypro",     # all 0
             # "has_full_text", # all 1
             # "has_image",     # all 1
+=======
+        # Keep has_* as ordinary binary metadata features.
+        # These are useful missingness / availability signals for the metadata
+        # encoder.  They should NOT be used through brittle hard-coded index
+        # logic such as model.set_bin_col_idx(...).
+        self.bin_cols = bin_cols or [
+            "is_weekend",
+            "is_night",
+            "is_workhour",
+            "ispro",
+            "canbuypro",
+            "ispublic",
+            "has_geo",
+            "has_title",
+            "has_tags",
+            "has_full_text",
+            "has_user_description",
+            "has_location_text",
+            "has_city",
+            "has_country",
+            "has_image",
+>>>>>>> 89feca2996a4b0120f22edce8af37cba6fa47dbb
         ]
         self.text_cols = text_cols or ["title", "alltags", "full_text"]
         self.log1p_cols = log1p_cols or []
@@ -443,19 +469,40 @@ class MetadataPreprocessor:
         out = df.copy()
 
         # Ensure raw fields used to derive presence flags exist before we create
+<<<<<<< HEAD
         # has_* columns. This keeps old datasets and newer enriched datasets
         # compatible with the same config.
         raw_needed = [
             "title", "alltags", "full_text",
             "user_description", "location_description", "location_description_clean", "location_text",
             "city", "state", "country", "latitude", "longitude", "image_path",
+=======
+        # has_* columns.  This keeps old datasets and newer enriched datasets
+        # compatible with the same config.
+        raw_needed = [
+            "title",
+            "alltags",
+            "full_text",
+            "user_description",
+            "location_description",
+            "location_text",
+            "city",
+            "country",
+            "latitude",
+            "longitude",
+            "image_path",
+>>>>>>> 89feca2996a4b0120f22edce8af37cba6fa47dbb
         ]
         for c in raw_needed:
             if c not in out.columns:
                 out[c] = None
 
         # Derive missingness / availability features only when they are part of
+<<<<<<< HEAD
         # bin_cols. If a config explicitly provides a different bin_cols list,
+=======
+        # bin_cols.  If a config explicitly provides a different bin_cols list,
+>>>>>>> 89feca2996a4b0120f22edce8af37cba6fa47dbb
         # we respect that list and create only the requested flags.
         if "has_geo" in self.bin_cols:
             out["has_geo"] = (
@@ -474,13 +521,17 @@ class MetadataPreprocessor:
             out["has_location_text"] = out["location_text"].map(_has_text_value).astype(np.int64)
         if "has_city" in self.bin_cols:
             out["has_city"] = out["city"].map(_has_text_value).astype(np.int64)
+<<<<<<< HEAD
         if "has_state" in self.bin_cols:
             out["has_state"] = out["state"].map(_has_text_value).astype(np.int64)
+=======
+>>>>>>> 89feca2996a4b0120f22edce8af37cba6fa47dbb
         if "has_country" in self.bin_cols:
             out["has_country"] = out["country"].map(_has_text_value).astype(np.int64)
         if "has_image" in self.bin_cols:
             out["has_image"] = out["image_path"].map(_has_text_value).astype(np.int64)
 
+<<<<<<< HEAD
         out = _derive_text_length_features(out)
 
         # YAML-controlled user_desc_lite:
@@ -493,6 +544,8 @@ class MetadataPreprocessor:
                 if c in out.columns:
                     out[c] = 0
 
+=======
+>>>>>>> 89feca2996a4b0120f22edce8af37cba6fa47dbb
         for c in self.num_cols + self.cat_cols + self.bin_cols + self.text_cols:
             if c not in out.columns:
                 out[c] = None
@@ -618,6 +671,10 @@ class MetadataPreprocessor:
         # Description embeddings are loaded by SMPDataset from .npy/.json files.
         # Presence flags such as has_user_description remain ordinary binary
         # metadata features and do not control any hard-coded routing here.
+<<<<<<< HEAD
+=======
+
+>>>>>>> 89feca2996a4b0120f22edce8af37cba6fa47dbb
         return out
 
     def fit_transform(self, train_df: pd.DataFrame) -> pd.DataFrame:
