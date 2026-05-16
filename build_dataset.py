@@ -1,34 +1,61 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-Build unified SMP-Image train/val/test tables from raw official files.
+build_dataset_v4.py
 
-Key points:
-- train labels are loaded from train_label.txt by row order
-- the i-th label corresponds to the i-th line in train_img_filepath.txt
-- official train is split into train/val
-- train/val/test feature columns are aligned
-- only test has no true label
+Build unified SMP-Image train/test tables from official raw files.
+
+v4 = v3 (timezone fix + sentiment + reverse geocoding) + v2 (location text parsing).
+Output path follows v2: processed_v2/
+
+Key changes in v4 (over v3):
+- Restore location text parsing from v2 (_COUNTRY_ALIASES, _US_STATE_ABBR,
+  parse_location_text, enrich_location_from_text).
+- Two-layer location enrichment:
+    Layer 1 — reverse_geo from lat/lon (~12% of rows, accurate)
+    Layer 2 — parse free-form location_description text (~28% additional rows
+              that have text like "Vienna, Austria" but no lat/lon)
+  Total coverage: ~40% of rows have city/country (vs v3's ~12%).
+
+Key changes in v3 (over v2):
+- Fix timezone_offset parsing: raw values are "-08:00" strings; v2 silently dropped
+  them via to_int(). v3 parses them to float hours (e.g. -8.0, +1.5).
+- Add has_timezone binary flag (1 = user had timezone in raw data, 0 = missing).
+- Impute missing timezone from lat/lon via TimezoneFinder (layer 1), then fall back
+  to timezone_id="Unknown" / timezone_offset=0.0 (layer 2).
+- Add user_description_sentiment: VADER compound score on the cleaned description
+  (-1 to +1, 0.0 when description is absent).
+
+Key changes in v2 (over v1):
+- Clean title / tags / user_description / location_description before building full_text.
+- Keep raw user/location descriptions, and add *_clean columns.
+- Preserve city/state/country if they already exist in temporalspatial files.
+- Build location_text from location_description_clean + city/state/country.
+- Build full_text ONLY from clean fields.
+- full_train mode does NOT precompute label-derived user aggregate features, avoiding KFold leakage.
 """
 
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import math
 import re
-from datetime import datetime
+from datetime import datetime, timezone as dt_timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 
-LOGGER = logging.getLogger("build_dataset")
+LOGGER = logging.getLogger("build_dataset_v4")
 
 
+# -----------------------------------------------------------------------------
+# Basic helpers
+# -----------------------------------------------------------------------------
 def setup_logging(verbose: bool = False) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -36,15 +63,23 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
-def empty_to_none(value: Any) -> Any:
+def safe_str(value: Any) -> str:
     if value is None:
-        return None
-    if isinstance(value, str):
-        v = value.strip()
-        if v == "":
-            return None
-        return v
-    return value
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    s = str(value).strip()
+    if s.lower() in {"none", "nan", "null", "<na>"}:
+        return ""
+    return s
+
+
+def empty_to_none(value: Any) -> Any:
+    s = safe_str(value)
+    return s if s else None
 
 
 def to_int(value: Any) -> Optional[int]:
@@ -79,12 +114,384 @@ def to_float(value: Any) -> Optional[float]:
         return None
 
 
-def safe_div(a: float, b: float) -> Optional[float]:
+def parse_timezone_offset(value: Any) -> Optional[float]:
+    """Convert a timezone offset string or number to float hours.
+
+    Handles formats like "-08:00", "+05:30", "3600", -28800.
+    Returns None for missing/unparseable values.
+    """
+    value = empty_to_none(value)
+    if value is None:
+        return None
+    s = str(value).strip()
+    # "+HH:MM" / "-HH:MM"
+    m = re.match(r"^([+-]?)(\d{1,2}):(\d{2})$", s)
+    if m:
+        sign = -1 if m.group(1) == "-" else 1
+        hours = int(m.group(2))
+        minutes = int(m.group(3))
+        return sign * (hours + minutes / 60.0)
+    # plain integer seconds (e.g. -28800 = -8 h)
+    try:
+        seconds = float(s)
+        if abs(seconds) > 86400:          # guard against garbage large values
+            return None
+        if abs(seconds) <= 24:            # already looks like hours
+            return seconds
+        return seconds / 3600.0
+    except ValueError:
+        return None
+
+
+def safe_div(a: Any, b: Any) -> Optional[float]:
+    a = to_float(a)
+    b = to_float(b)
     if a is None or b is None or b == 0:
         return None
     return a / b
 
 
+def clean_description(x: Any) -> str:
+    """Clean dirty Flickr/user text before it can enter full_text."""
+    s = safe_str(x)
+    if not s:
+        return ""
+
+    s = html.unescape(s)
+
+    # remove full HTML tags, including href/src attributes
+    s = re.sub(r"<[^>]*>", " ", s)
+
+    # remove URLs / domains / mailto
+    s = re.sub(r"\b(?:https?|ftp)://[^\s\"'<>()]+", " ", s, flags=re.I)
+    s = re.sub(r"\bwww\.[^\s\"'<>()]+", " ", s, flags=re.I)
+    s = re.sub(r"\bmailto:[^\s\"'<>()]+", " ", s, flags=re.I)
+    s = re.sub(
+        r"\b[a-zA-Z0-9.-]+\.(?:com|org|net|edu|gov|co|io|me|info|biz|jp|tw|uk|de|fr|it|es|ca|au|in|cn|hk|ph|nl|se|ru)(?:/[^\s\"'<>()]*)?",
+        " ",
+        s,
+        flags=re.I,
+    )
+
+    # remove emails / obfuscated emails
+    s = re.sub(r"\b[\w.+-]+@[\w.-]+\.\w+\b", " ", s)
+    s = re.sub(
+        r"\b[\w.+-]+\s*(?:\{AT\}|\[AT\]|\(AT\)| at )\s*[\w.-]+\b",
+        " ",
+        s,
+        flags=re.I,
+    )
+
+    # remove filenames
+    s = re.sub(
+        r"\b\S+\.(?:jpg|jpeg|png|gif|webp|bmp|tiff|svg|html|htm|php|aspx|pdf|zip)\b",
+        " ",
+        s,
+        flags=re.I,
+    )
+
+    # remove repeated separators: ------, =====, *****
+    s = re.sub(r"[-_=*~#]{3,}", " ", s)
+
+    # remove repeated punctuation: !!!!!, ......, ///////
+    s = re.sub(r"([!?.,/\\|:;])\1{2,}", " ", s)
+
+    # remove very long garbage tokens
+    s = re.sub(r"\b\S{35,}\b", " ", s)
+
+    # remove common HTML leftovers
+    s = re.sub(
+        r"\b(?:href|src|rel|nofollow|class|title|alt|img|target|blank|style|width|height)\b",
+        " ",
+        s,
+        flags=re.I,
+    )
+
+    # remove weird brackets/symbols
+    s = re.sub(r"[<>={}\[\]|\\]", " ", s)
+
+    # normalize spaces
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def truncate_words(text: Any, max_words: int) -> str:
+    s = safe_str(text)
+    if not s or max_words <= 0:
+        return ""
+    return " ".join(s.split()[:max_words])
+
+
+def join_unique(parts: List[Any], sep: str = " ") -> str:
+    seen = set()
+    out: List[str] = []
+    for p in parts:
+        s = safe_str(p)
+        if not s:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return sep.join(out).strip()
+
+
+# -----------------------------------------------------------------------------
+# Location parsing / enrichment (from v2, for rows without lat/lon)
+# -----------------------------------------------------------------------------
+_COUNTRY_ALIASES = {
+    "usa": "United States",
+    "u.s.a": "United States",
+    "u.s.a.": "United States",
+    "us": "United States",
+    "u.s": "United States",
+    "u.s.": "United States",
+    "united states of america": "United States",
+    "america": "United States",
+    "uk": "United Kingdom",
+    "u.k": "United Kingdom",
+    "u.k.": "United Kingdom",
+    "gb": "United Kingdom",
+    "g.b.": "United Kingdom",
+    "great britain": "United Kingdom",
+    "england": "United Kingdom",
+    "scotland": "United Kingdom",
+    "wales": "United Kingdom",
+    "brasil": "Brazil",
+    "deutschland": "Germany",
+    "españa": "Spain",
+    "espana": "Spain",
+    "méxico": "Mexico",
+    "mexico": "Mexico",
+    "czech republic": "Czechia",
+    "russian federation": "Russia",
+    "republic of korea": "South Korea",
+    "korea": "South Korea",
+    "ru": "Russia",
+    "russia": "Russia",
+    "the netherlands": "Netherlands",
+    "taiwan": "Taiwan",
+    "taiwan, province of china": "Taiwan",
+    "taiwan province of china": "Taiwan",
+    "prc": "China",
+    "peoples republic of china": "China",
+}
+
+_KNOWN_COUNTRY_NAMES = {
+    "United States", "United Kingdom", "Canada", "Australia", "New Zealand",
+    "France", "Germany", "Italy", "Spain", "Portugal", "Netherlands", "The Netherlands", "Belgium",
+    "Switzerland", "Austria", "Ireland", "Sweden", "Norway", "Denmark", "Finland",
+    "Poland", "Czechia", "Greece", "Turkey", "Russia", "Ukraine",
+    "Japan", "South Korea", "China", "Taiwan", "Hong Kong", "Singapore",
+    "Thailand", "Malaysia", "Indonesia", "Philippines", "Vietnam", "India",
+    "Brazil", "Argentina", "Chile", "Mexico", "Colombia", "Peru",
+    "South Africa", "Egypt", "Morocco", "Israel", "United Arab Emirates",
+}
+
+_US_STATE_NAMES = {
+    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+    "Connecticut", "Delaware", "Florida", "Georgia", "Hawaii", "Idaho",
+    "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana",
+    "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+    "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada",
+    "New Hampshire", "New Jersey", "New Mexico", "New York",
+    "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon",
+    "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota",
+    "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington",
+    "West Virginia", "Wisconsin", "Wyoming", "District of Columbia",
+}
+
+_US_STATE_ABBR = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota",
+    "MS": "Mississippi", "MO": "Missouri", "MT": "Montana", "NE": "Nebraska",
+    "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
+    "NM": "New Mexico", "NY": "New York", "NC": "North Carolina",
+    "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma", "OR": "Oregon",
+    "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+    "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
+    "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
+    "DC": "District of Columbia",
+}
+
+
+def clean_location_part(value: Any) -> str:
+    s = clean_description(value)
+    if not s:
+        return ""
+    s = re.sub(r"\s+", " ", s).strip(" ,;/|")
+    if s.lower() in {"none", "nan", "null", "<na>", "unknown", "unk"}:
+        return ""
+    return s
+
+
+def is_empty_location(value: Any) -> bool:
+    return clean_location_part(value) == ""
+
+
+def normalize_country(value: Any) -> str:
+    s = clean_location_part(value)
+    if not s:
+        return ""
+    key = re.sub(r"[.]", "", s.lower()).strip()
+    if key in _COUNTRY_ALIASES:
+        return _COUNTRY_ALIASES[key]
+    return s
+
+
+def normalize_state(value: Any) -> str:
+    s = clean_location_part(value)
+    if not s:
+        return ""
+    upper = s.upper().replace(".", "")
+    if upper in _US_STATE_ABBR:
+        return _US_STATE_ABBR[upper]
+    return s
+
+
+def parse_location_text(value: Any) -> Tuple[str, str, str]:
+    """
+    Heuristically parse free-form Flickr location text into city/state/country.
+
+    Examples:
+        "London, United Kingdom"
+            -> city=London, state="", country=United Kingdom
+        "Buffalo, New York, United States of America"
+            -> city=Buffalo, state=New York, country=United States
+        "France"
+            -> city="", state="", country=France
+    """
+    raw = clean_location_part(value)
+    if not raw:
+        return "", "", ""
+
+    raw = raw.replace("|", ",").replace(";", ",")
+    parts = [clean_location_part(p) for p in raw.split(",")]
+    parts = [p for p in parts if p]
+
+    if not parts:
+        return "", "", ""
+
+    if len(parts) == 1:
+        original = clean_location_part(parts[0])
+        only = normalize_country(original)
+        key = re.sub(r"[.]", "", only.lower()).strip()
+
+        if only in _KNOWN_COUNTRY_NAMES or key in _COUNTRY_ALIASES:
+            return "", "", normalize_country(only)
+
+        # "England UK" -> country=United Kingdom
+        # "Paris France" -> city=Paris, country=France
+        tokens = original.split()
+        if len(tokens) >= 2:
+            last_token_country = normalize_country(tokens[-1])
+            last_key = re.sub(r"[.]", "", last_token_country.lower()).strip()
+            if last_token_country in _KNOWN_COUNTRY_NAMES or last_key in _COUNTRY_ALIASES:
+                city_guess = clean_location_part(" ".join(tokens[:-1]))
+                return city_guess, "", normalize_country(last_token_country)
+
+        return only, "", ""
+
+    country = normalize_country(parts[-1])
+    city = ""
+    state = ""
+
+    if len(parts) == 2:
+        city = parts[0]
+    else:
+        city = parts[0]
+        state = normalize_state(parts[-2])
+
+    return clean_location_part(city), normalize_state(state), normalize_country(country)
+
+
+def first_non_empty(*values: Any) -> str:
+    for value in values:
+        s = clean_location_part(value)
+        if s:
+            return s
+    return ""
+
+
+def enrich_location_from_text(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fill city/state/country from location_description text, ONLY for rows where
+    these fields are still empty after reverse geocoding from lat/lon.
+
+    v4 design (combines v2 + v3):
+    Layer 1 (v3): reverse_geo from lat/lon (~12% of rows with valid geo)
+    Layer 2 (v2): this function — parse free-form text for remaining rows
+                  (~28% additional rows that have location_description but no lat/lon)
+    """
+    out = df.copy()
+
+    for c in [
+        "city", "state", "country",
+        "location_description", "location_description_clean", "location_text",
+    ]:
+        if c not in out.columns:
+            out[c] = None
+
+    source_text = [
+        first_non_empty(loc_clean, loc_raw, loc_text)
+        for loc_clean, loc_raw, loc_text in zip(
+            out["location_description_clean"],
+            out["location_description"],
+            out["location_text"],
+        )
+    ]
+
+    parsed = [parse_location_text(x) for x in source_text]
+    parsed_city = pd.Series([x[0] for x in parsed], index=out.index)
+    parsed_state = pd.Series([x[1] for x in parsed], index=out.index)
+    parsed_country = pd.Series([x[2] for x in parsed], index=out.index)
+
+    def fill_existing(existing: pd.Series, parsed_values: pd.Series, normalizer) -> pd.Series:
+        existing_clean = existing.map(clean_location_part)
+        parsed_clean = parsed_values.map(normalizer)
+        mask = existing_clean.map(lambda x: x == "")
+        return existing_clean.where(~mask, parsed_clean)
+
+    out["city"] = fill_existing(out["city"], parsed_city, clean_location_part)
+    out["state"] = fill_existing(out["state"], parsed_state, normalize_state)
+    out["country"] = fill_existing(out["country"], parsed_country, normalize_country)
+
+    out["has_city"] = out["city"].map(lambda x: int(bool(clean_location_part(x))))
+    out["has_state"] = out["state"].map(lambda x: int(bool(clean_location_part(x))))
+    out["has_country"] = out["country"].map(lambda x: int(bool(clean_location_part(x))))
+
+    LOGGER.info(
+        "Location enrichment from text: city=%d/%d, state=%d/%d, country=%d/%d",
+        int(out["has_city"].sum()), len(out),
+        int(out["has_state"].sum()), len(out),
+        int(out["has_country"].sum()), len(out),
+    )
+
+    for col in ["city", "state", "country"]:
+        top = (
+            out[col]
+            .map(clean_location_part)
+            .replace("", pd.NA)
+            .dropna()
+            .value_counts()
+            .head(5)
+            .to_dict()
+        )
+        if top:
+            LOGGER.info("Top %s values after enrichment: %s", col, top)
+
+    return out
+
+
+# -----------------------------------------------------------------------------
+# JSON loading
+# -----------------------------------------------------------------------------
 def parse_json_file(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -109,8 +516,11 @@ def normalize_record_keys(record: Dict[str, Any]) -> Dict[str, Any]:
         "pathalias": "Pathalias",
         "ispublic": "Ispublic",
         "mediastatus": "Mediastatus",
+        "city": "city",
+        "state": "state",
+        "country": "country",
     }
-    out = {}
+    out: Dict[str, Any] = {}
     for k, v in record.items():
         nk = alias_map.get(str(k).lower(), str(k))
         out[nk] = v
@@ -120,7 +530,22 @@ def normalize_record_keys(record: Dict[str, Any]) -> Dict[str, Any]:
 def load_json_records(path: Path) -> List[Dict[str, Any]]:
     data = parse_json_file(path)
 
+    # Official SMP JSON often stores columns as dicts:
+    # {"Uid": {"0": "..."}, "Pid": {"0": "..."}, ...}
+    # Convert that directly through pandas and back to records.
     if isinstance(data, dict):
+        if data and all(isinstance(v, dict) for v in data.values()):
+            try:
+                df = pd.DataFrame(data).reset_index(drop=True)
+                return [normalize_record_keys(r) for r in df.to_dict(orient="records")]
+            except Exception:
+                pass
+        if data and all(isinstance(v, list) for v in data.values()):
+            try:
+                df = pd.DataFrame(data).reset_index(drop=True)
+                return [normalize_record_keys(r) for r in df.to_dict(orient="records")]
+            except Exception:
+                pass
         for key in ("data", "items", "results", "records"):
             if key in data and isinstance(data[key], list):
                 data = data[key]
@@ -132,13 +557,23 @@ def load_json_records(path: Path) -> List[Dict[str, Any]]:
     if not isinstance(data, list):
         raise ValueError(f"Unsupported JSON structure in {path}")
 
-    records = []
-    for item in data:
-        if isinstance(item, dict):
-            records.append(normalize_record_keys(item))
-    return records
+    return [normalize_record_keys(item) for item in data if isinstance(item, dict)]
 
 
+def load_json_table(path: Optional[Path]) -> pd.DataFrame:
+    if path is None or not path.exists():
+        return pd.DataFrame()
+    records = load_json_records(path)
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    LOGGER.info("Loaded %s -> %d rows, %d cols", path.name, len(df), len(df.columns))
+    return df
+
+
+# -----------------------------------------------------------------------------
+# Table standardization
+# -----------------------------------------------------------------------------
 def make_post_id(uid: Any, pid: Any) -> Optional[str]:
     uid = empty_to_none(uid)
     pid = empty_to_none(pid)
@@ -191,24 +626,16 @@ def load_img_filepath_table(path: Path, split: str) -> pd.DataFrame:
 
 
 def load_label_txt(path: Path) -> pd.DataFrame:
-    """
-    Load label text file where each row is the popularity score of the
-    corresponding post in train_img_filepath.txt.
-    """
     labels: List[Optional[float]] = []
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line == "":
                 continue
-
             lower = line.lower()
-            # Skip header-like lines
             if lower in {"label", "popularityscore", "popularity_score"}:
                 continue
-
             labels.append(to_float(line))
-
     return pd.DataFrame({"label": labels})
 
 
@@ -233,17 +660,6 @@ def standardize_user_df(df: pd.DataFrame) -> pd.DataFrame:
     if "Uid" not in df.columns:
         df["Uid"] = None
     df["Uid"] = df["Uid"].map(empty_to_none).astype("string")
-    return df
-
-
-def load_json_table(path: Optional[Path]) -> pd.DataFrame:
-    if path is None or not path.exists():
-        return pd.DataFrame()
-    records = load_json_records(path)
-    if not records:
-        return pd.DataFrame()
-    df = pd.DataFrame(records)
-    LOGGER.info("Loaded %s -> %d rows, %d cols", path.name, len(df), len(df.columns))
     return df
 
 
@@ -279,16 +695,32 @@ def standardize_temporal_table(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df = standardize_post_df(df)
-    rename = {"Postdate": "postdate", "Latitude": "latitude", "Longitude": "longitude", "Geoaccuracy": "geoaccuracy"}
+    rename = {
+        "Postdate": "postdate",
+        "Latitude": "latitude",
+        "Longitude": "longitude",
+        "Geoaccuracy": "geoaccuracy",
+        "City": "city",
+        "State": "state",
+        "Country": "country",
+    }
     df = df.rename(columns=rename)
-    for c in ["postdate", "latitude", "longitude", "geoaccuracy"]:
+    # v4: keep city/state/country if temporal file has them (some datasets include
+    # these). They serve as Layer 0 ground truth before reverse_geo (Layer 1) and
+    # text parsing (Layer 2).
+    for c in ["postdate", "latitude", "longitude", "geoaccuracy", "city", "state", "country"]:
         if c not in df.columns:
             df[c] = None
     df["postdate"] = df["postdate"].map(to_int)
     df["latitude"] = df["latitude"].map(to_float)
     df["longitude"] = df["longitude"].map(to_float)
     df["geoaccuracy"] = df["geoaccuracy"].map(to_int)
-    cols = ["Uid", "Pid", "post_id", "postdate", "latitude", "longitude", "geoaccuracy"]
+    for c in ["city", "state", "country"]:
+        df[c] = df[c].map(lambda x: clean_description(x) if empty_to_none(x) is not None else None)
+    cols = [
+        "Uid", "Pid", "post_id", "postdate", "latitude", "longitude", "geoaccuracy",
+        "city", "state", "country",
+    ]
     return df[cols].drop_duplicates(subset=["post_id"], keep="first").copy()
 
 
@@ -308,23 +740,6 @@ def standardize_additional_table(df: pd.DataFrame) -> pd.DataFrame:
     return df[cols].drop_duplicates(subset=["post_id"], keep="first").copy()
 
 
-def parse_vector_like(value: Any) -> Any:
-    value = empty_to_none(value)
-    if value is None:
-        return None
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str):
-        s = value.strip()
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                return json.loads(s)
-            except Exception:
-                return s
-        return s
-    return value
-
-
 def standardize_user_table(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -341,6 +756,7 @@ def standardize_user_table(df: pd.DataFrame) -> pd.DataFrame:
         "timezone_id": ["timezone_id", "timezoneid", "tz_id"],
         "user_description": ["user_description", "userdescription", "description", "bio"],
         "location_description": ["location_description", "locationdescription", "location", "hometown"],
+        "profile_summary": ["profile_summary", "profile", "profile_keywords"],
         "follower_count": ["follower_count", "followers", "followers_count", "follower", "num_followers"],
         "following_count": ["following_count", "following", "following_count_num", "contacts", "contact_count", "num_following"],
         "total_views": ["total_views", "views", "view_count", "count_views", "totalviews"],
@@ -350,19 +766,18 @@ def standardize_user_table(df: pd.DataFrame) -> pd.DataFrame:
         "mean_tags": ["mean_tags", "avg_tags", "average_tags", "mean_tag"],
     }
 
-    mapping = {}
+    mapping: Dict[str, str] = {}
     for dst, aliases in alias_candidates.items():
         for src in aliases:
             if src in lower_to_actual:
                 mapping[lower_to_actual[src]] = dst
                 break
-
     df = df.rename(columns=mapping)
 
     keep_cols = [
         "Uid", "photo_firstdate", "photo_count", "ispro", "canbuypro",
         "timezone_offset", "photo_firstdatetaken", "timezone_id",
-        "user_description", "location_description",
+        "user_description", "location_description", "profile_summary",
         "follower_count", "following_count", "total_views", "total_favorites",
         "mean_views", "mean_favorites", "mean_tags",
     ]
@@ -372,7 +787,7 @@ def standardize_user_table(df: pd.DataFrame) -> pd.DataFrame:
 
     int_cols = [
         "photo_firstdate", "photo_count", "ispro", "canbuypro",
-        "timezone_offset", "photo_firstdatetaken", "timezone_id",
+        "photo_firstdatetaken",
         "follower_count", "following_count", "total_views", "total_favorites",
     ]
     float_cols = ["mean_views", "mean_favorites", "mean_tags"]
@@ -382,44 +797,157 @@ def standardize_user_table(df: pd.DataFrame) -> pd.DataFrame:
     for c in float_cols:
         df[c] = df[c].map(to_float)
 
-    for c in ["user_description", "location_description"]:
-        df[c] = df[c].map(parse_vector_like)
+    # timezone_id stays as a string category; timezone_offset parsed to float hours.
+    # (raw values look like "-08:00", "+01:00" — to_int() always returned None in v2)
+    df["timezone_id"] = df["timezone_id"].map(empty_to_none)
+    df["timezone_offset"] = df["timezone_offset"].map(parse_timezone_offset)
 
+    # has_timezone is 1 when the raw data actually contained a timezone, 0 otherwise.
+    # We set it here (before imputation) so we always know which rows are genuinely present.
+    # NOTE: use .notna() not "is not None" — after .map(empty_to_none), pandas stores
+    # Python None as NaN (float), and `nan is not None` evaluates to True.
+    df["has_timezone"] = df["timezone_id"].notna().astype(int)
+
+    # Keep raw text, but add clean versions. Do NOT parse as vector here.
+    df["user_description"] = df["user_description"].map(empty_to_none)
+    df["location_description"] = df["location_description"].map(empty_to_none)
+    df["profile_summary"] = df["profile_summary"].map(lambda x: clean_description(x) if empty_to_none(x) is not None else None)
+    df["user_description_clean"] = df["user_description"].map(clean_description)
+    df["location_description_clean"] = df["location_description"].map(clean_description)
+
+    keep_cols += ["user_description_clean", "location_description_clean", "has_timezone"]
     return df[keep_cols].drop_duplicates(subset=["Uid"], keep="first").copy()
 
 
+# -----------------------------------------------------------------------------
+# Imputation helpers (v3)
+# -----------------------------------------------------------------------------
+
+def impute_timezone_from_geo(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing timezone_id / timezone_offset using latitude & longitude.
+
+    Layer 1 – TimezoneFinder: for rows where timezone is missing but lat/lon
+    are valid, look up the IANA timezone name and derive the UTC offset in hours
+    from pytz.
+
+    Layer 2 – fallback: rows still missing after layer 1 get
+    timezone_id = "Unknown" and timezone_offset = 0.0.
+
+    has_timezone is NOT modified here — it was already set in
+    standardize_user_table() and reflects the original data, not the imputed
+    result.
+    """
+    try:
+        from timezonefinder import TimezoneFinder
+        import pytz
+    except ImportError:
+        LOGGER.warning("timezonefinder / pytz not installed; skipping geo-timezone imputation.")
+        return df
+
+    tf = TimezoneFinder()
+    ref_dt = datetime(2016, 1, 1)  # reference date inside the dataset window
+
+    miss_mask = df["timezone_id"].isna() | (df["timezone_id"].map(safe_str) == "")
+    lat_valid = pd.to_numeric(df["latitude"], errors="coerce")
+    lon_valid = pd.to_numeric(df["longitude"], errors="coerce")
+    geo_ok = lat_valid.notna() & lon_valid.notna() & (lat_valid != 0.0) & (lon_valid != 0.0)
+
+    layer1_mask = miss_mask & geo_ok
+    n_layer1 = int(layer1_mask.sum())
+    LOGGER.info("impute_timezone: %d rows with geo → attempting TimezoneFinder", n_layer1)
+
+    recovered = 0
+    for idx in df.index[layer1_mask]:
+        lat = lat_valid.at[idx]
+        lon = lon_valid.at[idx]
+        try:
+            tz_name = tf.timezone_at(lat=lat, lng=lon)
+        except Exception:
+            tz_name = None
+        if tz_name:
+            df.at[idx, "timezone_id"] = tz_name
+            try:
+                tz = pytz.timezone(tz_name)
+                offset_td = tz.utcoffset(ref_dt)
+                df.at[idx, "timezone_offset"] = offset_td.total_seconds() / 3600.0
+            except Exception:
+                df.at[idx, "timezone_offset"] = 0.0
+            recovered += 1
+
+    LOGGER.info("impute_timezone layer1: recovered %d/%d rows from geo", recovered, n_layer1)
+
+    # Layer 2: fill remaining missing rows with Unknown / 0.0
+    still_miss = df["timezone_id"].isna() | (df["timezone_id"].map(safe_str) == "")
+    df.loc[still_miss, "timezone_id"] = "Unknown"
+    df.loc[still_miss, "timezone_offset"] = df.loc[still_miss, "timezone_offset"].fillna(0.0)
+    LOGGER.info("impute_timezone layer2: %d rows set to Unknown/0.0", int(still_miss.sum()))
+
+    return df
+
+
+def add_user_description_sentiment(df: pd.DataFrame) -> pd.DataFrame:
+    """Add VADER compound sentiment score for user_description_clean.
+
+    Score is in [-1, +1].  Rows with no description receive 0.0.
+    The column is named user_description_sentiment.
+    """
+    try:
+        from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    except ImportError:
+        LOGGER.warning("vaderSentiment not installed; user_description_sentiment will be 0.0.")
+        df["user_description_sentiment"] = 0.0
+        return df
+
+    if "user_description_clean" not in df.columns:
+        df["user_description_sentiment"] = 0.0
+        return df
+
+    analyzer = SentimentIntensityAnalyzer()
+
+    def _score(text: Any) -> float:
+        s = safe_str(text)
+        if not s:
+            return 0.0
+        return float(analyzer.polarity_scores(s)["compound"])
+
+    LOGGER.info("Computing VADER sentiment for user_description_clean (%d rows)…", len(df))
+    df["user_description_sentiment"] = df["user_description_clean"].map(_score).astype("float32")
+    return df
+
+
+# -----------------------------------------------------------------------------
+# Feature engineering
+# -----------------------------------------------------------------------------
 def _safe_nunique(series: pd.Series) -> int:
     return int(series.dropna().nunique())
 
 
-def add_user_history_features(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
+def split_tags(value: Any) -> List[str]:
+    text = safe_str(value)
+    if not text:
+        return []
+    # official Alltags often looks like: "tag1" "tag2"
+    quoted = re.findall(r'"([^"]+)"', text)
+    if quoted:
+        items = quoted
+    else:
+        items = re.split(r"[\s,;|]+", text)
+    return [clean_description(x) for x in items if clean_description(x)]
 
-    for c in ["follower_count", "following_count", "photo_count", "total_views", "total_favorites", "mean_views", "mean_favorites", "mean_tags"]:
-        if c not in df.columns:
-            df[c] = None
 
-    def add_ratio(num_col: str, den_col: str, out_col: str) -> None:
-        df[out_col] = [safe_div(to_float(a), to_float(b)) for a, b in zip(df[num_col], df[den_col])]
+def count_words(text: Any) -> int:
+    text = safe_str(text)
+    if not text:
+        return 0
+    return len(re.findall(r"\S+", text))
 
-    add_ratio("follower_count", "following_count", "follower_following_ratio")
-    add_ratio("total_views", "photo_count", "views_per_photo")
-    add_ratio("total_favorites", "photo_count", "favorites_per_photo")
 
-    for src in [
-        "photo_count", "follower_count", "following_count", "total_views",
-        "total_favorites", "mean_views", "mean_favorites", "mean_tags",
-        "account_age_days", "camera_age_days",
-    ]:
-        if src in df.columns:
-            df[f"{src}_log1p"] = df[src].map(
-                lambda x: math.log1p(x) if x is not None and not pd.isna(x) and x >= 0 else None
-            )
-
-    df["has_user_description"] = df["user_description"].map(lambda x: int(empty_to_none(x) is not None))
-    df["has_location_description"] = df["location_description"].map(lambda x: int(empty_to_none(x) is not None))
-    return df
+def ratio_by_pattern(text: Any, pattern: str) -> Optional[float]:
+    text = safe_str(text)
+    if not text:
+        return None
+    matches = re.findall(pattern, text)
+    return len(matches) / len(text)
 
 
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -460,11 +988,19 @@ def add_cyclic_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def add_extra_features(df: pd.DataFrame) -> pd.DataFrame:
-    if "latitude" not in df.columns:
-        df["latitude"] = None
-    if "longitude" not in df.columns:
-        df["longitude"] = None
+def add_extra_features(
+    df: pd.DataFrame,
+    max_tags_for_full_text: int = 24,
+    max_user_words: int = 40,
+    max_location_words: int = 24,
+    max_profile_words: int = 24,
+) -> pd.DataFrame:
+    for c in ["latitude", "longitude", "title", "alltags", "category", "subcategory", "concept", "city", "state", "country"]:
+        if c not in df.columns:
+            df[c] = None
+    for c in ["user_description", "location_description", "profile_summary"]:
+        if c not in df.columns:
+            df[c] = None
 
     def has_geo(lat: Any, lon: Any) -> int:
         lat = to_float(lat)
@@ -477,87 +1013,96 @@ def add_extra_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df["has_geo"] = [has_geo(a, b) for a, b in zip(df["latitude"], df["longitude"])]
 
-    if "title" not in df.columns:
-        df["title"] = None
-    if "alltags" not in df.columns:
-        df["alltags"] = None
+    df["title_clean"] = df["title"].map(clean_description)
+    df["alltags_clean"] = df["alltags"].map(lambda x: " ".join(split_tags(x)))
+    if "user_description_clean" not in df.columns:
+        df["user_description_clean"] = df["user_description"].map(clean_description)
+    if "location_description_clean" not in df.columns:
+        df["location_description_clean"] = df["location_description"].map(clean_description)
+    df["profile_summary_clean"] = df["profile_summary"].map(clean_description)
 
-    def merge_text(a: Any, b: Any) -> str:
+    # location_text: include cleaned location_description plus city/state/country.
+    # city/state/country may be absent in original data; then this still works.
+    loc_texts = []
+    for loc_desc, city, state, country in zip(
+        df["location_description_clean"], df["city"], df["state"], df["country"]
+    ):
+        loc_texts.append(
+            join_unique([
+                truncate_words(loc_desc, max_location_words),
+                clean_description(city),
+                clean_description(state),
+                clean_description(country),
+            ], sep=" ")
+        )
+    df["location_text"] = loc_texts
+    df["has_location_text"] = df["location_text"].map(lambda x: int(bool(safe_str(x))))
+
+    # Full text: title | tags | topic only.
+    # location 與 user description 刻意排除：
+    # - location 缺失率 ~60%，加入會造成欄位資訊不一致
+    # - user description 為用戶層級資料，由獨立的 sentiment/embedding 特徵負責
+    full_texts = []
+    for title, tags, category, subcategory, concept in zip(
+        df["title_clean"],
+        df["alltags_clean"],
+        df["category"],
+        df["subcategory"],
+        df["concept"],
+    ):
+        topic = join_unique([category, subcategory, concept], sep=" ")
+        tag_text = truncate_words(tags, max_tags_for_full_text)
+
         parts = []
-        if empty_to_none(a) is not None:
-            parts.append(str(a).strip())
-        if empty_to_none(b) is not None:
-            parts.append(str(b).strip())
-        return " ".join(parts).strip()
+        if safe_str(title):
+            parts.append(safe_str(title))
+        if safe_str(tag_text):
+            parts.append("tags: " + tag_text)
+        if safe_str(topic):
+            parts.append("topic: " + topic)
+        full_texts.append(" | ".join(parts).strip())
 
-    df["full_text"] = [merge_text(a, b) for a, b in zip(df["title"], df["alltags"])]
+    df["full_text"] = full_texts
     return df
 
 
-def split_tags(value: Any) -> List[str]:
-    value = empty_to_none(value)
-    if value is None:
-        return []
-    if isinstance(value, list):
-        items = value
-    else:
-        text = str(value).strip()
-        items = re.split(r"[\s,;|]+", text)
-    return [str(x).strip() for x in items if empty_to_none(x) is not None]
-
-
-def count_words(text: Any) -> int:
-    text = empty_to_none(text)
-    if text is None:
-        return 0
-    return len(re.findall(r"\S+", str(text)))
-
-
-def ratio_by_pattern(text: Any, pattern: str) -> Optional[float]:
-    text = empty_to_none(text)
-    if text is None:
-        return None
-    s = str(text)
-    if len(s) == 0:
-        return None
-    matches = re.findall(pattern, s)
-    return len(matches) / len(s)
-
-
 def add_text_stats_features(df: pd.DataFrame) -> pd.DataFrame:
-    if "title" not in df.columns:
-        df["title"] = None
-    if "alltags" not in df.columns:
-        df["alltags"] = None
-    if "full_text" not in df.columns:
-        df["full_text"] = None
+    for c in ["title", "alltags", "full_text", "title_clean", "alltags_clean", "user_description_clean", "location_description_clean", "location_text"]:
+        if c not in df.columns:
+            df[c] = None
 
-    tag_lists = df["alltags"].map(split_tags)
+    tag_lists = df["alltags_clean"].map(split_tags)
 
-    df["has_title"] = df["title"].map(lambda x: int(empty_to_none(x) is not None))
+    df["has_title"] = df["title_clean"].map(lambda x: int(bool(safe_str(x))))
     df["has_tags"] = tag_lists.map(lambda x: int(len(x) > 0))
-    df["title_len"] = df["title"].map(lambda x: len(str(x)) if empty_to_none(x) is not None else 0)
-    df["tags_len"] = df["alltags"].map(lambda x: len(str(x)) if empty_to_none(x) is not None else 0)
-    df["full_text_len"] = df["full_text"].map(lambda x: len(str(x)) if empty_to_none(x) is not None else 0)
-    df["title_word_count"] = df["title"].map(count_words)
+    df["has_user_description"] = df["user_description_clean"].map(lambda x: int(bool(safe_str(x))))
+    df["has_location_description"] = df["location_description_clean"].map(lambda x: int(bool(safe_str(x))))
+
+    df["title_len"] = df["title_clean"].map(lambda x: len(safe_str(x)))
+    df["tags_len"] = df["alltags_clean"].map(lambda x: len(safe_str(x)))
+    df["full_text_len"] = df["full_text"].map(lambda x: len(safe_str(x)))
+    df["user_description_clean_len"] = df["user_description_clean"].map(lambda x: len(safe_str(x)))
+    df["location_text_len"] = df["location_text"].map(lambda x: len(safe_str(x)))
+
+    df["title_word_count"] = df["title_clean"].map(count_words)
     df["full_text_word_count"] = df["full_text"].map(count_words)
+    df["user_description_clean_word_count"] = df["user_description_clean"].map(count_words)
+    df["location_text_word_count"] = df["location_text"].map(count_words)
     df["tag_count"] = tag_lists.map(len)
     df["avg_tag_len"] = tag_lists.map(lambda tags: (sum(len(t) for t in tags) / len(tags)) if tags else None)
-    df["title_digit_ratio"] = df["title"].map(lambda x: ratio_by_pattern(x, r"\d"))
-    df["title_upper_ratio"] = df["title"].map(lambda x: ratio_by_pattern(x, r"[A-Z]"))
-    df["title_punct_ratio"] = df["title"].map(lambda x: ratio_by_pattern(x, r"[^\w\s]"))
+
+    df["title_digit_ratio"] = df["title_clean"].map(lambda x: ratio_by_pattern(x, r"\d"))
+    df["title_upper_ratio"] = df["title_clean"].map(lambda x: ratio_by_pattern(x, r"[A-Z]"))
+    df["title_punct_ratio"] = df["title_clean"].map(lambda x: ratio_by_pattern(x, r"[^\w\s]"))
     df["full_text_digit_ratio"] = df["full_text"].map(lambda x: ratio_by_pattern(x, r"\d"))
     df["full_text_punct_ratio"] = df["full_text"].map(lambda x: ratio_by_pattern(x, r"[^\w\s]"))
     return df
 
 
 def add_category_combo_features(df: pd.DataFrame) -> pd.DataFrame:
-    if "category" not in df.columns:
-        df["category"] = None
-    if "subcategory" not in df.columns:
-        df["subcategory"] = None
-    if "concept" not in df.columns:
-        df["concept"] = None
+    for c in ["category", "subcategory", "concept"]:
+        if c not in df.columns:
+            df[c] = None
 
     def make_combo(a: Any, b: Any) -> Optional[str]:
         a = empty_to_none(a)
@@ -572,13 +1117,17 @@ def add_category_combo_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_geo_bin_features(df: pd.DataFrame, n_bins: int = 20) -> pd.DataFrame:
-    if "latitude" not in df.columns:
-        df["latitude"] = None
-    if "longitude" not in df.columns:
-        df["longitude"] = None
+    for c in ["latitude", "longitude"]:
+        if c not in df.columns:
+            df[c] = None
 
     lat_series = pd.to_numeric(df["latitude"], errors="coerce")
     lon_series = pd.to_numeric(df["longitude"], errors="coerce")
+
+    # 原始缺失的 lat/lon 以 0.0 儲存（raw JSON 的 "0" 字串），
+    # 分桶前先把 0.0 → NaN，避免缺失列汙染桶的邊界計算。
+    lat_series = lat_series.where(lat_series != 0.0, other=pd.NA)
+    lon_series = lon_series.where(lon_series != 0.0, other=pd.NA)
 
     try:
         lat_bin = pd.cut(lat_series, bins=n_bins, labels=False, duplicates="drop")
@@ -618,12 +1167,9 @@ def add_account_age_features(df: pd.DataFrame) -> pd.DataFrame:
             return None
         return (a - b) / 86400.0
 
-    if "postdate" not in df.columns:
-        df["postdate"] = None
-    if "photo_firstdate" not in df.columns:
-        df["photo_firstdate"] = None
-    if "photo_firstdatetaken" not in df.columns:
-        df["photo_firstdatetaken"] = None
+    for c in ["postdate", "photo_firstdate", "photo_firstdatetaken"]:
+        if c not in df.columns:
+            df[c] = None
 
     df["account_age_days"] = [diff_days(a, b) for a, b in zip(df["postdate"], df["photo_firstdate"])]
     df["camera_age_days"] = [diff_days(a, b) for a, b in zip(df["postdate"], df["photo_firstdatetaken"])]
@@ -633,9 +1179,44 @@ def add_account_age_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def add_user_aggregate_features(train_df: pd.DataFrame, target_df: pd.DataFrame) -> pd.DataFrame:
+def add_user_history_features(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    for c in ["follower_count", "following_count", "photo_count", "total_views", "total_favorites", "mean_views", "mean_favorites", "mean_tags"]:
+        if c not in df.columns:
+            df[c] = None
+
+    df["follower_following_ratio"] = [safe_div(a, b) for a, b in zip(df["follower_count"], df["following_count"])]
+    df["views_per_photo"] = [safe_div(a, b) for a, b in zip(df["total_views"], df["photo_count"])]
+    df["favorites_per_photo"] = [safe_div(a, b) for a, b in zip(df["total_favorites"], df["photo_count"])]
+
+    for src in [
+        "photo_count", "follower_count", "following_count", "total_views",
+        "total_favorites", "mean_views", "mean_favorites", "mean_tags",
+        "account_age_days", "camera_age_days",
+        "user_description_clean_word_count", "location_text_word_count",
+    ]:
+        if src in df.columns:
+            df[f"{src}_log1p"] = df[src].map(
+                lambda x: math.log1p(x) if x is not None and not pd.isna(x) and x >= 0 else None
+            )
+    return df
+
+
+def add_user_aggregate_features(
+    train_df: pd.DataFrame,
+    target_df: pd.DataFrame,
+) -> pd.DataFrame:
     """
-    Keep aligned output columns across train / val / test.
+    Fit label-derived user aggregate stats on train_df only and apply to target_df.
+
+    v4 fix: if target_df IS train_df, use LEAVE-ONE-OUT aggregation to avoid
+    label leakage. Otherwise (val/test), use standard groupby aggregation.
+
+    NOTE: This is used by single_split mode only (debug/quick-test).
+    For real training (full_train + KFold), train.py recomputes these features
+    per fold via its own add_user_aggregate_features_fold(), which also does LOO.
     """
     if train_df.empty or "Uid" not in train_df.columns or "Uid" not in target_df.columns:
         return target_df
@@ -644,6 +1225,59 @@ def add_user_aggregate_features(train_df: pd.DataFrame, target_df: pd.DataFrame)
     work["label"] = pd.to_numeric(work["label"] if "label" in work.columns else None, errors="coerce")
     work["hour"] = pd.to_numeric(work["hour"] if "hour" in work.columns else None, errors="coerce")
 
+    is_train_self = (target_df is train_df) or (
+        len(target_df) == len(train_df)
+        and "post_id" in target_df.columns
+        and "post_id" in train_df.columns
+        and target_df["post_id"].equals(train_df["post_id"])
+    )
+
+    agg_cols_to_drop = [
+        "user_prev_post_count", "user_mean_label", "user_median_label",
+        "user_std_label", "user_category_nunique", "user_active_hour_mean",
+    ]
+
+    if is_train_self:
+        # ── LEAVE-ONE-OUT for train: avoid each row seeing its own label ──
+        LOGGER.info("add_user_aggregate_features: train_df==target_df, using LOO aggregation")
+        out = train_df.drop(
+            columns=[c for c in agg_cols_to_drop if c in train_df.columns],
+            errors="ignore",
+        ).copy()
+
+        grp = work.groupby("Uid", dropna=True)
+        user_count = grp["post_id"].transform("count")
+        label_sum = grp["label"].transform("sum")
+        label_count_nn = grp["label"].transform(lambda s: s.notna().sum())
+        hour_sum = grp["hour"].transform("sum")
+        hour_count_nn = grp["hour"].transform(lambda s: s.notna().sum())
+
+        own_label = work["label"]
+        own_hour = work["hour"]
+
+        out["user_prev_post_count"] = (user_count - 1).clip(lower=0)
+
+        label_sum_loo = label_sum - own_label.fillna(0.0)
+        label_count_loo = (label_count_nn - own_label.notna().astype(int)).clip(lower=0)
+        out["user_mean_label"] = (label_sum_loo / label_count_loo.replace(0, pd.NA)).astype(float)
+
+        hour_sum_loo = hour_sum - own_hour.fillna(0.0)
+        hour_count_loo = (hour_count_nn - own_hour.notna().astype(int)).clip(lower=0)
+        out["user_active_hour_mean"] = (hour_sum_loo / hour_count_loo.replace(0, pd.NA)).astype(float)
+
+        # median/std/nunique: full-user values (less leakage risk than mean)
+        out["user_median_label"] = grp["label"].transform("median")
+        out["user_std_label"] = grp["label"].transform("std")
+        if "category" in work.columns:
+            out["user_category_nunique"] = grp["category"].transform(
+                lambda s: s.dropna().nunique()
+            )
+        else:
+            out["user_category_nunique"] = pd.NA
+
+        return out
+
+    # ── Standard aggregation for val/test ──
     agg = (
         work.groupby("Uid", dropna=True)
         .agg(
@@ -657,77 +1291,69 @@ def add_user_aggregate_features(train_df: pd.DataFrame, target_df: pd.DataFrame)
         .reset_index()
     )
 
-    if target_df is train_df:
-        sort_cols = [c for c in ["Uid", "postdate", "post_id"] if c in work.columns]
-        work = work.sort_values(sort_cols, kind="mergesort", na_position="first").copy()
-        g = work.groupby("Uid", dropna=False)
-
-        work["user_prev_post_count"] = g.cumcount()
-        work["_label_filled"] = work["label"].fillna(0.0)
-        work["_label_seen"] = work["label"].notna().astype(int)
-        work["_cum_label_sum"] = g["_label_filled"].cumsum() - work["_label_filled"]
-        work["_cum_label_cnt"] = g["_label_seen"].cumsum() - work["_label_seen"]
-        work["user_mean_label"] = work["_cum_label_sum"] / work["_cum_label_cnt"].replace(0, pd.NA)
-        work["user_active_hour_mean"] = g["hour"].expanding().mean().reset_index(level=0, drop=True).shift(1)
-
-        def _expanding_nunique(series: pd.Series) -> pd.Series:
-            result = []
-            seen = set()
-            for val in series:
-                result.append(len(seen))
-                cat = empty_to_none(val)
-                if cat is not None:
-                    seen.add(cat)
-            return pd.Series(result, index=series.index)
-
-        work["user_category_nunique"] = (
-            work.groupby("Uid", dropna=False)["category"].transform(_expanding_nunique)
-            if "category" in work.columns
-            else 0
-        )
-
-        out = target_df.merge(
-            work[[
-                "post_id",
-                "user_prev_post_count",
-                "user_mean_label",
-                "user_active_hour_mean",
-                "user_category_nunique",
-            ]],
-            on="post_id",
-            how="left",
-        ).merge(
-            agg.rename(columns={
-                "user_prev_post_count": "_user_prev_post_count_global",
-                "user_mean_label": "_user_mean_label_global",
-                "user_median_label": "_user_median_label_global",
-                "user_std_label": "_user_std_label_global",
-                "user_category_nunique": "_user_category_nunique_global",
-                "user_active_hour_mean": "_user_active_hour_mean_global",
-            }),
-            on="Uid",
-            how="left",
-        )
-
-        for col, fallback in [
-            ("user_prev_post_count", "_user_prev_post_count_global"),
-            ("user_mean_label", "_user_mean_label_global"),
-            ("user_category_nunique", "_user_category_nunique_global"),
-            ("user_active_hour_mean", "_user_active_hour_mean_global"),
-        ]:
-            out[col] = out[col].where(out[col].notna(), out[fallback])
-
-        out["user_median_label"] = out["_user_median_label_global"]
-        out["user_std_label"] = out["_user_std_label_global"]
-
-        drop_cols = [c for c in out.columns if c.startswith("_user_")] + ["_label_filled", "_label_seen", "_cum_label_sum", "_cum_label_cnt"]
-        out = out.drop(columns=[c for c in drop_cols if c in out.columns], errors="ignore")
-        return out
-
-    out = target_df.merge(agg, on="Uid", how="left")
+    agg_cols = [c for c in agg.columns if c != "Uid"]
+    out = target_df.drop(
+        columns=[c for c in agg_cols if c in target_df.columns],
+        errors="ignore",
+    )
+    out = out.merge(agg, on="Uid", how="left")
     return out
 
 
+# -----------------------------------------------------------------------------
+# Reverse geocoding
+# -----------------------------------------------------------------------------
+def add_reverse_geo_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Batch reverse-geocode lat/lon → city/state/country for rows with valid coordinates."""
+    try:
+        import reverse_geocoder as rg
+        import pycountry
+    except ImportError:
+        LOGGER.warning("reverse_geocoder/pycountry not installed; skipping geo enrichment. "
+                       "Run: pip install reverse_geocoder pycountry")
+        for c in ["city", "state", "country"]:
+            if c not in df.columns:
+                df[c] = None
+        return df
+
+    for c in ["city", "state", "country"]:
+        if c not in df.columns:
+            df[c] = None
+
+    lat = pd.to_numeric(df["latitude"], errors="coerce")
+    lon = pd.to_numeric(df["longitude"], errors="coerce")
+    valid_mask = lat.notna() & lon.notna() & (lat != 0.0) & (lon != 0.0)
+
+    n_valid = int(valid_mask.sum())
+    if n_valid == 0:
+        LOGGER.info("add_reverse_geo_features: no valid coordinates found, skipping.")
+        return df
+
+    LOGGER.info("add_reverse_geo_features: reverse geocoding %d rows…", n_valid)
+    coords = list(zip(lat[valid_mask].tolist(), lon[valid_mask].tolist()))
+    results = rg.search(coords, verbose=False)
+
+    cities, states, countries = [], [], []
+    for r in results:
+        cc = r.get("cc", "")
+        country_obj = pycountry.countries.get(alpha_2=cc)
+        countries.append(country_obj.name if country_obj else (cc or None))
+        cities.append(r.get("name") or None)
+        states.append(r.get("admin1") or None)
+
+    df = df.copy()
+    df.loc[valid_mask, "city"]    = cities
+    df.loc[valid_mask, "state"]   = states
+    df.loc[valid_mask, "country"] = countries
+
+    LOGGER.info("add_reverse_geo_features: %d rows now have city/country (%.1f%%)",
+                n_valid, 100 * n_valid / len(df))
+    return df
+
+
+# -----------------------------------------------------------------------------
+# Split loading/building
+# -----------------------------------------------------------------------------
 def load_split(input_dir: Path, split: str) -> pd.DataFrame:
     prefix = split
     split_dir = input_dir / split
@@ -752,16 +1378,13 @@ def load_split(input_dir: Path, split: str) -> pd.DataFrame:
 
     out = image_df.copy()
 
-    # Train labels are aligned by row order with train_img_filepath.txt
     if split == "train" and label_txt_file.exists():
         label_df = load_label_txt(label_txt_file)
-
         if len(label_df) != len(out):
             raise ValueError(
                 f"Label count ({len(label_df)}) != image count ({len(out)}) for split={split}. "
                 "train_label.txt must align row-by-row with train_img_filepath.txt"
             )
-
         out = out.reset_index(drop=True)
         label_df = label_df.reset_index(drop=True)
         out["label"] = label_df["label"]
@@ -790,6 +1413,14 @@ def load_split(input_dir: Path, split: str) -> pd.DataFrame:
     else:
         LOGGER.warning("%s split: user table is empty or missing", split)
 
+    # v3: impute timezone before feature engineering so downstream features see
+    # consistent timezone_id / timezone_offset values.
+    out = impute_timezone_from_geo(out)
+
+    out = add_reverse_geo_features(out)   # Layer 1: lat/lon → city/state/country (~12%)
+    # v4: Layer 2 fallback — parse free-form location_description text for rows
+    # without geo (~28% additional coverage from text like "Vienna, Austria")
+    out = enrich_location_from_text(out)
     out = add_time_features(out)
     out = add_cyclic_time_features(out)
     out = add_extra_features(out)
@@ -800,10 +1431,13 @@ def load_split(input_dir: Path, split: str) -> pd.DataFrame:
     out = add_user_history_features(out)
     out = add_label_features(out)
 
+    # v3: sentiment after text stats (user_description_clean is ready by now)
+    out = add_user_description_sentiment(out)
+
     front = [
         "split", "post_id", "Uid", "Pid", "image_path", "label", "label_log1p",
         "category", "subcategory", "concept", "category_subcategory_combo", "category_concept_combo",
-        "title", "mediatype", "alltags", "full_text",
+        "title", "title_clean", "mediatype", "alltags", "alltags_clean", "full_text",
         "has_title", "has_tags", "title_len", "tags_len", "full_text_len",
         "title_word_count", "full_text_word_count", "tag_count", "avg_tag_len",
         "title_digit_ratio", "title_upper_ratio", "title_punct_ratio",
@@ -812,9 +1446,15 @@ def load_split(input_dir: Path, split: str) -> pd.DataFrame:
         "is_weekend", "is_night", "is_workhour",
         "hour_sin", "hour_cos", "weekday_sin", "weekday_cos", "month_sin", "month_cos",
         "latitude", "longitude", "geoaccuracy", "has_geo", "lat_bin", "lon_bin", "geo_cluster",
+        "city", "state", "country",
+        "location_description", "location_description_clean", "location_text", "has_location_text",
         "pathalias", "ispublic", "mediastatus",
         "photo_firstdate", "photo_count", "ispro", "canbuypro",
-        "timezone_offset", "photo_firstdatetaken", "timezone_id",
+        "has_timezone", "timezone_offset", "photo_firstdatetaken", "timezone_id",
+        "user_description", "user_description_clean", "profile_summary", "profile_summary_clean",
+        "has_user_description", "user_description_sentiment", "has_location_description",
+        "user_description_clean_len", "user_description_clean_word_count",
+        "location_text_len", "location_text_word_count",
         "follower_count", "following_count", "total_views", "total_favorites",
         "mean_views", "mean_favorites", "mean_tags",
         "follower_following_ratio", "views_per_photo", "favorites_per_photo",
@@ -823,8 +1463,8 @@ def load_split(input_dir: Path, split: str) -> pd.DataFrame:
         "mean_views_log1p", "mean_favorites_log1p", "mean_tags_log1p",
         "account_age_days", "camera_age_days",
         "account_age_days_log1p", "camera_age_days_log1p",
-        "has_user_description", "has_location_description",
-        "user_description", "location_description",
+        "user_description_clean_word_count_log1p", "location_text_word_count_log1p",
+        # label-derived user aggregates: not precomputed in full_train mode
         "user_prev_post_count", "user_mean_label", "user_median_label",
         "user_std_label", "user_category_nunique", "user_active_hour_mean",
     ]
@@ -846,24 +1486,20 @@ def split_train_valid(
         raise ValueError(f"val_ratio must be in (0, 1), got {val_ratio}")
 
     split_by = str(split_by).lower()
-
     if split_by == "user":
         if "Uid" not in train_df.columns:
             raise ValueError("split_by='user' requires 'Uid' column.")
         unique_users = train_df[["Uid"]].drop_duplicates().sample(frac=1.0, random_state=split_seed).reset_index(drop=True)
         n_val_users = max(1, int(round(len(unique_users) * val_ratio)))
         val_users = set(unique_users.iloc[:n_val_users]["Uid"].astype(str).tolist())
-
         val_mask = train_df["Uid"].astype(str).isin(val_users)
         val_df = train_df[val_mask].copy()
         train_sub_df = train_df[~val_mask].copy()
-
     elif split_by == "post":
         shuffled = train_df.sample(frac=1.0, random_state=split_seed)
         n_val = max(1, int(round(len(shuffled) * val_ratio)))
         val_df = shuffled.iloc[:n_val].copy()
         train_sub_df = shuffled.iloc[n_val:].copy()
-
     else:
         raise ValueError(f"Unsupported split_by: {split_by}. Use 'user' or 'post'.")
 
@@ -871,35 +1507,29 @@ def split_train_valid(
     val_df = val_df.reset_index(drop=True)
     train_sub_df["split"] = "train"
     val_df["split"] = "val"
-
-    LOGGER.info(
-        "Created train/val split with split_by=%s, val_ratio=%.4f -> train=%d, val=%d",
-        split_by, val_ratio, len(train_sub_df), len(val_df)
-    )
+    LOGGER.info("Created train/val split with split_by=%s -> train=%d, val=%d", split_by, len(train_sub_df), len(val_df))
     return train_sub_df, val_df
 
 
-def align_columns(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def align_columns(*dfs: pd.DataFrame) -> Tuple[pd.DataFrame, ...]:
     all_cols: List[str] = []
-    for df in [train_df, val_df, test_df]:
+    for df in dfs:
         for c in df.columns:
             if c not in all_cols:
                 all_cols.append(c)
 
-    for df in [train_df, val_df, test_df]:
+    aligned = []
+    for df in dfs:
+        x = df.copy()
         for c in all_cols:
-            if c not in df.columns:
-                df[c] = None
-
-    train_df = train_df[all_cols].copy()
-    val_df = val_df[all_cols].copy()
-    test_df = test_df[all_cols].copy()
-    return train_df, val_df, test_df
+            if c not in x.columns:
+                x[c] = None
+        aligned.append(x[all_cols].copy())
+    return tuple(aligned)
 
 
 def save_split(df: pd.DataFrame, output_dir: Path, split: str) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-
     parquet_path = output_dir / f"{split}.parquet"
     jsonl_path = output_dir / f"{split}.jsonl"
     csv_path = output_dir / f"{split}.csv"
@@ -926,32 +1556,31 @@ def save_split(df: pd.DataFrame, output_dir: Path, split: str) -> None:
     LOGGER.info("Saved %s", csv_path)
 
 
-def save_summary(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame, output_dir: Path) -> None:
-    summary = {
-        "train_rows": int(len(train_df)),
-        "val_rows": int(len(val_df)),
-        "test_rows": int(len(test_df)),
-        "train_cols": list(train_df.columns),
-        "val_cols": list(val_df.columns),
-        "test_cols": list(test_df.columns),
-        "train_missing_label": int(train_df["label"].isna().sum()) if "label" in train_df.columns else None,
-        "val_missing_label": int(val_df["label"].isna().sum()) if "label" in val_df.columns else None,
-        "test_missing_label": int(test_df["label"].isna().sum()) if "label" in test_df.columns else None,
-    }
+def save_summary(output_dir: Path, summary: Dict[str, Any]) -> None:
     path = output_dir / "summary.json"
     with path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     LOGGER.info("Saved %s", path)
 
 
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build unified SMP dataset tables with train/val split.")
+    parser = argparse.ArgumentParser(description="Build unified SMP dataset tables, v4: v2 + v3 merged (location text + timezone + sentiment).")
     parser.add_argument("--input_dir", type=str, required=True, help="Folder containing raw official files.")
     parser.add_argument("--output_dir", type=str, required=True, help="Output folder.")
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation ratio split from train. Default: 0.1")
-    parser.add_argument("--split_seed", type=int, default=42, help="Random seed for train/val split.")
-    parser.add_argument("--split_by", type=str, default="user", choices=["user", "post"], help="Split validation by 'user' or 'post'. Default: user")
+    parser.add_argument(
+        "--split_mode",
+        type=str,
+        default="full_train",
+        choices=["full_train", "single_split"],
+        help="full_train: save official_train/test for later GroupKFold. single_split: also create train/val once.",
+    )
+    parser.add_argument("--val_ratio", type=float, default=0.1)
+    parser.add_argument("--split_seed", type=int, default=42)
+    parser.add_argument("--split_by", type=str, default="user", choices=["user", "post"])
     return parser.parse_args()
 
 
@@ -962,11 +1591,35 @@ def main() -> None:
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
 
-    LOGGER.info("Input dir: %s", input_dir)
+    LOGGER.info("Input dir : %s", input_dir)
     LOGGER.info("Output dir: %s", output_dir)
+    LOGGER.info("Split mode: %s", args.split_mode)
 
     official_train_df = load_split(input_dir, "train")
     test_df = load_split(input_dir, "test")
+
+    if args.split_mode == "full_train":
+        # Do NOT compute label-derived user aggregate features here.
+        official_train_df["split"] = "train"
+        test_df["split"] = "test"
+        official_train_df, test_df = align_columns(official_train_df, test_df)
+
+        save_split(official_train_df, output_dir, "official_train")
+        save_split(test_df, output_dir, "test")
+
+        summary = {
+            "mode": "full_train",
+            "official_train_rows": int(len(official_train_df)),
+            "test_rows": int(len(test_df)),
+            "official_train_cols": list(official_train_df.columns),
+            "test_cols": list(test_df.columns),
+            "official_train_missing_label": int(official_train_df["label"].isna().sum()) if "label" in official_train_df.columns else None,
+            "test_missing_label": int(test_df["label"].isna().sum()) if "label" in test_df.columns else None,
+            "note": "label-derived user aggregate features are intentionally NOT precomputed in full_train mode to avoid KFold leakage",
+        }
+        save_summary(output_dir, summary)
+        LOGGER.info("Done. Official train shape: %s | Test shape: %s", official_train_df.shape, test_df.shape)
+        return
 
     train_df, val_df = split_train_valid(
         official_train_df,
@@ -975,27 +1628,51 @@ def main() -> None:
         split_by=args.split_by,
     )
 
-    # Fit user aggregate features on train only
+    # ─────────────────────────────────────────────────────────────────────
+    # WARNING: single_split mode is for DEBUG / quick-test only.
+    # ─────────────────────────────────────────────────────────────────────
+    # The user aggregate features computed here are NOT KFold-safe. They use
+    # leave-one-out aggregation to avoid in-row label leakage, but the validation
+    # split is still drawn from the same user pool as train, which is not how
+    # the real evaluation works (GroupKFold by Uid).
+    #
+    # For real training:
+    #   1. Use --split_mode full_train to save official_train.parquet without
+    #      precomputed user aggregates.
+    #   2. Let scripts/train.py recompute user aggregates per fold via
+    #      add_user_aggregate_features_fold(), which does LOO inside each fold.
+    LOGGER.warning(
+        "[DEBUG-ONLY] single_split mode uses precomputed user aggregates with LOO. "
+        "For real training, use --split_mode full_train and let train.py handle KFold."
+    )
+
     train_df = add_user_aggregate_features(train_df, train_df)
     val_df = add_user_aggregate_features(train_df, val_df)
     test_df = add_user_aggregate_features(train_df, test_df)
-
-    # Keep schema aligned
     train_df, val_df, test_df = align_columns(train_df, val_df, test_df)
 
     save_split(train_df, output_dir, "train")
     save_split(val_df, output_dir, "val")
     save_split(test_df, output_dir, "test")
-    save_summary(train_df, val_df, test_df, output_dir)
 
-    LOGGER.info("Done.")
-    LOGGER.info("Train shape: %s", train_df.shape)
-    LOGGER.info("Val shape: %s", val_df.shape)
-    LOGGER.info("Test shape: %s", test_df.shape)
+    summary = {
+        "mode": "single_split",
+        "train_rows": int(len(train_df)),
+        "val_rows": int(len(val_df)),
+        "test_rows": int(len(test_df)),
+        "train_cols": list(train_df.columns),
+        "val_cols": list(val_df.columns),
+        "test_cols": list(test_df.columns),
+        "train_missing_label": int(train_df["label"].isna().sum()) if "label" in train_df.columns else None,
+        "val_missing_label": int(val_df["label"].isna().sum()) if "label" in val_df.columns else None,
+        "test_missing_label": int(test_df["label"].isna().sum()) if "label" in test_df.columns else None,
+    }
+    save_summary(output_dir, summary)
+    LOGGER.info("Done. Train shape: %s | Val shape: %s | Test shape: %s", train_df.shape, val_df.shape, test_df.shape)
 
 
 if __name__ == "__main__":
     main()
 
 # Example:
-# python build_dataset.py --input_dir ./data/raw --output_dir ./data/processed --val_ratio 0.1 --split_by user
+# python3 build_dataset_v4.py --input_dir /local/smp/data --output_dir /local/smp/processed_v2 --split_mode full_train
