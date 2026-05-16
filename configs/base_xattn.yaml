@@ -1,7 +1,7 @@
 seed: 42
 exp_name: base_exp
 data:
-  official_train_path: /local/smp/processed_v2/official_train.parquet
+  official_train_path: /local/smp/processed_v3/official_train.parquet
   loc_desc_emb_path: null
   loc_desc_idx_path: null
 user_desc_encoder:
@@ -15,7 +15,7 @@ user_desc_encoder:
   batch_size: 128
   normalize_embeddings: true
   max_chars: 1024
-  cache_dir: /local/smp/processed_v2/embeddings/hf_user_desc
+  cache_dir: /local/smp/processed_v3/embeddings/hf_user_desc
   cache_name: all_mpnet_base_v2_user_desc
   force_rebuild: false
   device: null

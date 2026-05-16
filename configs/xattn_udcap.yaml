@@ -50,7 +50,7 @@ user_desc_encoder:
   batch_size: 128
   normalize_embeddings: true
   max_chars: 1024
-  cache_dir: /local/smp/processed_v2/embeddings/hf_user_desc
+  cache_dir: /local/smp/processed_v3/embeddings/hf_user_desc
   cache_name: all_mpnet_base_v2_user_desc
   force_rebuild: false
   device: null
