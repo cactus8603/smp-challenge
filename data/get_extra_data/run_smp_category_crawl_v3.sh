@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # run_smp_category_crawl_v5.sh
 set -euo pipefail
-export FLICKR_API_KEY=2f2d8b2bec66d6416d1feb8744848631
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 CRAWLER_SCRIPT="${CRAWLER_SCRIPT:-./crawl_flickr_to_smp.py}"
