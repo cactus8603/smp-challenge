@@ -1,0 +1,8 @@
+base: xattn_arch_user_residual.yaml
+
+exp_name: xattn_arch_user_meta_bridge
+
+meta:
+  user_desc_mode: meta_bridge
+  user_desc_scale: 0.25
+  user_desc_gate_init: -2.0

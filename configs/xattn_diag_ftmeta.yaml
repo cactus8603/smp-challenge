@@ -1,0 +1,12 @@
+base: xattn_udcap.yaml
+
+exp_name: xattn_diag_ftmeta
+
+meta:
+  encoder_type: ft_transformer
+  use_semantic_groups: false
+  ft_token_dim: 192
+  ft_num_layers: 3
+  ft_num_heads: 8
+  ft_ffn_mult: 2
+  ft_dropout: 0.1

@@ -4,8 +4,15 @@ exp_name: smp_v2_fasttext_geoB_residual_cross_v2_ftmeta_gatedres
 
 train:
   batch_size: 512
+  epochs: 12
   lr: 0.00015
   meta_warmup_epochs: 1
+  early_stop_patience: 2
+  early_stop_min_delta: 0.001
+
+diagnostics:
+  ablation_spearman_threshold: 0.60
+  ablation_on_best_only: true
 
 fusion:
   type: residual_cross_attention
@@ -23,7 +30,7 @@ model:
   head_type: regression
   head_hidden_mult: 1.5
   head_num_layers: 3
-  dropout: 0.1
+  dropout: 0.12
 
   # Independent metadata prediction path used also by meta-only warmup.
   use_meta_aux_head: true
@@ -33,7 +40,7 @@ model:
   # fused = fused + sigmoid(gate) * LN(Linear(meta_feat))
   use_meta_residual: true
   meta_residual_init: 0.0        # sigmoid(0)=0.5, half-open at start
-  meta_residual_dropout: 0.0
+  meta_residual_dropout: 0.05
 
 meta:
   branch_dim: 128
@@ -46,7 +53,7 @@ meta:
   ft_num_layers: 3
   ft_num_heads: 8
   ft_ffn_mult: 2
-  ft_dropout: 0.1
+  ft_dropout: 0.12
 
   # Dense user_desc branch is disabled for this architecture test.
   # user_desc_lite metadata features remain enabled in preprocess.
@@ -68,7 +75,7 @@ user_desc_encoder:
   batch_size: 128
   normalize_embeddings: true
   max_chars: 1024
-  cache_dir: /local/smp/processed_v2/embeddings/hf_user_desc
+  cache_dir: "${SMP_ROOT:-/local/smp}/processed_v2/embeddings/hf_user_desc"
   cache_name: all_mpnet_base_v2_user_desc
   force_rebuild: false
   device: null
@@ -77,6 +84,7 @@ preprocess:
   # Smoothed target encoding for country/state/city/location_text.
   # Train rows use leave-one-out; val/test use fold-train stats.
   target_encoding_smoothing: 30.0
+  use_label_user_aggregates: false
   use_user_desc_lite: true
   user_desc_lite_debug: true
 
@@ -85,9 +93,9 @@ tag_embedding:
   type: vec
   source: vec
   language: en
-  vec_path: /local/smp/fasttext/wiki-news-300d-1M.vec
-  cache_dir: /local/smp/fasttext
-  cache_path: /local/smp/fasttext/fasttext_en_300k_cache.pt
+  vec_path: "${SMP_ROOT:-/local/smp}/fasttext/wiki-news-300d-1M.vec"
+  cache_dir: "${SMP_ROOT:-/local/smp}/fasttext"
+  cache_path: "${SMP_ROOT:-/local/smp}/fasttext/fasttext_en_300k_cache.pt"
   max_vectors: 300000
   trainable: false
   normalize_output: false
@@ -105,6 +113,8 @@ loss:
   reg_max_weight: 4.0
   min_target_diff: 0.15
   rank_max_weight: 4.0
+  rank_max_pairs: 65536
+  contrast_max_pairs: 65536
   variance_floor_ratio: 0.70
   focal_gamma: 1.3
 

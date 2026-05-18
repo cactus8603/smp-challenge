@@ -1,0 +1,7 @@
+base: xattn_udcap.yaml
+
+exp_name: xattn_diag_caption
+
+text:
+  use_caption: true
+  caption_max_freq: 50

@@ -205,6 +205,7 @@ class CLIPImageEncoder(nn.Module):
         self.hidden_size = self.model.config.hidden_size
         self.projection_dim = self.model.config.projection_dim
         self.output_dim = output_dim if output_dim is not None else self.projection_dim
+        self.trainable = bool(trainable)
 
         if not trainable:
             for param in self.model.parameters():
@@ -251,7 +252,12 @@ class CLIPImageEncoder(nn.Module):
         image_tensor: torch.Tensor,
         return_raw_clip: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        outputs = self.model(pixel_values=image_tensor)
+        if self.trainable:
+            outputs = self.model(pixel_values=image_tensor)
+        else:
+            self.model.eval()
+            with torch.no_grad():
+                outputs = self.model(pixel_values=image_tensor)
 
         raw_clip_feat = outputs.image_embeds  # [B, projection_dim]
 

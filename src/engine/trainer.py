@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -19,6 +19,16 @@ def save_json(data: Dict, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def to_jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(v) for v in value]
+    if hasattr(value, "item"):
+        return value.item()
+    return value
 
 
 def save_checkpoint(
@@ -173,7 +183,10 @@ class Trainer:
         logger: Optional[logging.Logger] = None,
         grad_clip_norm: Optional[float] = None,
         ablation_spearman_threshold: float = 0.58,
+        ablation_on_best_only: bool = True,
         meta_warmup_epochs: int = 0,
+        early_stop_patience: Optional[int] = None,
+        early_stop_min_delta: float = 0.0,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
@@ -186,7 +199,14 @@ class Trainer:
         self.tb_dir = tb_dir
         self.grad_clip_norm = grad_clip_norm
         self.ablation_spearman_threshold = float(ablation_spearman_threshold)
+        self.ablation_on_best_only = bool(ablation_on_best_only)
         self.meta_warmup_epochs = int(meta_warmup_epochs)
+        self.early_stop_patience = (
+            int(early_stop_patience)
+            if early_stop_patience is not None and int(early_stop_patience) > 0
+            else None
+        )
+        self.early_stop_min_delta = float(early_stop_min_delta)
         self._original_requires_grad = {name: p.requires_grad for name, p in model.named_parameters()}
 
         self.logger = logger or setup_logger(exp_dir, exp_name)
@@ -194,6 +214,11 @@ class Trainer:
 
         self.best_spearman = -1.0
         self.best_epoch = -1
+        self.best_ablation: Optional[Dict] = None
+        self._early_stop_best = -1.0
+        self._epochs_without_improvement = 0
+        self.stopped_early = False
+        self.stop_epoch: Optional[int] = None
         self.history: List[Dict] = []
 
 
@@ -251,6 +276,13 @@ class Trainer:
                 criterion=self.criterion,
                 device=self.device,
                 meta_only=meta_only_epoch,
+                verbose_debug=False,
+            )
+
+            is_new_best = (not meta_only_epoch) and val_spearman > self.best_spearman
+            is_early_stop_improvement = (
+                (not meta_only_epoch)
+                and val_spearman > self._early_stop_best + self.early_stop_min_delta
             )
 
             gbdt_scores = {}
@@ -265,7 +297,24 @@ class Trainer:
                     run_catboost=True,
                     max_train_batches=gbdt_max_train_batches,
                     max_val_batches=gbdt_max_val_batches,
+                    save_dir=self.exp_dir / "gbdt_monitor",
+                    best_lightgbm_spearman=float(getattr(self, "best_lightgbm_spearman", float("-inf"))),
+                    best_catboost_spearman=float(getattr(self, "best_catboost_spearman", float("-inf"))),
+                    epoch=epoch,
                 )
+
+                lgb_score = gbdt_scores.get("lightgbm_spearman", float("nan"))
+                cat_score = gbdt_scores.get("catboost_spearman", float("nan"))
+                if isinstance(lgb_score, (float, int)) and lgb_score == lgb_score:
+                    self.best_lightgbm_spearman = max(
+                        float(getattr(self, "best_lightgbm_spearman", float("-inf"))),
+                        float(lgb_score),
+                    )
+                if isinstance(cat_score, (float, int)) and cat_score == cat_score:
+                    self.best_catboost_spearman = max(
+                        float(getattr(self, "best_catboost_spearman", float("-inf"))),
+                        float(cat_score),
+                    )
 
                 self.logger.info(
                     "[GBDT Monitor] "
@@ -297,7 +346,13 @@ class Trainer:
             # during weak early epochs or failed runs.
             # ---------------------------------------------------------
             ablation_results = None
-            if (not meta_only_epoch) and val_spearman > self.ablation_spearman_threshold:
+            should_run_ablation = (
+                (not meta_only_epoch)
+                and val_spearman > self.ablation_spearman_threshold
+                and ((not self.ablation_on_best_only) or is_new_best)
+            )
+
+            if should_run_ablation:
                 self.logger.info(
                     f"val_spearman={val_spearman:.4f} > "
                     f"{self.ablation_spearman_threshold:.4f}; running modality ablation."
@@ -312,6 +367,8 @@ class Trainer:
             else:
                 if meta_only_epoch:
                     self.logger.info("Skip modality ablation during meta-only warmup.")
+                elif self.ablation_on_best_only and not is_new_best:
+                    self.logger.info("Skip modality ablation: current epoch is not a new best.")
                 else:
                     self.logger.info(
                         f"Skip modality ablation: val_spearman={val_spearman:.4f} <= "
@@ -348,6 +405,8 @@ class Trainer:
 
             if ablation_results is not None:
                 epoch_record["modality_ablation"] = ablation_results
+            if gbdt_scores:
+                epoch_record["gbdt_monitor"] = to_jsonable(gbdt_scores)
 
             self.history.append(epoch_record)
 
@@ -366,9 +425,10 @@ class Trainer:
             # so its score is not directly comparable with full multimodal validation.
             if meta_only_epoch:
                 self.logger.info("Skip saving best.pt during meta-only warmup.")
-            elif val_spearman > self.best_spearman:
+            elif is_new_best:
                 self.best_spearman = val_spearman
                 self.best_epoch = epoch
+                self.best_ablation = ablation_results
 
                 save_checkpoint(
                     model=self.model,
@@ -379,12 +439,36 @@ class Trainer:
                 )
                 self.logger.info(f"Saved best model to {self.ckpt_dir / 'best.pt'}")
 
+            if not meta_only_epoch and self.early_stop_patience is not None:
+                if is_early_stop_improvement:
+                    self._early_stop_best = val_spearman
+                    self._epochs_without_improvement = 0
+                else:
+                    self._epochs_without_improvement += 1
+                    self.logger.info(
+                        "Early-stop patience: "
+                        f"{self._epochs_without_improvement}/{self.early_stop_patience}"
+                    )
+
+                if self._epochs_without_improvement >= self.early_stop_patience:
+                    self.stopped_early = True
+                    self.stop_epoch = epoch
+                    self.logger.info(
+                        f"Early stopping at epoch {epoch}; "
+                        f"best_val_spearman={self.best_spearman:.4f} "
+                        f"at epoch {self.best_epoch}."
+                    )
+                    break
+
         self.writer.close()
 
         summary = {
             "exp_name": self.exp_name,
             "best_epoch": self.best_epoch,
             "best_val_spearman": float(self.best_spearman),
+            "stopped_early": bool(self.stopped_early),
+            "stop_epoch": self.stop_epoch,
+            "best_modality_ablation": self.best_ablation,
         }
         save_json(summary, self.exp_dir / "summary.json")
 

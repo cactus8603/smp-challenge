@@ -1,0 +1,9 @@
+base: xattn_arch_user_residual.yaml
+
+exp_name: xattn_arch_user_fusion_token
+
+meta:
+  user_desc_mode: fusion_cross_attention
+  user_desc_scale: 1.0
+  user_desc_res_scale: 0.35
+  user_desc_gate_init: -2.0

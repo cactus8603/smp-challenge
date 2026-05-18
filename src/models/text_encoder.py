@@ -132,6 +132,7 @@ class TextEncoder(nn.Module):
         self.hidden_size = self.model.config.hidden_size
         self.projection_dim = self.model.config.projection_dim
         self.output_dim = output_dim if output_dim is not None else self.projection_dim
+        self.trainable = bool(trainable)
 
         self.pooling = pooling.lower()
         if self.pooling not in {"clip"}:
@@ -183,10 +184,18 @@ class TextEncoder(nn.Module):
         attention_mask: torch.Tensor,
         return_raw_clip: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
+        if self.trainable:
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+        else:
+            self.model.eval()
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
 
         raw_clip_feat = outputs.text_embeds  # [B, projection_dim]
 

@@ -1,0 +1,25 @@
+base: xattn_udcap.yaml
+
+exp_name: xattn_diag_userdesc
+
+meta:
+  use_user_desc: true
+  user_desc_dim: 768
+  desc_bottleneck_dim: 64
+  user_desc_scale: 0.03
+
+user_desc_encoder:
+  enabled: true
+  mode: sentence_transformers
+  model_name: sentence-transformers/all-mpnet-base-v2
+  uid_col: Uid
+  text_col: user_description_clean
+  fallback_text_col: user_description
+  output_dim: 768
+  batch_size: 128
+  normalize_embeddings: true
+  max_chars: 1024
+  cache_dir: "${SMP_ROOT:-/local/smp}/processed_v3/embeddings/hf_user_desc"
+  cache_name: all_mpnet_base_v2_user_desc
+  force_rebuild: false
+  device: null

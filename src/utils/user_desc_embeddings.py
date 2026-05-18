@@ -118,14 +118,6 @@ def build_user_desc_embedding_cache(
         print(f"[USER_DESC_EMB] reuse index: {idx_path}")
         return emb_path, idx_path
 
-    try:
-        from sentence_transformers import SentenceTransformer
-    except Exception as e:
-        raise ImportError(
-            "user_desc_encoder.enabled=true requires sentence-transformers.\n"
-            "Install it with: pip install sentence-transformers"
-        ) from e
-
     uids, texts = _select_user_texts(
         df=df,
         uid_col=uid_col,
@@ -141,18 +133,34 @@ def build_user_desc_embedding_cache(
         f"batch_size={batch_size} | normalize={normalize_embeddings}"
     )
 
-    model_kwargs = {}
-    if device:
-        model_kwargs["device"] = device
-    model = SentenceTransformer(model_name, **model_kwargs)
+    try:
+        from sentence_transformers import SentenceTransformer
 
-    emb = model.encode(
-        texts,
-        batch_size=int(batch_size),
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=bool(normalize_embeddings),
-    ).astype(np.float32)
+        model_kwargs = {}
+        if device:
+            model_kwargs["device"] = device
+        model = SentenceTransformer(model_name, **model_kwargs)
+
+        emb = model.encode(
+            texts,
+            batch_size=int(batch_size),
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=bool(normalize_embeddings),
+        ).astype(np.float32)
+    except Exception as e:
+        print(
+            "[USER_DESC_EMB] sentence-transformers unavailable; "
+            f"falling back to transformers mean pooling ({type(e).__name__}: {e})"
+        )
+        emb = _encode_with_transformers_mean_pooling(
+            texts=texts,
+            model_name=model_name,
+            batch_size=int(batch_size),
+            normalize_embeddings=bool(normalize_embeddings),
+            device=device,
+            max_length=int(max_chars) if max_chars else 512,
+        ).astype(np.float32)
 
     uid_index = {str(uid): int(i) for i, uid in enumerate(uids)}
 
@@ -180,6 +188,53 @@ def build_user_desc_embedding_cache(
     print(f"[USER_DESC_EMB] saved embeddings: {emb_path} shape={emb.shape}")
     print(f"[USER_DESC_EMB] saved uid index: {idx_path}")
     return emb_path, idx_path
+
+
+def _encode_with_transformers_mean_pooling(
+    texts: list[str],
+    model_name: str,
+    batch_size: int,
+    normalize_embeddings: bool,
+    device: str | None,
+    max_length: int = 512,
+) -> np.ndarray:
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoModel, AutoTokenizer
+
+    try:
+        from tqdm import tqdm
+    except Exception:
+        tqdm = lambda x, **_: x
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name).to(device)
+    model.eval()
+
+    chunks = []
+    with torch.no_grad():
+        for start in tqdm(range(0, len(texts), batch_size), desc="UserDescEmb"):
+            batch_texts = texts[start : start + batch_size]
+            encoded = tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=min(max_length, 512),
+                return_tensors="pt",
+            )
+            encoded = {k: v.to(device) for k, v in encoded.items()}
+            output = model(**encoded)
+            token_embeddings = output.last_hidden_state
+            mask = encoded["attention_mask"].unsqueeze(-1).float()
+            pooled = (token_embeddings * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+            if normalize_embeddings:
+                pooled = F.normalize(pooled, p=2, dim=-1)
+            chunks.append(pooled.cpu().numpy())
+
+    return np.concatenate(chunks, axis=0) if chunks else np.zeros((0, 0), dtype=np.float32)
 
 
 def maybe_prepare_user_desc_embeddings(

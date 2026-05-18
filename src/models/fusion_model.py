@@ -84,6 +84,9 @@ class SMPFusionModel(nn.Module):
         loc_desc_dim: int = 400,
         desc_bottleneck_dim: int = 32,
         user_desc_scale: float = 0.01,
+        user_desc_mode: str = "residual",
+        user_desc_gate_init: float = -4.0,
+        user_desc_res_scale: float = 0.35,
         loc_desc_scale: float = 0.0,
     ) -> None:
         super().__init__()
@@ -114,6 +117,15 @@ class SMPFusionModel(nn.Module):
         self.fusion_order = str(fusion_order or "text_meta_first").lower()
         self.head_hidden_mult = float(head_hidden_mult)
         self.head_num_layers = int(head_num_layers)
+        self.user_desc_mode = str(user_desc_mode or "none").lower()
+        if self.user_desc_mode in {"off", "disabled", "false"}:
+            self.user_desc_mode = "none"
+        if self.user_desc_mode in {"fusion_token", "cross_attention", "user_cross_attention"}:
+            self.user_desc_mode = "fusion_cross_attention"
+        if self.user_desc_mode not in {"none", "residual", "meta_bridge", "text_bridge", "fusion_cross_attention"}:
+            raise ValueError(f"Unsupported user_desc_mode: {user_desc_mode}")
+        self.user_desc_gate_init = float(user_desc_gate_init)
+        self.user_desc_res_scale = float(user_desc_res_scale)
 
         if self.use_clip_similarity and not (self.use_text and self.use_image):
             raise ValueError("use_clip_similarity=True requires both use_text=True and use_image=True.")
@@ -228,9 +240,11 @@ class SMPFusionModel(nn.Module):
             self.clip_sim_dim = 2 if self.clip_similarity_mode == "both" else 1
             fusion_input_dims["clip_sim"] = self.clip_sim_dim
 
-        # user_desc is a weak auxiliary residual. This is intentionally tiny
-        # because previous ablation showed small user_desc contribution.
-        self.use_user_desc_aux = bool(use_user_desc and user_desc_dim > 0 and user_desc_scale != 0)
+        self.use_user_desc_aux = bool(
+            use_user_desc
+            and user_desc_dim > 0
+            and self.user_desc_mode != "none"
+        )
         self.user_desc_aux_scale = float(user_desc_scale)
         self.use_loc_desc_aux = False
         self.loc_desc_aux_scale = 0.0
@@ -255,12 +269,12 @@ class SMPFusionModel(nn.Module):
                 nn.Dropout(dropout),
                 nn.Linear(gate_hidden_dim, 1),
             )
-            if self.use_user_desc_aux
+            if self.use_user_desc_aux and self.user_desc_mode in {"residual", "meta_bridge", "text_bridge"}
             else None
         )
         if self.user_desc_gate is not None:
-            # Start almost closed; let the model use user_desc only if helpful.
-            nn.init.constant_(self.user_desc_gate[-1].bias, -4.0)
+            # Start mostly closed; let the model use user_desc only if helpful.
+            nn.init.constant_(self.user_desc_gate[-1].bias, self.user_desc_gate_init)
             nn.init.zeros_(self.user_desc_gate[-1].weight)
 
         self.loc_desc_gate: Optional[nn.Module] = None
@@ -321,6 +335,9 @@ class SMPFusionModel(nn.Module):
                 text_res_scale=float(fusion_text_res_scale),
                 image_res_scale=float(fusion_image_res_scale),
                 tm_res_scale=float(fusion_tm_res_scale),
+                use_user_desc=self.use_user_desc_aux and self.user_desc_mode == "fusion_cross_attention",
+                user_res_scale=self.user_desc_res_scale,
+                user_gate_init=self.user_desc_gate_init,
                 order=self.fusion_order,
             )
         else:
@@ -334,6 +351,7 @@ class SMPFusionModel(nn.Module):
             f"head_type = {self.head_type}, "
             f"normalize_image_feature = {self.normalize_image_feature}, "
             f"use_user_desc_aux = {self.use_user_desc_aux}, "
+            f"user_desc_mode = {self.user_desc_mode}, "
             f"user_desc_scale = {self.user_desc_aux_scale}, "
             f"use_meta_aux_head = {self.use_meta_aux_head}, "
             f"meta_aux_scale = {self.meta_aux_scale}, "
@@ -393,6 +411,26 @@ class SMPFusionModel(nn.Module):
             self.meta_residual_norm = nn.LayerNorm(hidden_dim)
             # sigmoid(0.0)=0.5, so metadata residual starts half-open.
             self.meta_residual_gate = nn.Parameter(torch.tensor(self.meta_residual_init, dtype=torch.float32))
+
+    def _apply_user_desc_bridge(
+        self,
+        features: Dict[str, Optional[torch.Tensor]],
+        target_name: str,
+    ) -> None:
+        user_feat = features.get("user_desc")
+        target_feat = features.get(target_name)
+        if user_feat is None or target_feat is None or self.user_desc_gate is None:
+            return
+
+        user_mask = features.get(
+            "user_desc_mask",
+            torch.ones(user_feat.size(0), 1, device=user_feat.device, dtype=user_feat.dtype),
+        ).to(device=user_feat.device, dtype=user_feat.dtype)
+        gate = torch.sigmoid(
+            self.user_desc_gate(torch.cat([target_feat, user_feat, user_mask], dim=-1))
+        ) * user_mask
+        features[target_name] = target_feat + self.user_desc_aux_scale * gate * user_feat
+        features["user_desc_gate"] = gate
 
     def _infer_batch_size(
         self,
@@ -679,6 +717,31 @@ class SMPFusionModel(nn.Module):
         modality_mask: Optional[Dict[str, bool]] = None,
         meta_only: bool = False,
     ):
+        if meta_only:
+            if not self.use_meta or self.meta_encoder is None:
+                raise ValueError("meta_only=True requires metadata features.")
+            if self.meta_aux_head is None:
+                raise ValueError("meta_only=True requires meta_aux_head.")
+            meta_feat = self.meta_encoder(
+                meta_num=meta_num,
+                meta_cat=meta_cat,
+                meta_bin=meta_bin,
+            )
+            output = self.meta_aux_head(meta_feat)
+            if return_features:
+                return {
+                    "output": output,
+                    "fused": meta_feat,
+                    "features": {
+                        "text": None,
+                        "meta": meta_feat,
+                        "image": None,
+                        "clip_sim": None,
+                        "user_desc": None,
+                    },
+                }
+            return output
+
         features = self.extract_features(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -707,25 +770,18 @@ class SMPFusionModel(nn.Module):
                 if features.get("clip_sim") is not None:
                     features["clip_sim"] = torch.zeros_like(features["clip_sim"])
 
-        if meta_only:
-            if features.get("meta") is None:
-                raise ValueError("meta_only=True requires metadata features.")
-            if self.meta_aux_head is None:
-                raise ValueError("meta_only=True requires meta_aux_head.")
-            output = self.meta_aux_head(features["meta"])
-            if return_features:
-                return {
-                    "output": output,
-                    "fused": features["meta"],
-                    "features": features,
-                }
-            return output
+        meta_masked = bool(modality_mask is not None and modality_mask.get("meta", False))
+        text_masked = bool(modality_mask is not None and modality_mask.get("text", False))
+
+        if self.use_user_desc_aux and self.user_desc_mode == "meta_bridge" and not meta_masked:
+            self._apply_user_desc_bridge(features, "meta")
+        elif self.use_user_desc_aux and self.user_desc_mode == "text_bridge" and not text_masked:
+            self._apply_user_desc_bridge(features, "text")
 
         fused = self.fusion(features)
 
         # Gated metadata residual after fusion.
         # Skip this during mask_meta ablation so the ablation remains honest.
-        meta_masked = bool(modality_mask is not None and modality_mask.get("meta", False))
         if (
             self.use_meta_residual
             and not meta_masked
@@ -740,8 +796,7 @@ class SMPFusionModel(nn.Module):
             fused = fused + meta_gate * meta_residual
             features["meta_residual_gate"] = meta_gate.detach().reshape(1)
 
-        # Add tiny gated user_desc residual after fusion.
-        if features.get("user_desc") is not None:
+        if self.use_user_desc_aux and self.user_desc_mode == "residual" and features.get("user_desc") is not None:
             user_desc_mask = features.get(
                 "user_desc_mask",
                 torch.ones(fused.size(0), 1, device=fused.device),

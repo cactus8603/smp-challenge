@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 from typing import Any, Dict, List, Sequence
 
+import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
@@ -72,6 +73,7 @@ class SMPDataset(Dataset):
         # user_description sentence embeddings
         user_desc_emb_path: str | None = None,   # path to .npy file
         user_desc_idx_path: str | None = None,   # path to uid_index .json
+        cache_static_fields: bool = False,
     ) -> None:
         if not preprocessor.fitted:
             raise ValueError("preprocessor must be fitted before building SMPDataset.")
@@ -90,9 +92,19 @@ class SMPDataset(Dataset):
         self.is_train = is_train
         self.use_caption = bool(use_caption)
         self.caption_max_freq = caption_max_freq
+        self.cache_static_fields = bool(cache_static_fields)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(text_model_name) if use_text else None
-        self.image_processor = CLIPImageProcessor.from_pretrained(image_model_name) if use_image else None
+        if use_text:
+            print(f"[SMPDataset] loading text tokenizer: {text_model_name}", flush=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(text_model_name)
+        else:
+            self.tokenizer = None
+
+        if use_image:
+            print(f"[SMPDataset] loading image processor: {image_model_name}", flush=True)
+            self.image_processor = CLIPImageProcessor.from_pretrained(image_model_name)
+        else:
+            self.image_processor = None
 
         self.pad_token_id = self.tokenizer.pad_token_id if self.tokenizer is not None else 0
         if self.pad_token_id is None and self.tokenizer is not None:
@@ -121,6 +133,7 @@ class SMPDataset(Dataset):
         self.user_desc_embeddings: np.ndarray | None = None
         self.user_desc_uid_index: dict | None = None
         self.user_desc_emb_dim: int = 0
+        self.user_desc_feature_dim: int = 0
 
         if user_desc_emb_path is not None and user_desc_idx_path is not None:
             import numpy as np
@@ -164,6 +177,17 @@ class SMPDataset(Dataset):
         if self.use_image and self.image_path_col not in self.df.columns:
             raise ValueError(
                 f"use_image=True but image path column '{self.image_path_col}' is missing."
+            )
+
+        self.user_desc_feature_dim = int(self.user_desc_emb_dim or self.preprocessor.user_desc_dim)
+
+        if self.cache_static_fields:
+            self._init_cached_fields()
+        else:
+            print(
+                "[SMPDataset] static field RAM cache disabled; "
+                "items will be built on demand.",
+                flush=True,
             )
 
     def __len__(self) -> int:
@@ -408,6 +432,94 @@ class SMPDataset(Dataset):
         pixel_values = self.image_processor(images=image, return_tensors="pt")["pixel_values"]
         return pixel_values.squeeze(0)
 
+    def _init_cached_fields(self) -> None:
+        """
+        Precompute deterministic per-row work once per dataset/worker.
+
+        The old __getitem__ rebuilt CLIP text, tag tokens, metadata tensors, and
+        user-desc vectors for every epoch. Those values do not change during
+        training, so caching them cuts a large CPU/DataLoader bottleneck.
+        """
+        n = len(self.df)
+        print(
+            f"[SMPDataset] caching static fields: rows={n} | "
+            f"text={self.use_text} | meta={self.use_meta} | image={self.use_image}",
+            flush=True,
+        )
+        self._clip_text_cache: List[str] = [""] * n
+        self._tag_tokens_cache: List[List[str]] = [[] for _ in range(n)]
+        self._tag_text_cache: List[str] = [""] * n
+        self._input_ids_cache: List[torch.Tensor] = [torch.empty(0, dtype=torch.long) for _ in range(n)]
+        self._attention_mask_cache: List[torch.Tensor] = [torch.empty(0, dtype=torch.long) for _ in range(n)]
+        self._clip_token_count_cache = torch.zeros(n, dtype=torch.long)
+        self._clip_was_truncated_cache = torch.zeros(n, dtype=torch.long)
+
+        progress_every = 50000
+        for idx, row in self.df.iterrows():
+            if idx > 0 and idx % progress_every == 0:
+                print(f"[SMPDataset] cached static fields: {idx}/{n}", flush=True)
+
+            clip_text = self.build_clip_text(row)
+            tag_tokens = self.build_tag_tokens(row)
+            self._clip_text_cache[idx] = clip_text
+            self._tag_tokens_cache[idx] = tag_tokens
+            self._tag_text_cache[idx] = " ".join(tag_tokens)
+
+            if self.use_text:
+                encoded = self.tokenizer(
+                    clip_text,
+                    truncation=True,
+                    padding=False,
+                    max_length=77,
+                    return_tensors=None,
+                )
+                input_ids = torch.tensor(encoded["input_ids"], dtype=torch.long)
+                attention_mask = torch.tensor(encoded["attention_mask"], dtype=torch.long)
+                self._input_ids_cache[idx] = input_ids
+                self._attention_mask_cache[idx] = attention_mask
+                self._clip_token_count_cache[idx] = input_ids.numel()
+                self._clip_was_truncated_cache[idx] = int(input_ids.numel() >= 77)
+
+        if self.use_meta:
+            self._meta_num_cache = torch.tensor(
+                self.df[self.num_cols].to_numpy(dtype="float32"),
+                dtype=torch.float32,
+            )
+            self._meta_cat_cache = torch.tensor(
+                self.df[self.cat_cols].to_numpy(dtype="int64"),
+                dtype=torch.long,
+            )
+            self._meta_bin_cache = torch.tensor(
+                self.df[self.bin_cols].to_numpy(dtype="float32"),
+                dtype=torch.float32,
+            )
+        else:
+            self._meta_num_cache = torch.zeros((n, self.meta_num_dim), dtype=torch.float32)
+            self._meta_cat_cache = torch.zeros((n, self.meta_cat_dim), dtype=torch.long)
+            self._meta_bin_cache = torch.zeros((n, self.meta_bin_dim), dtype=torch.float32)
+
+        user_desc_dim = self.user_desc_feature_dim
+        self._user_desc_cache = torch.zeros((n, user_desc_dim), dtype=torch.float32)
+        if self.user_desc_embeddings is not None and self.user_desc_uid_index is not None and user_desc_dim > 0:
+            for idx, uid in enumerate(self.df["Uid"].astype(str)):
+                emb_idx = self.user_desc_uid_index.get(uid)
+                if emb_idx is not None:
+                    self._user_desc_cache[idx] = torch.from_numpy(
+                        np.asarray(self.user_desc_embeddings[emb_idx], dtype=np.float32)
+                    )
+
+        self._loc_desc_cache = torch.zeros((n, self.preprocessor.loc_desc_dim), dtype=torch.float32)
+        labels_raw = pd.to_numeric(self.df["label"], errors="coerce").fillna(0.0).to_numpy(dtype="float32")
+        self._label_raw_cache = torch.tensor(labels_raw, dtype=torch.float32)
+        if self.normalize_label:
+            if self.label_mean is None or self.label_std is None:
+                raise ValueError("normalize_label=True but label_mean/std is None")
+            labels = (labels_raw - float(self.label_mean)) / (float(self.label_std) + 1e-8)
+        else:
+            labels = labels_raw
+        self._labels_cache = torch.tensor(labels, dtype=torch.float32)
+        print(f"[SMPDataset] cached static fields: done ({n}/{n})", flush=True)
+
     # ------------------------------------------------------------------
     # debug
     # ------------------------------------------------------------------
@@ -465,51 +577,74 @@ class SMPDataset(Dataset):
     # ------------------------------------------------------------------
     # dataset item
     # ------------------------------------------------------------------
+    def _encode_text_item(self, clip_text: str) -> Dict[str, Any]:
+        if not self.use_text:
+            return {
+                "input_ids": torch.tensor([], dtype=torch.long),
+                "attention_mask": torch.tensor([], dtype=torch.long),
+                "raw_text": "",
+                "clip_text": "",
+                "clip_token_count_raw": torch.tensor(0, dtype=torch.long),
+                "clip_token_count": torch.tensor(0, dtype=torch.long),
+                "clip_was_truncated": torch.tensor(0, dtype=torch.long),
+            }
+
+        encoded = self.tokenizer(
+            clip_text,
+            truncation=True,
+            padding=False,
+            max_length=77,
+            return_tensors=None,
+        )
+        input_ids = torch.tensor(encoded["input_ids"], dtype=torch.long)
+        attention_mask = torch.tensor(encoded["attention_mask"], dtype=torch.long)
+        token_count = torch.tensor(input_ids.numel(), dtype=torch.long)
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "raw_text": clip_text,
+            "clip_text": clip_text,
+            "clip_token_count_raw": token_count,
+            "clip_token_count": token_count,
+            "clip_was_truncated": torch.tensor(int(input_ids.numel() >= 77), dtype=torch.long),
+        }
+
+    def _get_user_desc_tensor(self, uid: Any) -> torch.Tensor:
+        x = torch.zeros(self.user_desc_feature_dim, dtype=torch.float32)
+        if self.user_desc_embeddings is None or self.user_desc_uid_index is None or self.user_desc_feature_dim <= 0:
+            return x
+
+        emb_idx = self.user_desc_uid_index.get(safe_str(uid, ""))
+        if emb_idx is None:
+            return x
+        return torch.from_numpy(np.asarray(self.user_desc_embeddings[emb_idx], dtype=np.float32))
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = self.df.iloc[idx]
         item: Dict[str, Any] = {}
 
-        # -------------------------
-        # text
-        # -------------------------
-        clip_text = self.build_clip_text(row)
-        tag_tokens = self.build_tag_tokens(row)
-        tag_text = " ".join(tag_tokens)
-
-        if self.use_text:
-            raw_encoded = self.tokenizer(
-                clip_text,
-                truncation=True,   # ⭐ 改這裡
-                padding=False,
-                max_length=77,
-                return_tensors=None,
-            )
-            raw_token_count = len(raw_encoded["input_ids"])
-
-            encoded = self.tokenizer(
-                clip_text,
-                truncation=True,
-                padding=False,
-                max_length=77,
-                return_tensors=None,
-            )
-            used_token_count = len(encoded["input_ids"])
-
-            item["input_ids"] = torch.tensor(encoded["input_ids"], dtype=torch.long)
-            item["attention_mask"] = torch.tensor(encoded["attention_mask"], dtype=torch.long)
-            item["raw_text"] = clip_text
-            item["clip_text"] = clip_text
-            item["clip_token_count_raw"] = torch.tensor(raw_token_count, dtype=torch.long)
-            item["clip_token_count"] = torch.tensor(used_token_count, dtype=torch.long)
-            item["clip_was_truncated"] = torch.tensor(int(raw_token_count > 77), dtype=torch.long)
+        if self.cache_static_fields:
+            if self.use_text:
+                item["input_ids"] = self._input_ids_cache[idx]
+                item["attention_mask"] = self._attention_mask_cache[idx]
+                item["raw_text"] = self._clip_text_cache[idx]
+                item["clip_text"] = self._clip_text_cache[idx]
+                item["clip_token_count_raw"] = self._clip_token_count_cache[idx]
+                item["clip_token_count"] = self._clip_token_count_cache[idx]
+                item["clip_was_truncated"] = self._clip_was_truncated_cache[idx]
+            else:
+                item.update(self._encode_text_item(""))
+        elif self.use_text:
+            item.update(self._encode_text_item(self.build_clip_text(row)))
         else:
-            item["input_ids"] = torch.tensor([], dtype=torch.long)
-            item["attention_mask"] = torch.tensor([], dtype=torch.long)
-            item["raw_text"] = ""
-            item["clip_text"] = ""
-            item["clip_token_count_raw"] = torch.tensor(0, dtype=torch.long)
-            item["clip_token_count"] = torch.tensor(0, dtype=torch.long)
-            item["clip_was_truncated"] = torch.tensor(0, dtype=torch.long)
+            item.update(self._encode_text_item(""))
+
+        if self.cache_static_fields:
+            tag_tokens = self._tag_tokens_cache[idx]
+            tag_text = self._tag_text_cache[idx]
+        else:
+            tag_tokens = self.build_tag_tokens(row)
+            tag_text = " ".join(tag_tokens)
 
         item["tag_text"] = tag_text
         item["tag_tokens"] = tag_tokens
@@ -518,7 +653,13 @@ class SMPDataset(Dataset):
         # -------------------------
         # metadata
         # -------------------------
-        if self.use_meta:
+        if self.cache_static_fields:
+            item["meta_num"] = self._meta_num_cache[idx]
+            item["meta_cat"] = self._meta_cat_cache[idx]
+            item["meta_bin"] = self._meta_bin_cache[idx]
+            item["user_desc"] = self._user_desc_cache[idx]
+            item["loc_desc"] = self._loc_desc_cache[idx]
+        elif self.use_meta:
             item["meta_num"] = torch.tensor(
                 row[self.num_cols].to_numpy(dtype="float32"),
                 dtype=torch.float32,
@@ -531,33 +672,13 @@ class SMPDataset(Dataset):
                 row[self.bin_cols].to_numpy(dtype="float32"),
                 dtype=torch.float32,
             )
-
-            # ── user_description sentence embedding ───────────────────
-            import numpy as _np
-            if self.user_desc_embeddings is not None and self.user_desc_uid_index is not None:
-                uid_str = safe_str(row.get("Uid", ""))
-                emb_idx = self.user_desc_uid_index.get(uid_str, None)
-                vec = (
-                    self.user_desc_embeddings[emb_idx]
-                    if emb_idx is not None
-                    else _np.zeros(self.user_desc_emb_dim, dtype=_np.float32)
-                )
-                item["user_desc"] = torch.tensor(vec, dtype=torch.float32)
-            else:
-                item["user_desc"] = torch.zeros(
-                    self.user_desc_emb_dim or self.preprocessor.user_desc_dim,
-                    dtype=torch.float32,
-                )
-
+            item["user_desc"] = self._get_user_desc_tensor(row.get("Uid", ""))
             item["loc_desc"] = torch.zeros(self.preprocessor.loc_desc_dim, dtype=torch.float32)
-
         else:
             item["meta_num"] = torch.zeros(self.meta_num_dim, dtype=torch.float32)
             item["meta_cat"] = torch.zeros(self.meta_cat_dim, dtype=torch.long)
             item["meta_bin"] = torch.zeros(self.meta_bin_dim, dtype=torch.float32)
-            item["user_desc"] = torch.zeros(
-                self.user_desc_emb_dim or self.preprocessor.user_desc_dim, dtype=torch.float32
-            )
+            item["user_desc"] = torch.zeros(self.user_desc_feature_dim, dtype=torch.float32)
             item["loc_desc"] = torch.zeros(self.preprocessor.loc_desc_dim, dtype=torch.float32)
 
         # -------------------------
@@ -574,17 +695,18 @@ class SMPDataset(Dataset):
         # -------------------------
         # labels / ids
         # -------------------------
-        label = float(row.get("label", 0.0))
-
-        item["label_raw"] = torch.tensor(label, dtype=torch.float32)
-
-        if self.normalize_label:
-            if self.label_mean is None or self.label_std is None:
-                raise ValueError("normalize_label=True but label_mean/std is None")
-
-            label = (label - self.label_mean) / (self.label_std + 1e-8)
-
-        item["labels"] = torch.tensor(label, dtype=torch.float32)
+        if self.cache_static_fields:
+            item["label_raw"] = self._label_raw_cache[idx]
+            item["labels"] = self._labels_cache[idx]
+        else:
+            label_raw = torch.tensor(_safe_float(row.get("label", 0.0)), dtype=torch.float32)
+            item["label_raw"] = label_raw
+            if self.normalize_label:
+                if self.label_mean is None or self.label_std is None:
+                    raise ValueError("normalize_label=True but label_mean/std is None")
+                item["labels"] = (label_raw - float(self.label_mean)) / (float(self.label_std) + 1e-8)
+            else:
+                item["labels"] = label_raw
         item["pad_token_id"] = self.pad_token_id
         item["post_id"] = safe_str(row.get("post_id", ""))
         item["uid"] = safe_str(row.get("Uid", ""))

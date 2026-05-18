@@ -1,0 +1,6 @@
+base: xattn_udcap.yaml
+
+exp_name: xattn_diag_tag_off
+
+tag_embedding:
+  use: false

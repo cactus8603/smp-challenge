@@ -1,0 +1,25 @@
+base: xattn_udcap.yaml
+
+exp_name: xattn_diag_residual_xattn
+
+fusion:
+  type: residual_cross_attention
+  order: text_meta_first
+  use_clip_similarity: true
+  clip_similarity_mode: projected
+  num_heads: 4
+  text_res_scale: 0.5
+  meta_res_scale: 1.2
+  image_res_scale: 0.5
+  tm_res_scale: 0.75
+
+model:
+  head_type: regression
+  head_hidden_mult: 1.5
+  head_num_layers: 3
+  dropout: 0.1
+  use_meta_aux_head: true
+  meta_aux_scale: 0.2
+  use_meta_residual: true
+  meta_residual_init: 0.0
+  meta_residual_dropout: 0.0

@@ -203,12 +203,14 @@ class PairwiseRankingLoss(nn.Module):
         min_target_diff: float = 0.2,
         weight_by_target_diff: bool = True,
         max_weight: float | None = 6.0,
+        max_pairs: int | None = None,
     ):
         super().__init__()
         self.margin = margin
         self.min_target_diff = min_target_diff
         self.weight_by_target_diff = weight_by_target_diff
         self.max_weight = max_weight
+        self.max_pairs = int(max_pairs) if max_pairs is not None else None
 
     def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         preds = preds.view(-1)
@@ -224,6 +226,10 @@ class PairwiseRankingLoss(nn.Module):
 
         pair_pred_diff = pred_diff[mask]
         pair_target_diff = target_diff[mask]
+        if self.max_pairs is not None and pair_pred_diff.numel() > self.max_pairs:
+            keep = torch.randperm(pair_pred_diff.numel(), device=preds.device)[: self.max_pairs]
+            pair_pred_diff = pair_pred_diff[keep]
+            pair_target_diff = pair_target_diff[keep]
 
         # if pair_pred_diff is too small or wrong sign, punish strongly
         loss = F.softplus(-(pair_pred_diff - self.margin))
@@ -245,15 +251,23 @@ class BatchContrastLoss(nn.Module):
     If preds are too concentrated around their mean, this loss increases.
     It compares pairwise distance structure between preds and targets.
     """
-    def __init__(self):
+    def __init__(self, max_pairs: int | None = None):
         super().__init__()
+        self.max_pairs = int(max_pairs) if max_pairs is not None else None
 
     def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         preds = preds.view(-1)
         targets = targets.view(-1)
 
-        pred_dist = torch.abs(preds.unsqueeze(1) - preds.unsqueeze(0))
-        target_dist = torch.abs(targets.unsqueeze(1) - targets.unsqueeze(0))
+        if self.max_pairs is not None and preds.numel() * preds.numel() > self.max_pairs:
+            n = preds.numel()
+            i = torch.randint(0, n, (self.max_pairs,), device=preds.device)
+            j = torch.randint(0, n, (self.max_pairs,), device=preds.device)
+            pred_dist = torch.abs(preds[i] - preds[j])
+            target_dist = torch.abs(targets[i] - targets[j])
+        else:
+            pred_dist = torch.abs(preds.unsqueeze(1) - preds.unsqueeze(0))
+            target_dist = torch.abs(targets.unsqueeze(1) - targets.unsqueeze(0))
 
         pred_dist = pred_dist / (pred_dist.mean() + 1e-8)
         target_dist = target_dist / (target_dist.mean() + 1e-8)
@@ -358,6 +372,8 @@ class HybridLoss(nn.Module):
         min_target_diff: float = 0.2,
         weight_by_target_diff: bool = True,
         rank_max_weight: float | None = 6.0,
+        rank_max_pairs: int | None = None,
+        contrast_max_pairs: int | None = None,
 
         variance_floor_ratio: float = 0.7,
         focal_gamma: float = 2.0,
@@ -377,9 +393,10 @@ class HybridLoss(nn.Module):
             min_target_diff=min_target_diff,
             weight_by_target_diff=weight_by_target_diff,
             max_weight=rank_max_weight,
+            max_pairs=rank_max_pairs,
         )
 
-        self.batch_contrast_loss = BatchContrastLoss()
+        self.batch_contrast_loss = BatchContrastLoss(max_pairs=contrast_max_pairs)
         self.variance_floor_loss = VarianceFloorLoss(ratio=variance_floor_ratio)
         self.mean_escape_loss = MeanEscapeLoss()
         self.large_error_focal_loss = LargeErrorFocalLoss(gamma=focal_gamma)
